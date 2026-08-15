@@ -1,0 +1,237 @@
+#include "ltx25-connector.h"
+#include "ltx25-dit-weights.h"
+
+#include <string>
+#include <vector>
+
+using vpipe::genai::WeightSet;
+using vpipe::metal_compute::SharedBuffer;
+
+namespace ltx25 {
+
+namespace {
+
+SharedBuffer
+get_(WeightSet& ws, vpipe::metal_compute::MetalCompute* mc,
+     const std::string& n)
+{
+  if (!ws.has(n)) { return SharedBuffer{}; }
+  return ws.tensor(n, mc, WeightSet::Residency::Mapped);
+}
+
+bool
+need_(WeightSet& ws, vpipe::metal_compute::MetalCompute* mc,
+      const std::string& n, SharedBuffer& out, std::string* miss)
+{
+  out = get_(ws, mc, n);
+  if (out.empty()) {
+    if (miss != nullptr && miss->empty()) { *miss = n; }
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+std::unique_ptr<Ltx25Connector>
+Ltx25Connector::load(const DitConfig& cfg, WeightSet& ws, const MetalOps& ops,
+                     bool audio, std::string* err)
+{
+  std::unique_ptr<Ltx25Connector> c(new Ltx25Connector());
+  c->_ops = &ops;
+  c->_heads = audio ? cfg.audio_connector_num_attention_heads
+                    : cfg.connector_num_attention_heads;
+  c->_head_dim = audio ? cfg.audio_connector_attention_head_dim
+                       : cfg.connector_attention_head_dim;
+  c->_dim = c->_heads * c->_head_dim;
+  // 4x, as both connectors ship. The checkpoint states it only through
+  // the tensor's shape, which WeightSet does not expose.
+  c->_ff_hidden = c->_dim * 4;
+  c->_n_registers = cfg.connector_num_learnable_registers;
+  c->_norm_output = cfg.connector_norm_output;
+  c->_theta = cfg.positional_embedding_theta;
+  c->_rope_f64 = cfg.rope_f64();
+  c->_max_pos = cfg.connector_positional_embedding_max_pos.empty()
+                    ? 4096
+                    : cfg.connector_positional_embedding_max_pos[0];
+
+  const std::string root = std::string(kDitPrefix) +
+                           (audio ? "audio_" : "video_") +
+                           "embeddings_connector.";
+  std::string miss;
+  if (c->_n_registers > 0 &&
+      !need_(ws, ops.mc(), root + "learnable_registers", c->_registers,
+             &miss)) {
+    if (err != nullptr) { *err = "missing '" + miss + "'"; }
+    return nullptr;
+  }
+
+  c->_blocks.resize((std::size_t)cfg.connector_num_layers);
+  for (int i = 0; i < cfg.connector_num_layers; ++i) {
+    Block& b = c->_blocks[(std::size_t)i];
+    const std::string p =
+        root + "transformer_1d_blocks." + std::to_string(i) + ".";
+    const bool ok =
+        need_(ws, ops.mc(), p + "attn1.to_q.weight", b.q_w, &miss) &&
+        need_(ws, ops.mc(), p + "attn1.to_q.bias",   b.q_b, &miss) &&
+        need_(ws, ops.mc(), p + "attn1.to_k.weight", b.k_w, &miss) &&
+        need_(ws, ops.mc(), p + "attn1.to_k.bias",   b.k_b, &miss) &&
+        need_(ws, ops.mc(), p + "attn1.to_v.weight", b.v_w, &miss) &&
+        need_(ws, ops.mc(), p + "attn1.to_v.bias",   b.v_b, &miss) &&
+        need_(ws, ops.mc(), p + "attn1.to_out.0.weight", b.o_w, &miss) &&
+        need_(ws, ops.mc(), p + "attn1.to_out.0.bias",   b.o_b, &miss) &&
+        need_(ws, ops.mc(), p + "attn1.q_norm.weight", b.q_norm, &miss) &&
+        need_(ws, ops.mc(), p + "attn1.k_norm.weight", b.k_norm, &miss) &&
+        // The connector's feed-forward HAS bias, unlike the DiT's video
+        // one. Required, not probed: a missing bias here means the
+        // checkpoint disagrees with connector_ff_bias and the result
+        // would be quietly shifted.
+        need_(ws, ops.mc(), p + "ff.net.0.proj.weight", b.ff_in, &miss) &&
+        need_(ws, ops.mc(), p + "ff.net.0.proj.bias",   b.ff_in_b, &miss) &&
+        need_(ws, ops.mc(), p + "ff.net.2.weight", b.ff_out, &miss) &&
+        need_(ws, ops.mc(), p + "ff.net.2.bias",   b.ff_out_b, &miss);
+    if (!ok) {
+      if (err != nullptr) {
+        *err = "connector block " + std::to_string(i) + ": missing '" +
+               miss + "'";
+      }
+      return nullptr;
+    }
+    b.gate_w = get_(ws, ops.mc(), p + "attn1.to_gate_logits.weight");
+    b.has_gate = !b.gate_w.empty();
+    if (b.has_gate) {
+      b.gate_b = get_(ws, ops.mc(), p + "attn1.to_gate_logits.bias");
+    }
+  }
+  return c;
+}
+
+bool
+Ltx25Connector::reserve(int tokens, std::string* err)
+{
+  auto fail = [&](const std::string& m) {
+    if (err != nullptr) { *err = m; }
+    return false;
+  };
+  if (tokens <= 0) { return fail("tokens must be positive"); }
+  if (_n_registers > 0 && tokens % _n_registers != 0) {
+    // The reference asserts this. The registers TILE, so a sequence that
+    // is not a whole number of tiles has no defined substitution.
+    return fail("sequence length " + std::to_string(tokens) +
+                " is not a multiple of the register count " +
+                std::to_string(_n_registers));
+  }
+  _tokens = tokens;
+
+  // A 1-D grid, one position per token, at the CONNECTOR's own max_pos
+  // (4096) -- not the DiT's [20, 2048, 2048].
+  // INDICES, not seconds: the connector's registers are a
+  // sequence position, and ltx25-connector-test pins them that way
+  // against the reference's own connector.
+  _rope = build_index_rope(tokens, {_max_pos}, _dim, _heads, _theta,
+                           _rope_f64);
+  if (_rope.tokens == 0) { return fail("could not build the connector RoPE"); }
+  _rope_cos = _ops->upload_f32(_rope.cos);
+  _rope_sin = _ops->upload_f32(_rope.sin);
+
+  const std::size_t plane = (std::size_t)tokens * _dim;
+  _a  = _ops->alloc(plane);
+  _b  = _ops->alloc(plane);
+  _q  = _ops->alloc(plane);
+  _k  = _ops->alloc(plane);
+  _v  = _ops->alloc(plane);
+  _o  = _ops->alloc(plane);
+  _qh = _ops->alloc(plane);
+  _kh = _ops->alloc(plane);
+  _vh = _ops->alloc(plane);
+  _oh = _ops->alloc(plane);
+  _gate = _ops->alloc((std::size_t)tokens * _heads);
+  _ff = _ops->alloc((std::size_t)tokens * _ff_hidden);
+  return true;
+}
+
+bool
+Ltx25Connector::forward(const SharedBuffer& in, const SharedBuffer& out,
+                        int tokens, int n_valid, std::string* err)
+{
+  auto fail = [&](const std::string& m) {
+    if (err != nullptr) { *err = m; }
+    return false;
+  };
+  if (tokens != _tokens) {
+    return fail("reserve() sized for " + std::to_string(_tokens) +
+                " tokens, forward wants " + std::to_string(tokens));
+  }
+  const MetalOps& o = *_ops;
+  if (_steel.tq != tokens) {
+    _steel = MetalOps::SteelAttn{};
+    if (!o.steel_attn_plan(&_steel, _heads, tokens, tokens, _head_dim)) {
+      _steel = MetalOps::SteelAttn{};
+    }
+  }
+  auto stream = o.mc()->make_command_stream();
+  {
+    auto enc = stream.begin_compute();
+
+    // The running stream lives in `out` from here: the first thing done
+    // is a copy, so the caller's input is never modified.
+    o.copy(enc, in, out, tokens * _dim);
+    if (_n_registers > 0) {
+      o.fill_registers(enc, out, _registers, _dim, _n_registers, n_valid,
+                       tokens);
+    }
+
+    for (const Block& b : _blocks) {
+      // --- pre-norm + self-attention, PLAIN residual -----------------
+      o.rms_norm_out(enc, out, _a, _dim, tokens);
+      o.linear(enc, _a, b.q_w, &b.q_b, _q, tokens, _dim, _dim);
+      o.linear(enc, _a, b.k_w, &b.k_b, _k, tokens, _dim, _dim);
+      o.linear(enc, _a, b.v_w, &b.v_b, _v, tokens, _dim, _dim);
+      o.rms_norm_gain(enc, _q, b.q_norm, _dim, tokens);
+      o.rms_norm_gain(enc, _k, b.k_norm, _dim, tokens);
+      o.rope(enc, _q, _rope_cos, _rope_sin, _heads, tokens, _head_dim);
+      o.rope(enc, _k, _rope_cos, _rope_sin, _heads, tokens, _head_dim);
+      o.transpose_abd(enc, _q, _qh, tokens, _heads, _head_dim);
+      o.transpose_abd(enc, _k, _kh, tokens, _heads, _head_dim);
+      o.transpose_abd(enc, _v, _vh, tokens, _heads, _head_dim);
+      // FULL attention, no mask: the registers already replaced every
+      // padded position, and the reference discards the mask at that
+      // point.
+      if (_steel.tq == tokens) {
+        o.sdpa_steel(enc, _steel, _qh, _kh, _vh, _oh);
+      } else {
+        o.sdpa_full(enc, _qh, _kh, _vh, _oh, _heads, tokens, tokens,
+                    _head_dim);
+      }
+      o.transpose_abd(enc, _oh, _o, _heads, tokens, _head_dim);
+      if (b.has_gate) {
+        o.linear(enc, _a, b.gate_w, &b.gate_b, _gate, tokens, _dim, _heads);
+        o.gate_heads(enc, _o, _gate, _heads, tokens, _head_dim);
+      }
+      o.linear(enc, _o, b.o_w, &b.o_b, _b, tokens, _dim, _dim);
+      // x = attn_out + x. PLAIN -- there is no gate on this residual,
+      // unlike every residual in the DiT block. In place: ltx_add reads
+      // and writes the same index, so aliasing a with out is safe.
+      o.add(enc, out, 0, _b, 0, out, tokens * _dim);
+
+      // --- pre-norm + feed-forward, PLAIN residual -------------------
+      o.rms_norm_out(enc, out, _a, _dim, tokens);
+      o.linear(enc, _a, b.ff_in, &b.ff_in_b, _ff, tokens, _dim, _ff_hidden);
+      o.gelu(enc, _ff, _ff, tokens * _ff_hidden);
+      o.linear(enc, _ff, b.ff_out, &b.ff_out_b, _b, tokens, _ff_hidden,
+               _dim);
+      o.add(enc, out, 0, _b, 0, out, tokens * _dim);
+    }
+
+    if (_norm_output) {
+      // `connector_norm_output`. In place: rms_norm_out with the same
+      // buffer both sides is elementwise-safe (each row reads only
+      // itself), and the alternative is a copy of the whole context.
+      o.rms_norm_out(enc, out, out, _dim, tokens);
+    }
+  }
+  stream.commit().wait();
+  return true;
+}
+
+}  // namespace ltx25

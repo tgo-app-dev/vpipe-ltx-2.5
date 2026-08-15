@@ -1,0 +1,7 @@
+# Out-of-source build trees are machine-local, as in the vpipe tree.
+build/
+build-*/
+cmake-build-*/
+
+.DS_Store
+compile_commands.json

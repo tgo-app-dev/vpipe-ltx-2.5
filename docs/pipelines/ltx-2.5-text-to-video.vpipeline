@@ -1,0 +1,155 @@
+{
+  "id": "ltx-2.5-text-to-video",
+  "stages": [
+    {
+      "id": "text-prompt",
+      "type": "text-prompt",
+      "iports": [],
+      "config": {
+        "text": "Cinematic video of a young Asian female pianist passionately playing a grand piano."
+      }
+    },
+    {
+      "id": "cond",
+      "type": "ltx-2.5-conditioner",
+      "iports": [
+        {
+          "src": "text-prompt",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "hf_dir": "./models/Lightricks/LTX-2.5",
+        "unload_when_idle": "auto"
+      }
+    },
+    {
+      "id": "ltx-config",
+      "type": "ltx-2.5-model-config",
+      "iports": [],
+      "config": {
+        "audio_seconds": 0.0,
+        "variant": "w8g64"
+      }
+    },
+    {
+      "id": "gen",
+      "type": "generate-video",
+      "iports": [
+        {
+          "src": "cond",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "ltx-config",
+          "oport": 0
+        },
+        {
+          "src": "cond",
+          "oport": 2
+        }
+      ],
+      "config": {
+        "hf_dir": "./models/Lightricks/LTX-2.5",
+        "height": 544,
+        "width": 960,
+        "frames": 121,
+        "fps": 24,
+        "steps": 8,
+        "seed": 6,
+        "unload_when_idle": "always"
+      }
+    },
+    {
+      "id": "vae",
+      "type": "vae-decode",
+      "iports": [
+        {
+          "src": "gen",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "hf_dir": "./models/Lightricks/LTX-2.5"
+      }
+    },
+    {
+      "id": "avae",
+      "type": "audio-vae-decode",
+      "iports": [
+        {
+          "src": "gen",
+          "oport": 1
+        }
+      ],
+      "config": {
+        "hf_dir": "./models/Lightricks/LTX-2.5"
+      }
+    },
+    {
+      "id": "rgb-to-video",
+      "type": "rgb-to-video",
+      "iports": [
+        {
+          "src": "vae",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "fps": 24
+      }
+    },
+    {
+      "id": "save",
+      "type": "save-video",
+      "iports": [
+        {
+          "src": "rgb-to-video",
+          "oport": 0
+        },
+        {
+          "src": "avae",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_url": "./ltx-2.5-text-to-video.mp4",
+        "enable_video": true,
+        "enable_audio": true
+      }
+    }
+  ],
+  "subpipelines": []
+}

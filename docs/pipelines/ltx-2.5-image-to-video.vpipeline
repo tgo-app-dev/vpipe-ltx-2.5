@@ -1,0 +1,147 @@
+{
+  "id": "ltx-2.5-image-to-video",
+  "stages": [
+    {
+      "id": "load-image",
+      "type": "load-image",
+      "iports": [],
+      "config": {
+        "url": "./reference.png"
+      }
+    },
+    {
+      "id": "vae-encode",
+      "type": "vae-encode",
+      "iports": [
+        {
+          "src": "load-image",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "hf_dir": "./models/Lightricks/LTX-2.5",
+        "target_width": 512,
+        "target_height": 320,
+        "unload_when_idle": "always"
+      }
+    },
+    {
+      "id": "text-prompt",
+      "type": "text-prompt",
+      "iports": [],
+      "config": {
+        "text": "A giant panda sitting in bamboo, slowly turning its head towards the camera, gentle daylight."
+      }
+    },
+    {
+      "id": "cond",
+      "type": "ltx-2.5-conditioner",
+      "iports": [
+        {
+          "src": "text-prompt",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "hf_dir": "./models/Lightricks/LTX-2.5",
+        "unload_when_idle": "auto"
+      }
+    },
+    {
+      "id": "ltx-config",
+      "type": "ltx-2.5-model-config",
+      "iports": [],
+      "config": {
+        "audio_seconds": 0.0,
+        "ref_strength": 1.0
+      }
+    },
+    {
+      "id": "gen",
+      "type": "generate-video",
+      "iports": [
+        {
+          "src": "cond",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "vae-encode",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "ltx-config",
+          "oport": 0
+        },
+        {
+          "src": "cond",
+          "oport": 2
+        }
+      ],
+      "config": {
+        "hf_dir": "./models/Lightricks/LTX-2.5",
+        "height": 320,
+        "width": 512,
+        "frames": 9,
+        "fps": 24,
+        "steps": 8,
+        "seed": 1234,
+        "unload_when_idle": "always"
+      }
+    },
+    {
+      "id": "vae",
+      "type": "vae-decode",
+      "iports": [
+        {
+          "src": "gen",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "hf_dir": "./models/Lightricks/LTX-2.5"
+      }
+    },
+    {
+      "id": "save",
+      "type": "save-image",
+      "iports": [
+        {
+          "src": "vae",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "path": "./ltx-i2v-frame-%04d.png"
+      }
+    }
+  ],
+  "subpipelines": []
+}

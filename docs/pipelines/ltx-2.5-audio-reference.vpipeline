@@ -1,0 +1,190 @@
+{
+  "id": "ltx-2.5-audio-reference",
+  "stages": [
+    {
+      "id": "load-audio",
+      "type": "load-audio",
+      "iports": [],
+      "config": {
+        "input_url": "./reference-audio.m4a"
+      }
+    },
+    {
+      "id": "to-pcm",
+      "type": "audio-to-pcm",
+      "iports": [
+        {
+          "src": "load-audio",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_sample_rate": 16000,
+        "chunk_duration_s": 0.5
+      }
+    },
+    {
+      "id": "audio-ref",
+      "type": "audio-vae-encode",
+      "iports": [
+        {
+          "src": "to-pcm",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "hf_dir": "./models/Lightricks/LTX-2.5",
+        "max_seconds": 30
+      }
+    },
+    {
+      "id": "text-prompt",
+      "type": "text-prompt",
+      "iports": [],
+      "config": {
+        "text": "A wooden sailing boat crossing a calm bay at sunset, canvas snapping in the breeze."
+      }
+    },
+    {
+      "id": "cond",
+      "type": "ltx-2.5-conditioner",
+      "iports": [
+        {
+          "src": "text-prompt",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "hf_dir": "./models/Lightricks/LTX-2.5",
+        "unload_when_idle": "auto"
+      }
+    },
+    {
+      "id": "ltx-config",
+      "type": "ltx-2.5-model-config",
+      "iports": [],
+      "config": {
+        "ref_audio_strength": 1.0
+      }
+    },
+    {
+      "id": "gen",
+      "type": "generate-video",
+      "iports": [
+        {
+          "src": "cond",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "audio-ref",
+          "oport": 0
+        },
+        {
+          "src": "ltx-config",
+          "oport": 0
+        },
+        {
+          "src": "cond",
+          "oport": 2
+        }
+      ],
+      "config": {
+        "hf_dir": "./models/Lightricks/LTX-2.5",
+        "height": 320,
+        "width": 512,
+        "frames": 9,
+        "fps": 24,
+        "steps": 8,
+        "seed": 4321,
+        "unload_when_idle": "always"
+      }
+    },
+    {
+      "id": "vae",
+      "type": "vae-decode",
+      "iports": [
+        {
+          "src": "gen",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "hf_dir": "./models/Lightricks/LTX-2.5"
+      }
+    },
+    {
+      "id": "avae",
+      "type": "audio-vae-decode",
+      "iports": [
+        {
+          "src": "gen",
+          "oport": 1
+        }
+      ],
+      "config": {
+        "hf_dir": "./models/Lightricks/LTX-2.5"
+      }
+    },
+    {
+      "id": "rgb-to-video",
+      "type": "rgb-to-video",
+      "iports": [
+        {
+          "src": "vae",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "fps": 24
+      }
+    },
+    {
+      "id": "save",
+      "type": "save-video",
+      "iports": [
+        {
+          "src": "rgb-to-video",
+          "oport": 0
+        },
+        {
+          "src": "avae",
+          "oport": 0
+        }
+      ],
+      "config": {
+        "output_url": "./ltx-2.5-audio-reference.mp4",
+        "enable_video": true,
+        "enable_audio": true
+      }
+    }
+  ],
+  "subpipelines": []
+}
