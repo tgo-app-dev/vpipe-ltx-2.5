@@ -14,17 +14,38 @@ namespace {
 
 // One tensor, by full name. `stream` picks the non-retaining read.
 //
-// Residency::Mapped throughout: these bytes are used AS THEY SIT (bf16
-// in, bf16 kernels), so nothing is converted and mapping is free -- the
-// `Copied` rule in vpipe's docs/MODEL-MEMORY.md is about loaders that
-// allocate a converted
-// copy per dtype mismatch, which this is not.
+// Residency is chosen PER CALL, not fixed for the model. Mapping is a
+// candidate here at all because these bytes are used AS THEY SIT (bf16
+// in, bf16 kernels): the `Copied` default in vpipe's
+// docs/MODEL-MEMORY.md is about loaders that allocate a converted copy
+// per dtype mismatch, which this is not. Which residency each call
+// gets, and the measurement behind the split, is in the body.
 SharedBuffer
-get_(WeightSet& ws, MetalCompute* mc, const std::string& name, bool stream)
+get_(WeightSet& ws, MetalCompute* mc, const std::string& name, bool stream,
+     WeightSet::Residency kept)
 {
   if (!ws.has(name)) { return SharedBuffer{}; }
-  return stream ? ws.stream_tensor(name, mc, WeightSet::Residency::Mapped)
-                : ws.tensor(name, mc, WeightSet::Residency::Mapped);
+  // COPIED only when STREAMING, and the difference is measured rather
+  // than argued.
+  //
+  // Streaming needs to own the bytes: a pinned prefix means nothing if
+  // the kernel can evict it, and a forward is a cyclic scan, which is
+  // the case an LRU page cache handles worst -- each block dropped
+  // exactly before it comes round again.
+  //
+  // Preloading is the opposite. Everything is resident either way, so
+  // owning the bytes buys nothing and costs their KIND: clean file pages
+  // the kernel drops for free become anonymous memory it can only
+  // compress. MEASURED at 960x544x121 on a 64 GB box, same seed, w8g64:
+  // mapped 408.5 s of denoise against 473.5 s copied, with the copied
+  // arm sitting at 36 GB compressed and its own weights at 2-3% resident.
+  // Streamed reads own their bytes by definition. What the model KEEPS
+  // is `kept` -- the MODEL's verdict, not this tensor's -- so a streaming
+  // model's pinned prefix and trunk come out Copied too. kept_residency()
+  // in the header is where that distinction is argued.
+  const auto res = stream ? WeightSet::Residency::Copied : kept;
+  return stream ? ws.stream_tensor(name, mc, res)
+                : ws.tensor(name, mc, res);
 }
 
 // The scale/shift TABLES are F32 where every other tensor in the DiT is
@@ -79,9 +100,9 @@ need_f32_as_bf16_(WeightSet& ws, MetalCompute* mc, const std::string& name,
 // miss stops the walk.
 bool
 need_(WeightSet& ws, MetalCompute* mc, const std::string& name, bool stream,
-      SharedBuffer& out, std::string* miss)
+      SharedBuffer& out, std::string* miss, WeightSet::Residency kept)
 {
-  out = get_(ws, mc, name, stream);
+  out = get_(ws, mc, name, stream, kept);
   if (out.empty()) {
     if (miss != nullptr && miss->empty()) { *miss = name; }
     return false;
@@ -128,11 +149,11 @@ need_(WeightSet& ws, MetalCompute* mc, const std::string& name, bool stream,
 // bytes.
 SharedBuffer
 get_as_bf16_(WeightSet& ws, MetalCompute* mc, const std::string& name,
-             bool stream)
+             bool stream, WeightSet::Residency kept)
 {
   const auto* info = ws.src().info(name);
   if (info == nullptr || info->shape.empty()) { return SharedBuffer{}; }
-  if (info->dtype == "BF16") { return get_(ws, mc, name, stream); }
+  if (info->dtype == "BF16") { return get_(ws, mc, name, stream, kept); }
 
   std::size_t n = 1;
   for (auto d : info->shape) { n *= (std::size_t)d; }
@@ -174,9 +195,10 @@ get_as_bf16_(WeightSet& ws, MetalCompute* mc, const std::string& name,
 
 bool
 need_as_bf16_(WeightSet& ws, MetalCompute* mc, const std::string& name,
-              bool stream, SharedBuffer& out, std::string* miss)
+              bool stream, SharedBuffer& out, std::string* miss,
+              WeightSet::Residency kept)
 {
-  out = get_as_bf16_(ws, mc, name, stream);
+  out = get_as_bf16_(ws, mc, name, stream, kept);
   if (out.empty()) {
     if (miss != nullptr && miss->empty()) { *miss = name; }
     return false;
@@ -186,7 +208,8 @@ need_as_bf16_(WeightSet& ws, MetalCompute* mc, const std::string& name,
 
 bool
 need_q_(WeightSet& ws, MetalCompute* mc, const std::string& name, bool stream,
-        int K, QWeight& out, int* group, std::string* miss, std::string* err)
+        int K, QWeight& out, int* group, std::string* miss, std::string* err,
+        WeightSet::Residency kept)
 {
   const auto& src = ws.src();
   const auto* si = src.info(name + ".scales");
@@ -222,21 +245,24 @@ need_q_(WeightSet& ws, MetalCompute* mc, const std::string& name, bool stream,
     out.quantized = true;
     // The CODES are u32 and go through untouched; the scales and
     // biases are F16 in the checkpoint and bfloat to the kernel.
-    if (!need_(ws, mc, name + ".weight", stream, out.codes, miss) ||
-        !need_as_bf16_(ws, mc, name + ".scales", stream, out.scales, miss) ||
-        !need_as_bf16_(ws, mc, name + ".biases", stream, out.qbias, miss)) {
+    if (!need_(ws, mc, name + ".weight", stream, out.codes, miss, kept) ||
+        !need_as_bf16_(ws, mc, name + ".scales", stream, out.scales, miss,
+            kept) ||
+        !need_as_bf16_(ws, mc, name + ".biases", stream, out.qbias, miss,
+            kept)) {
       return false;
     }
     return true;
   }
   out.quantized = false;
-  return need_(ws, mc, name + ".weight", stream, out.w, miss);
+  return need_(ws, mc, name + ".weight", stream, out.w, miss, kept);
 }
 
 bool
 bind_attn_(WeightSet& ws, MetalCompute* mc, const std::string& p, int heads,
            int head_dim, int query_dim, int ctx_dim, bool stream, GpuAttn& a,
-           int* group, std::string* miss, std::string* qerr)
+           int* group, std::string* miss, std::string* qerr,
+           WeightSet::Residency kept)
 {
   a.heads = heads;
   a.head_dim = head_dim;
@@ -248,28 +274,28 @@ bind_attn_(WeightSet& ws, MetalCompute* mc, const std::string& p, int heads,
   const int inner = heads * head_dim;
   const bool ok =
       need_q_(ws, mc, p + ".to_q", stream, query_dim, a.q_w, group, miss,
-              qerr) &&
-      need_(ws, mc, p + ".to_q.bias",   stream, a.q_b, miss) &&
+              qerr, kept) &&
+      need_(ws, mc, p + ".to_q.bias",   stream, a.q_b, miss, kept) &&
       need_q_(ws, mc, p + ".to_k", stream, ctx_dim, a.k_w, group, miss,
-              qerr) &&
-      need_(ws, mc, p + ".to_k.bias",   stream, a.k_b, miss) &&
+              qerr, kept) &&
+      need_(ws, mc, p + ".to_k.bias",   stream, a.k_b, miss, kept) &&
       need_q_(ws, mc, p + ".to_v", stream, ctx_dim, a.v_w, group, miss,
-              qerr) &&
-      need_(ws, mc, p + ".to_v.bias",   stream, a.v_b, miss) &&
+              qerr, kept) &&
+      need_(ws, mc, p + ".to_v.bias",   stream, a.v_b, miss, kept) &&
       // to_out is a Sequential; the linear is index 0 and index 1 is an
       // Identity that carries nothing.
       need_q_(ws, mc, p + ".to_out.0", stream, inner, a.o_w, group, miss,
-              qerr) &&
-      need_(ws, mc, p + ".to_out.0.bias",   stream, a.o_b, miss) &&
-      need_(ws, mc, p + ".q_norm.weight", stream, a.q_norm, miss) &&
-      need_(ws, mc, p + ".k_norm.weight", stream, a.k_norm, miss);
+              qerr, kept) &&
+      need_(ws, mc, p + ".to_out.0.bias",   stream, a.o_b, miss, kept) &&
+      need_(ws, mc, p + ".q_norm.weight", stream, a.q_norm, miss, kept) &&
+      need_(ws, mc, p + ".k_norm.weight", stream, a.k_norm, miss, kept);
   if (!ok) { return false; }
   // Gating is on for every attention in LTX-2.5, but the absence of the
   // tensors is a legal (older) checkpoint rather than an error.
-  a.gate_w = get_(ws, mc, p + ".to_gate_logits.weight", stream);
+  a.gate_w = get_(ws, mc, p + ".to_gate_logits.weight", stream, kept);
   a.has_gate = !a.gate_w.empty();
   if (a.has_gate) {
-    a.gate_b = get_(ws, mc, p + ".to_gate_logits.bias", stream);
+    a.gate_b = get_(ws, mc, p + ".to_gate_logits.bias", stream, kept);
   }
   return true;
 }
@@ -277,7 +303,8 @@ bind_attn_(WeightSet& ws, MetalCompute* mc, const std::string& p, int heads,
 bool
 bind_stream_(WeightSet& ws, MetalCompute* mc, const std::string& block,
              bool is_audio, const DitConfig& cfg, bool stream, GpuStream& g,
-             int* group, std::string* miss, std::string* qerr)
+             int* group, std::string* miss, std::string* qerr,
+             WeightSet::Residency kept)
 {
   const std::string pre = block + (is_audio ? "audio_" : "");
   const int dim   = is_audio ? cfg.audio_inner_dim() : cfg.inner_dim();
@@ -291,18 +318,18 @@ bind_stream_(WeightSet& ws, MetalCompute* mc, const std::string& block,
   // attn1 is SELF-attention, so its context width is the stream's own;
   // attn2 reads the text conditioning at `cross_attention_dim`.
   if (!bind_attn_(ws, mc, pre + "attn1", heads, hd, dim, dim, stream,
-                  g.attn1, group, miss, qerr) ||
+                  g.attn1, group, miss, qerr, kept) ||
       !bind_attn_(ws, mc, pre + "attn2", heads, hd, dim, ctx, stream,
-                  g.attn2, group, miss, qerr)) {
+                  g.attn2, group, miss, qerr, kept)) {
     return false;
   }
   // FeedForward: net.0.proj is the input linear, net.2 the output. 1 is
   // the activation and 3 the dropout, so neither carries weights.
   // ff.net.0.proj reads `dim` and writes 4*dim; ff.net.2 reads 4*dim.
   if (!need_q_(ws, mc, pre + "ff.net.0.proj", stream, dim, g.ff_in, group,
-               miss, qerr) ||
+               miss, qerr, kept) ||
       !need_q_(ws, mc, pre + "ff.net.2", stream, dim * 4, g.ff_out, group,
-               miss, qerr)) {
+               miss, qerr, kept)) {
     return false;
   }
   // The VIDEO feed-forward has NO bias (`ff_bias: false`) and the audio
@@ -311,8 +338,9 @@ bind_stream_(WeightSet& ws, MetalCompute* mc, const std::string& block,
   // what the model was built from.
   g.ff_has_bias = is_audio ? cfg.audio_ff_bias : cfg.ff_bias;
   if (g.ff_has_bias) {
-    if (!need_(ws, mc, pre + "ff.net.0.proj.bias", stream, g.ff_in_b, miss) ||
-        !need_(ws, mc, pre + "ff.net.2.bias", stream, g.ff_out_b, miss)) {
+    if (!need_(ws, mc, pre + "ff.net.0.proj.bias", stream, g.ff_in_b, miss,
+        kept) ||
+        !need_(ws, mc, pre + "ff.net.2.bias", stream, g.ff_out_b, miss, kept)) {
       return false;
     }
   }
@@ -341,19 +369,19 @@ bind_stream_(WeightSet& ws, MetalCompute* mc, const std::string& block,
 
 bool
 bind_adaln_(WeightSet& ws, MetalCompute* mc, const std::string& p, int dim,
-            int out_dim, DitTrunk::AdaLN& a)
+            int out_dim, DitTrunk::AdaLN& a, WeightSet::Residency kept)
 {
   a.dim = dim;
   a.out_dim = out_dim;
   const std::string e = p + ".emb.timestep_embedder.";
   // SharedBuffer is move-only, so each slot is filled once, in place --
   // no temporaries to assign from.
-  a.emb1_w = get_(ws, mc, e + "linear_1.weight", false);
-  a.emb1_b = get_(ws, mc, e + "linear_1.bias",   false);
-  a.emb2_w = get_(ws, mc, e + "linear_2.weight", false);
-  a.emb2_b = get_(ws, mc, e + "linear_2.bias",   false);
-  a.out_w  = get_(ws, mc, p + ".linear.weight",  false);
-  a.out_b  = get_(ws, mc, p + ".linear.bias",    false);
+  a.emb1_w = get_(ws, mc, e + "linear_1.weight", false, kept);
+  a.emb1_b = get_(ws, mc, e + "linear_1.bias",   false, kept);
+  a.emb2_w = get_(ws, mc, e + "linear_2.weight", false, kept);
+  a.emb2_b = get_(ws, mc, e + "linear_2.bias",   false, kept);
+  a.out_w  = get_(ws, mc, p + ".linear.weight",  false, kept);
+  a.out_b  = get_(ws, mc, p + ".linear.bias",    false, kept);
   a.valid = !a.emb1_w.empty() && !a.emb2_w.empty() && !a.out_w.empty();
   return a.valid;
 }
@@ -361,8 +389,19 @@ bind_adaln_(WeightSet& ws, MetalCompute* mc, const std::string& p, int dim,
 }  // namespace
 
 bool
+bind_qlinear(WeightSet& ws, MetalCompute* mc, const std::string& name, int K,
+             bool stream, QWeight& out, int* group, std::string* miss,
+             std::string* err, WeightSet::Residency kept)
+{
+  int local = 0;
+  return need_q_(ws, mc, name, stream, K, out,
+                 group != nullptr ? group : &local, miss, err, kept);
+}
+
+bool
 bind_block(WeightSet& ws, MetalCompute* mc, const DitConfig& cfg, int layer,
-           bool stream, GpuBlockWeights& out, std::string* err)
+           bool stream, GpuBlockWeights& out, std::string* err,
+           WeightSet::Residency kept)
 {
   std::string miss, qerr;
   // A quantization-shape complaint says far more than "missing X" -- the
@@ -377,14 +416,14 @@ bind_block(WeightSet& ws, MetalCompute* mc, const DitConfig& cfg, int layer,
       + ".";
   out.norm_eps = cfg.norm_eps;
   if (!bind_stream_(ws, mc, b, false, cfg, stream, out.video, &out.quant_group,
-                    &miss, &qerr)) {
+                    &miss, &qerr, kept)) {
     report(err);
     return false;
   }
   out.have_audio = cfg.use_audio_video_cross_attention;
   if (!out.have_audio) { return true; }
   if (!bind_stream_(ws, mc, b, true, cfg, stream, out.audio, &out.quant_group,
-                    &miss, &qerr)) {
+                    &miss, &qerr, kept)) {
     report(err);
     return false;
   }
@@ -397,17 +436,17 @@ bind_block(WeightSet& ws, MetalCompute* mc, const DitConfig& cfg, int layer,
   const bool ok =
       bind_attn_(ws, mc, b + "audio_to_video_attn", ah, ahd,
                  /*query=*/cfg.inner_dim(), /*ctx=*/cfg.audio_inner_dim(),
-                 stream, out.a2v, &out.quant_group, &miss, &qerr) &&
+                 stream, out.a2v, &out.quant_group, &miss, &qerr, kept) &&
       bind_attn_(ws, mc, b + "video_to_audio_attn", ah, ahd,
                  /*query=*/cfg.audio_inner_dim(), /*ctx=*/cfg.inner_dim(),
-                 stream, out.v2a, &out.quant_group, &miss, &qerr);
+                 stream, out.v2a, &out.quant_group, &miss, &qerr, kept);
   if (!ok) { report(err); }
   return ok;
 }
 
 bool
 bind_trunk(WeightSet& ws, MetalCompute* mc, const DitConfig& cfg,
-           DitTrunk& out, std::string* err)
+           DitTrunk& out, std::string* err, WeightSet::Residency kept)
 {
   const std::string p(kDitPrefix);
   const int vd = cfg.inner_dim(), ad = cfg.audio_inner_dim();
@@ -416,20 +455,23 @@ bind_trunk(WeightSet& ws, MetalCompute* mc, const DitConfig& cfg,
   // is on; without it the block would want six. Sized from the config so
   // a checkpoint that disagrees fails at bind rather than at forward.
   const int k = cfg.cross_attention_adaln ? 9 : 6;
-  bool ok = bind_adaln_(ws, mc, p + "adaln_single", vd, k * vd, out.video);
-  ok &= bind_adaln_(ws, mc, p + "audio_adaln_single", ad, k * ad, out.audio);
-  ok &= bind_adaln_(ws, mc, p + "prompt_adaln_single", vd, 2 * vd, out.prompt);
+  bool ok = bind_adaln_(ws, mc, p + "adaln_single", vd, k * vd, out.video,
+      kept);
+  ok &= bind_adaln_(ws, mc, p + "audio_adaln_single", ad, k * ad, out.audio,
+      kept);
+  ok &= bind_adaln_(ws, mc, p + "prompt_adaln_single", vd, 2 * vd, out.prompt,
+      kept);
   ok &= bind_adaln_(ws, mc, p + "audio_prompt_adaln_single", ad, 2 * ad,
-                    out.audio_prompt);
+                    out.audio_prompt, kept);
   if (cfg.use_audio_video_cross_attention) {
     ok &= bind_adaln_(ws, mc, p + "av_ca_video_scale_shift_adaln_single",
-                      vd, 4 * vd, out.av_video_ss);
+                      vd, 4 * vd, out.av_video_ss, kept);
     ok &= bind_adaln_(ws, mc, p + "av_ca_audio_scale_shift_adaln_single",
-                      ad, 4 * ad, out.av_audio_ss);
+                      ad, 4 * ad, out.av_audio_ss, kept);
     ok &= bind_adaln_(ws, mc, p + "av_ca_a2v_gate_adaln_single", vd, vd,
-                      out.av_a2v_gate);
+                      out.av_a2v_gate, kept);
     ok &= bind_adaln_(ws, mc, p + "av_ca_v2a_gate_adaln_single", ad, ad,
-                      out.av_v2a_gate);
+                      out.av_v2a_gate, kept);
   }
   if (!ok) {
     if (err != nullptr) { *err = "one or more adaLN MLPs are missing"; }
@@ -438,10 +480,14 @@ bind_trunk(WeightSet& ws, MetalCompute* mc, const DitConfig& cfg,
 
   std::string miss;
   const bool bound =
-      need_(ws, mc, p + "patchify_proj.weight", false, out.patchify_w, &miss) &&
-      need_(ws, mc, p + "patchify_proj.bias",   false, out.patchify_b, &miss) &&
-      need_(ws, mc, p + "proj_out.weight", false, out.proj_out_w, &miss) &&
-      need_(ws, mc, p + "proj_out.bias",   false, out.proj_out_b, &miss) &&
+      need_(ws, mc, p + "patchify_proj.weight", false, out.patchify_w, &miss,
+          kept) &&
+      need_(ws, mc, p + "patchify_proj.bias",   false, out.patchify_b, &miss,
+          kept) &&
+      need_(ws, mc, p + "proj_out.weight", false, out.proj_out_w, &miss,
+          kept) &&
+      need_(ws, mc, p + "proj_out.bias",   false, out.proj_out_b, &miss,
+          kept) &&
       need_f32_as_bf16_(ws, mc, p + "scale_shift_table", out.scale_shift_out,
                         &miss);
   if (!bound) {
@@ -451,13 +497,13 @@ bind_trunk(WeightSet& ws, MetalCompute* mc, const DitConfig& cfg,
   if (cfg.use_audio_video_cross_attention) {
     const bool ab =
         need_(ws, mc, p + "audio_patchify_proj.weight", false,
-              out.audio_patchify_w, &miss) &&
+              out.audio_patchify_w, &miss, kept) &&
         need_(ws, mc, p + "audio_patchify_proj.bias", false,
-              out.audio_patchify_b, &miss) &&
+              out.audio_patchify_b, &miss, kept) &&
         need_(ws, mc, p + "audio_proj_out.weight", false, out.audio_proj_out_w,
-              &miss) &&
+              &miss, kept) &&
         need_(ws, mc, p + "audio_proj_out.bias", false, out.audio_proj_out_b,
-              &miss) &&
+              &miss, kept) &&
         need_f32_as_bf16_(ws, mc, p + "audio_scale_shift_table",
                           out.audio_scale_shift_out, &miss);
     if (!ab) {
@@ -468,7 +514,7 @@ bind_trunk(WeightSet& ws, MetalCompute* mc, const DitConfig& cfg,
   // Optional: zero-initialised in checkpoints that predate it, and an
   // exact no-op when absent.
   out.keyframes_abs_pos = get_(ws, mc, p + "keyframes_abs_pos_embedding",
-                               false);
+                               false, kept);
   return true;
 }
 

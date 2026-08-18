@@ -408,6 +408,25 @@ main()
       if (shared) {
         std::printf("       arena holds %.2f MB, shared by both blocks\n",
                     (double)arena->bytes() / (1024.0 * 1024.0));
+        // THE STATIC ESTIMATE, held to the real thing.
+        //
+        // Ltx25Dit::scratch_bytes is what a bounded box sizes its pinned
+        // prefix against, at LOAD, before any arena exists -- so it is a
+        // promise about reserve() made by code that cannot see it. EXACT
+        // is the bar, not close: the two are the same arithmetic over the
+        // same widths, and a tolerance here would only hide the day
+        // reserve() grows a buffer this forgets.
+        // The four widths reserve() reduces its arguments to.
+        const std::size_t td = (std::size_t)std::max(std::max(kTV, kTA), kTT);
+        const std::size_t dd = (std::size_t)std::max(kVD, kAD);
+        const std::uint64_t est = ltx25::BlockScratch::predict_bytes(
+            td, dd, 4 * dd, 1);
+        std::printf("       static estimate %.2f MB\n",
+                    (double)est / (1024.0 * 1024.0));
+        check(est == arena->bytes(),
+              "scratch_bytes() predicts the arena exactly (" +
+              std::to_string(est) + " vs " +
+              std::to_string(arena->bytes()) + ")");
         // Both blocks must be pointing at the SAME object, or the test
         // is measuring two private arenas and proving nothing.
         check(b0->scratch().get() == b1->scratch().get(),

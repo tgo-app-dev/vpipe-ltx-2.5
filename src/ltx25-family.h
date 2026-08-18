@@ -30,6 +30,7 @@ public:
 
   // frames % 8 == 1, rounded up.
   int align_frames(const std::string& root, int frames) const override;
+  void size_grid(const std::string& root, int* gh, int* gw) const override;
 
   std::vector<vpipe::ResourceClaim>
   declare_resources(const std::string& root) const override;

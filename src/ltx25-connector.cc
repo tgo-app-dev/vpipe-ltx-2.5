@@ -13,17 +13,18 @@ namespace {
 
 SharedBuffer
 get_(WeightSet& ws, vpipe::metal_compute::MetalCompute* mc,
-     const std::string& n)
+     const std::string& n, WeightSet::Residency kept)
 {
   if (!ws.has(n)) { return SharedBuffer{}; }
-  return ws.tensor(n, mc, WeightSet::Residency::Mapped);
+  return ws.tensor(n, mc, kept);
 }
 
 bool
 need_(WeightSet& ws, vpipe::metal_compute::MetalCompute* mc,
-      const std::string& n, SharedBuffer& out, std::string* miss)
+      const std::string& n, SharedBuffer& out, std::string* miss,
+      WeightSet::Residency kept)
 {
-  out = get_(ws, mc, n);
+  out = get_(ws, mc, n, kept);
   if (out.empty()) {
     if (miss != nullptr && miss->empty()) { *miss = n; }
     return false;
@@ -35,7 +36,8 @@ need_(WeightSet& ws, vpipe::metal_compute::MetalCompute* mc,
 
 std::unique_ptr<Ltx25Connector>
 Ltx25Connector::load(const DitConfig& cfg, WeightSet& ws, const MetalOps& ops,
-                     bool audio, std::string* err)
+                     bool audio, std::string* err,
+                     WeightSet::Residency kept)
 {
   std::unique_ptr<Ltx25Connector> c(new Ltx25Connector());
   c->_ops = &ops;
@@ -58,10 +60,14 @@ Ltx25Connector::load(const DitConfig& cfg, WeightSet& ws, const MetalOps& ops,
   const std::string root = std::string(kDitPrefix) +
                            (audio ? "audio_" : "video_") +
                            "embeddings_connector.";
-  std::string miss;
+  std::string miss, qerr;
+  // Group is fixed across the connector, as it is across a block:
+  // two group sizes would need two kernels bound at once, and
+  // silently running the wrong one is a full-speed wrong answer.
+  int qgroup = 0;
   if (c->_n_registers > 0 &&
       !need_(ws, ops.mc(), root + "learnable_registers", c->_registers,
-             &miss)) {
+             &miss, kept)) {
     if (err != nullptr) { *err = "missing '" + miss + "'"; }
     return nullptr;
   }
@@ -71,36 +77,60 @@ Ltx25Connector::load(const DitConfig& cfg, WeightSet& ws, const MetalOps& ops,
     Block& b = c->_blocks[(std::size_t)i];
     const std::string p =
         root + "transformer_1d_blocks." + std::to_string(i) + ".";
+    // The MATRICES through bind_qlinear (dense or affine, decided by the
+    // checkpoint's own siblings); the biases and norms straight. `.weight`
+    // is appended by the binder, so these name the LINEAR and not the
+    // tensor. All four attention projections read the connector width;
+    // ff.net.2 reads the 4x hidden.
     const bool ok =
-        need_(ws, ops.mc(), p + "attn1.to_q.weight", b.q_w, &miss) &&
-        need_(ws, ops.mc(), p + "attn1.to_q.bias",   b.q_b, &miss) &&
-        need_(ws, ops.mc(), p + "attn1.to_k.weight", b.k_w, &miss) &&
-        need_(ws, ops.mc(), p + "attn1.to_k.bias",   b.k_b, &miss) &&
-        need_(ws, ops.mc(), p + "attn1.to_v.weight", b.v_w, &miss) &&
-        need_(ws, ops.mc(), p + "attn1.to_v.bias",   b.v_b, &miss) &&
-        need_(ws, ops.mc(), p + "attn1.to_out.0.weight", b.o_w, &miss) &&
-        need_(ws, ops.mc(), p + "attn1.to_out.0.bias",   b.o_b, &miss) &&
-        need_(ws, ops.mc(), p + "attn1.q_norm.weight", b.q_norm, &miss) &&
-        need_(ws, ops.mc(), p + "attn1.k_norm.weight", b.k_norm, &miss) &&
+        bind_qlinear(ws, ops.mc(), p + "attn1.to_q", c->_dim, false, b.q_w,
+                     &qgroup, &miss, &qerr, kept) &&
+        need_(ws, ops.mc(), p + "attn1.to_q.bias",   b.q_b, &miss, kept) &&
+        bind_qlinear(ws, ops.mc(), p + "attn1.to_k", c->_dim, false, b.k_w,
+                     &qgroup, &miss, &qerr, kept) &&
+        need_(ws, ops.mc(), p + "attn1.to_k.bias",   b.k_b, &miss, kept) &&
+        bind_qlinear(ws, ops.mc(), p + "attn1.to_v", c->_dim, false, b.v_w,
+                     &qgroup, &miss, &qerr, kept) &&
+        need_(ws, ops.mc(), p + "attn1.to_v.bias",   b.v_b, &miss, kept) &&
+        bind_qlinear(ws, ops.mc(), p + "attn1.to_out.0", c->_dim, false,
+                     b.o_w, &qgroup, &miss, &qerr, kept) &&
+        need_(ws, ops.mc(), p + "attn1.to_out.0.bias",   b.o_b, &miss, kept) &&
+        need_(ws, ops.mc(), p + "attn1.q_norm.weight", b.q_norm, &miss, kept) &&
+        need_(ws, ops.mc(), p + "attn1.k_norm.weight", b.k_norm, &miss, kept) &&
         // The connector's feed-forward HAS bias, unlike the DiT's video
         // one. Required, not probed: a missing bias here means the
         // checkpoint disagrees with connector_ff_bias and the result
         // would be quietly shifted.
-        need_(ws, ops.mc(), p + "ff.net.0.proj.weight", b.ff_in, &miss) &&
-        need_(ws, ops.mc(), p + "ff.net.0.proj.bias",   b.ff_in_b, &miss) &&
-        need_(ws, ops.mc(), p + "ff.net.2.weight", b.ff_out, &miss) &&
-        need_(ws, ops.mc(), p + "ff.net.2.bias",   b.ff_out_b, &miss);
+        bind_qlinear(ws, ops.mc(), p + "ff.net.0.proj", c->_dim, false,
+                     b.ff_in, &qgroup, &miss, &qerr, kept) &&
+        need_(ws, ops.mc(), p + "ff.net.0.proj.bias",   b.ff_in_b, &miss,
+            kept) &&
+        bind_qlinear(ws, ops.mc(), p + "ff.net.2", c->_ff_hidden, false,
+                     b.ff_out, &qgroup, &miss, &qerr, kept) &&
+        need_(ws, ops.mc(), p + "ff.net.2.bias",   b.ff_out_b, &miss, kept);
     if (!ok) {
       if (err != nullptr) {
-        *err = "connector block " + std::to_string(i) + ": missing '" +
-               miss + "'";
+        // A quantization-shape complaint says more than "missing X" --
+        // the tensor IS there, its shapes just do not close -- so it
+        // wins the message, exactly as it does for a block.
+        *err = "connector block " + std::to_string(i) + ": " +
+               (qerr.empty() ? "missing '" + miss + "'" : qerr);
       }
       return nullptr;
     }
-    b.gate_w = get_(ws, ops.mc(), p + "attn1.to_gate_logits.weight");
+    if (b.q_w.quantized && !ops.quant_available()) {
+      if (err != nullptr) {
+        *err = "the connector is quantized but this host's affine qmm "
+               "kernels did not resolve -- an unvalidated ComputeFunction "
+               "is a silent no-op, so this refuses rather than running the "
+               "connector over uninitialised memory";
+      }
+      return nullptr;
+    }
+    b.gate_w = get_(ws, ops.mc(), p + "attn1.to_gate_logits.weight", kept);
     b.has_gate = !b.gate_w.empty();
     if (b.has_gate) {
-      b.gate_b = get_(ws, ops.mc(), p + "attn1.to_gate_logits.bias");
+      b.gate_b = get_(ws, ops.mc(), p + "attn1.to_gate_logits.bias", kept);
     }
   }
   return c;

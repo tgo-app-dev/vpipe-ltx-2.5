@@ -33,12 +33,29 @@ namespace ltx25 {
 //
 // ---- MEMORY ----
 //
-// im2col is the large transient: cells x C x 27 elements. At 512x512 x 9
-// frames that is ~1 GB for a single block if built whole, so the
-// convolution is CHUNKED over output cells and the scratch is bounded by
-// `max_im2col_elems()` rather than by the picture size. Bigger chunks
-// are faster (one GEMM instead of several), so the bound is a memory
-// ceiling, not a tuning knob to minimise.
+// im2col is the large transient WITHIN one convolution: cells x C x 27
+// elements. At 512x512 x 9 frames that is ~1 GB for a single block if
+// built whole, so the convolution is CHUNKED over output cells and the
+// scratch is bounded by `max_im2col_elems()` rather than by the picture
+// size. Bigger chunks are faster (one GEMM instead of several), so the
+// bound is a memory ceiling, not a tuning knob to minimise.
+//
+// ACROSS convolutions the transient is the feature map, and the rule
+// that bounds it is: COMMIT AND WAIT AT EVERY BLOCK BOUNDARY, then reuse
+// the buffers. An un-committed Metal command buffer RETAINS every
+// resource it references, so a SharedBuffer whose destructor has already
+// run stays allocated until that buffer completes -- which means a
+// decoder that encodes its whole graph before committing holds every
+// intermediate of every level at once, however carefully the C++ scopes
+// are written.
+//
+// MEASURED at 960x544x121, decoding the whole graph into one command
+// buffer: 32.6 GB peak process footprint, 20.3 GB of it still standing
+// when the frame sink was called. Committing per block and reusing three
+// slots takes the same decode to ~4 GB. The scaling is in the CELL
+// count, so it is invisible at test geometries -- the same decoder at
+// 9 frames of 64x64 moves 129 MB, of which 128 MB is the fixed im2col
+// buffer.
 class Ltx25VaeDecoder {
 public:
   static std::unique_ptr<Ltx25VaeDecoder>
@@ -46,10 +63,24 @@ public:
        const MetalOps& ops, std::string* err);
 
   // `latent` is f32 [latent_channels][F][H][W]. Writes f32
-  // [3][8*(F-1)+1][32*H][32*W].
+  // [3][8*(F-1)+1][32*H][32*W] into `out`, which is UMA memory the
+  // caller may read directly -- a frame sink gets `contents()` without a
+  // copy. At this model's real geometry that copy is 758 MB.
+  bool decode(const float* latent, int F, int H, int W,
+              vpipe::metal_compute::SharedBuffer* out,
+              std::array<int, 4>* shape, std::string* err);
+
+  // The same decode, copied into host memory. For callers holding the
+  // picture as a plain vector (the reference tests); the real path uses
+  // the buffer form above.
   bool decode(const float* latent, int F, int H, int W,
               std::vector<float>* out, std::array<int, 4>* shape,
               std::string* err);
+
+  // Drop what a decode leaves behind -- the im2col scratch, which is
+  // `max_im2col_elems()` wide and outlives the call so consecutive beats
+  // do not rebuild it. Everything else is already released per block.
+  void release_idle();
 
   // The im2col chunk ceiling, in ELEMENTS. Default 64 M (128 MB at
   // bf16).

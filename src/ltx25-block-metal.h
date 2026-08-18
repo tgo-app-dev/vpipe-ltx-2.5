@@ -193,6 +193,19 @@ struct BlockScratch {
 
   // Bytes held, for the log line that makes the saving visible.
   std::uint64_t bytes() const noexcept;
+
+  // What reserve() WILL allocate at these widths, before an arena
+  // exists. Pure arithmetic, and it lives HERE -- next to the allocation
+  // it predicts -- because the two have to move together: a caller sizes
+  // a pinned prefix against this at LOAD time, long before it can
+  // measure anything, and an estimate that drifts from reserve() is
+  // worse than no estimate at all.
+  //
+  // `t` is the widest of video / audio / caption tokens, `d` the widest
+  // stream, `f` the widest feed-forward hidden, `l` the denoise levels
+  // -- the same four reserve() reduces its arguments to.
+  static std::uint64_t predict_bytes(std::size_t t, std::size_t d,
+                                     std::size_t f, std::size_t l) noexcept;
 };
 
 class MetalBlock {

@@ -9,6 +9,7 @@
 #include "ltx25-metal-ops.h"
 #include "ltx25-rope.h"
 
+#include "generative-models/shared/block-residency.h"
 #include "generative-models/weight-set.h"
 
 #include <cstdint>
@@ -50,9 +51,52 @@ public:
   // cannot hold them runs them this way and the manager sees the
   // traffic. The trunk is always cached -- it is a few hundred MB and
   // every step reads it.
+  // `pin_frac` is the HOST's answer to "how much of RAM may the pinned
+  // prefix take", from model_memory::plan_streaming. It is threaded in
+  // rather than derived here for the reason every built-in DiT in the
+  // host tree threads it: the fraction depends on what the rest of the
+  // GRAPH will be holding during the denoise -- the text encoder above
+  // all -- and a model cannot see that.
+  //
+  // 0 means PIN NOTHING, which is what the plan returns when there is no
+  // room, and it is not a missing value to be replaced by a default. This
+  // model still pins ONE block at 0, because the block scratch is sized
+  // from a resident block and a stack with none cannot run; every
+  // built-in pins zero there, having no such constraint.
+  //
+  // Ignored when `stream_blocks` is false -- then every block is resident
+  // and there is no prefix to size.
   static std::unique_ptr<Ltx25Dit>
-  load(const Config& cfg, vpipe::genai::WeightSet& ws, const MetalOps& ops,
-       bool stream_blocks, std::string* err, bool with_connectors = false);
+  load(const Config& cfg, std::shared_ptr<vpipe::genai::WeightSet> ws,
+       const MetalOps& ops, bool stream_blocks, double pin_frac,
+       int plan_w, int plan_h, int plan_frames, std::string* err,
+       bool with_connectors = false);
+
+  // Streaming state, for the stage's log line and its declaration.
+  //
+  // `pinned_blocks()` is how many LEADING blocks are held resident; the
+  // rest are read per forward and freed. `pinned_bytes()` is what this
+  // model actually keeps, which is what revise_declaration() must be
+  // told -- a streaming model that goes on declaring the whole
+  // checkpoint makes every peer size against weights that are not there.
+  bool        streaming() const noexcept { return _stream_blocks; }
+  int         pinned_blocks() const noexcept { return _pinned; }
+  std::size_t pinned_bytes() const noexcept;
+
+  // ---- growing back into free RAM (mechanism 4) ---------------------
+  //
+  // Streaming every block on every step is the safe answer and an
+  // expensive one. When there is room, a streamed block is KEPT after it
+  // runs and the next forward finds it resident.
+  //
+  // `bytes` is what must stay clear for whatever runs AFTER this
+  // forward and has not allocated yet -- the VAE decode above all. Zero
+  // is a real answer ("nothing runs after me that I do not free
+  // first"), and it is different from never calling this: growth stays
+  // OFF until a caller sets a reserve at least once, so a model whose
+  // stage never asks the question streams forever and looks in the log
+  // exactly like one that chose to.
+  void set_residency_reserve(std::size_t bytes);
 
   // Fix the geometry: build the four RoPE tables and size the scratch.
   // Separate from load() because the tables depend on the REQUEST
@@ -126,6 +170,28 @@ public:
   // Weight bytes the per-step host chains no longer TOUCH. This is not
   // memory freed -- see above. 0 before the bake runs.
   std::uint64_t adaln_bytes_per_step() const noexcept { return _baked_freed; }
+
+  // What the shared arena WILL hold at a given geometry, before one
+  // exists.
+  //
+  // Static, and derived from the same numbers MetalBlock::reserve()
+  // allocates from, because the callers that need it have no model yet:
+  // the pinned-prefix count is decided at LOAD, and sizing it against a
+  // constant is what put 20 of 48 blocks on a 16 GB box. MiniMax-H3
+  // states the same figure the same way (scratch_bytes there), and for
+  // the same reason -- the term scales with the token count, so a
+  // constant is wrong at every geometry but one.
+  //
+  // Checked against reality rather than trusted: ltx25-block-metal-test
+  // reserves a real arena at several geometries and holds this to
+  // BlockScratch::bytes(). An estimate that drifts from what reserve()
+  // does is worse than none, because it is the number a bounded box
+  // commits to before it can measure anything.
+  //
+  // `levels` is the denoise-level count (1 unconditioned).
+  static std::uint64_t scratch_bytes(const DitConfig& cfg, int video_tokens,
+                                     int audio_tokens, int text_tokens,
+                                     int levels);
 
   // Bytes the block stack's shared scratch arena holds. This IS real
   // memory, and it is the term that scales with the clip: it used to be
@@ -226,7 +292,45 @@ private:
   const MetalOps* _ops = nullptr;
   DitConfig _cfg;
   DitTrunk  _trunk;
+  // Held for this model's lifetime, per the WeightSet contract -- and
+  // here it is load-bearing rather than bookkeeping: a streamed block is
+  // read from this set inside the forward.
+  std::shared_ptr<vpipe::genai::WeightSet> _ws;
+  // Full depth ALWAYS. When streaming, only [0, _pinned) are filled and
+  // the rest are null -- a null slot is the signal to read that block
+  // for this forward and drop it again. Sizing the vector to the full
+  // depth rather than to _pinned is what lets the forward index blocks
+  // by layer without a second mapping.
   std::vector<std::unique_ptr<MetalBlock>> _blocks;
+  bool _stream_blocks = false;
+  int  _pinned = 0;
+  // The geometry a streamed block has to be given when it is built,
+  // recorded by set_geometry because the block does not exist yet when
+  // that runs.
+  int  _geo_levels = 1;
+  // Mechanism 4. Promotion is per streamed block, eviction is from the
+  // TAIL -- never into the pinned prefix, which is not its to give.
+  vpipe::genai::BlockResidency _resid;
+
+  // Free the highest-index resident block, returning the bytes freed.
+  // `allow_pinned` lets it dip into the prefix -- see the definition.
+  std::size_t evict_tail_block_(bool allow_pinned = false);
+  // mincore over EVERY block this model is holding, prefix included.
+  // The prefix is not exempt from the question: it was sized at load
+  // against what the box was believed to hold, and the measurement is
+  // how that belief gets checked.
+  void resident_pages_(std::size_t* examined, std::size_t* incore) const;
+
+  // Read block `i` and make it ready to run: bind its weights, adopt the
+  // shared scratch arena, and give it the RoPE tables set_geometry built.
+  //
+  // `arena` is passed BY VALUE rather than read from `_scratch`, because
+  // this is also what the prefetch thread calls: a copy taken on the
+  // main thread before the thread starts is a shared_ptr the worker can
+  // read without racing the member.
+  bool build_block_(int i, std::shared_ptr<BlockScratch> arena,
+                    std::unique_ptr<MetalBlock>& out,
+                    std::string* err) const;
   bool _has_connector = false;
   bool _have_audio = false;
 

@@ -91,6 +91,18 @@ Ltx25Family::align_frames(const std::string& root, int frames) const
   return align_num_frames(frames);
 }
 
+void
+Ltx25Family::size_grid(const std::string& root, int* gh, int* gw) const
+{
+  (void)root;   // the rule is the VAE's, and every LTX-2.5 VAE shares it
+  // 32 in both axes: the conv VAE compresses space by 32, and the DiT's
+  // patch is 1 on top of that. A size that is not a multiple comes back
+  // rounded UP rather than refused, so a caller asks for the picture it
+  // wants instead of deriving one from the compression ratio.
+  if (gh != nullptr) { *gh = 32; }
+  if (gw != nullptr) { *gw = 32; }
+}
+
 std::vector<ResourceClaim>
 Ltx25Family::declare_resources(const std::string& root) const
 {
@@ -245,54 +257,74 @@ Ltx25Family::load(const VideoModelCreateArgs& args)
   if (const char* e = std::getenv("VPIPE_LTX25_STREAM")) {
     stream = (std::atoi(e) != 0);
   }
+  // THE PINNED-PREFIX FRACTION, from the same plan. Every built-in DiT in
+  // the host tree threads this; this port used to drop it and pass a
+  // hardcoded 0.60 down instead, which is the whole reason a 16 GB box
+  // pinned 20 of 48 blocks against a plan that had computed room for
+  // none. It is a property of the GRAPH -- what else is resident during
+  // the denoise -- so the model cannot derive it.
+  //
+  // Overridable in the same shape as VPIPE_LTX25_STREAM beside it: a
+  // forced `stream=0` makes the fraction meaningless (nothing streams, so
+  // there is no prefix), and a forced `stream=1` on a roomy box wants a
+  // way to ask for a real prefix anyway.
+  double pin_frac = plan.pin_frac;
+  if (std::getenv("VPIPE_LTX25_STREAM") != nullptr && !stream) {
+    pin_frac = 0.0;
+  }
+  if (const char* e = std::getenv("VPIPE_LTX25_PIN_FRAC")) {
+    pin_frac = std::atof(e);
+  }
   if (args.session != nullptr) {
     args.session->info(fmt(
-        "ltx-2.5: footprint {} GB (peers {} GB) + {} GB headroom -> {}",
+        "ltx-2.5: footprint {} GB (peers {} GB) + {} GB headroom -> {} "
+        "(pin_frac {:.3f})",
         plan.footprint >> 30, plan.others >> 30,
         vpipe::model_memory::kStreamHeadroom >> 30,
-        stream ? "STREAM blocks" : "PRELOAD"));
+        stream ? "STREAM blocks" : "PRELOAD", pin_frac));
   }
 
-  // ---- WHAT `stream` MEANS HERE, WHICH IS NOT WHAT IT MEANS ELSEWHERE
+  // WHAT `stream` MEANS HERE. The blocks ARE the checkpoint, and a
+  // streaming run keeps a PINNED PREFIX of them resident and reads the
+  // rest per forward, dropping each after use -- the same policy, and
+  // the same shared `stream_pin_count` rule, as every other streaming
+  // DiT in the host tree.
   //
-  // Two things a reader of docs/MODEL-MEMORY.md will expect at this
-  // point, and both would be WRONG for this model. Recorded because the
-  // obvious "fix" in either direction makes things worse.
-  //
-  // 1. NO revise_declaration(). The doc is emphatic that a streaming DiT
-  //    must revise down to its pinned prefix, and every in-tree DiT
-  //    does. This one must not, because it does not pin less: LTX binds
-  //    its blocks `Mapped` in BOTH arms (see get_ in
-  //    ltx25-dit-weights.cc), and `stream` selects only whether the
-  //    WeightSet keeps a cached alias. The whole 42 GB shard is mapped
-  //    either way. Revising down would report a smaller number for a
-  //    model whose mapping did not shrink -- which is precisely the
-  //    "revision reads as roominess" failure the doc warns about, except
-  //    self-inflicted and untrue rather than honest-but-lossy.
-  //
-  // 2. NO BlockResidency. Mechanism 4 admits and EVICTS explicit block
-  //    buffers. There are none here: nothing is re-read per forward and
-  //    nothing can be handed back, so admit()/evict() would have no
-  //    referent. Wiring it would produce exactly the decorative
-  //    machinery the doc calls out -- a model that looks like it manages
-  //    residency and does not.
-  //
-  // What actually governs this model's residency is the kernel: file-
-  // backed pages, dropped for free under pressure and re-faulted on
-  // demand. So the lever that matters is not this verdict but how much
-  // ANONYMOUS memory sits beside it -- above all the 24 GB Gemma
-  // encoder, which is `Copied` and therefore reclaimable only through
-  // the compressor. That is why ltx-2.5-conditioner defaults to
-  // destroying it, and why it revises ITS declaration: see
-  // Ltx25ConditionerStage::destroy_encoder_.
-
+  // It is a prefix rather than a cache on purpose. A forward is a cyclic
+  // scan over the stack, so recency predicts nothing: an LRU set of any
+  // size is evicted exactly before it comes round again and gives ~0%
+  // hits, while a fixed subset gives exactly its share. That is also why
+  // the blocks are read `Copied` rather than `Mapped` -- letting the
+  // kernel's page cache own their residency is precisely the LRU case,
+  // and it degrades with no control on a box that cannot hold the file.
+  // The clip the graph plans, so the pinned prefix is sized against the
+  // arena that clip will actually need rather than a constant. Zero when
+  // the stage could not settle it, which Ltx25Dit reads as "unknown" and
+  // falls back on.
   auto g = Ltx25Generator::create(cfg, std::move(ws), args.metal, stream,
-                                  args.session, &err);
+                                  pin_frac, args.width, args.height,
+                                  args.frames, args.session, &err);
   if (!g) {
     if (args.session != nullptr) {
       args.session->error(fmt("ltx-2.5: {}", err));
     }
     return nullptr;
+  }
+  // A streaming DiT keeps its pinned prefix, not the checkpoint, so the
+  // load-time claim would go on sizing every peer against the whole
+  // thing. Peers that then decline to free something are the difference
+  // between a run that fits and one that swaps.
+  if (g->streaming_blocks() && args.session != nullptr) {
+    auto* mgr = args.session->services()->generative_model_manager();
+    if (mgr != nullptr) {
+      const std::size_t held = g->pinned_weight_bytes();
+      mgr->revise_declaration(cfg.dit_file, held);
+      args.session->info(fmt(
+          "ltx-2.5: streaming keeps {} of {} blocks resident ({} MB); "
+          "declaration revised from {} MB",
+          g->pinned_blocks(), cfg.dit.num_layers, held >> 20,
+          vpipe::model_memory::dir_weights_bytes(cfg.dit_file) >> 20));
+    }
   }
   return g;
 }

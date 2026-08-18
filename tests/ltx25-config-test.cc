@@ -7,7 +7,10 @@
 // like a pass. It says which it did.
 
 #include "ltx25-config.h"
+#include "ltx25-quant-family.h"
 
+#include <filesystem>
+#include <fstream>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -74,6 +77,27 @@ test_variant_from_filename()
         == Variant::kDev, "dev");
   check(ltx25::variant_of_filename("something-else.safetensors")
         == Variant::kUnknown, "neither");
+
+  // A SELF-CONTAINED pack names the variant on its ROOT: model-quantize
+  // writes <name>/diffusion_models/, so the leaf is the role directory
+  // and says nothing. This is what a quantized model actually looks like
+  // on disk, and reading only the leaf reported kUnknown for it -- which
+  // silenced the "your step count is being ignored" notice for exactly
+  // the checkpoints most people run.
+  check(ltx25::variant_of_filename(
+            "/m/local/LTX-2.5-distilled-8bit/diffusion_models")
+        == Variant::kDistilled, "a quantized pack, named on its root");
+  check(ltx25::variant_of_filename(
+            "/m/local/LTX-2.5-dev-4bit/diffusion_models")
+        == Variant::kDev, "and the dev one likewise");
+  // ONE level up, and only past the role directory. The variant words
+  // are ordinary English, so a full-path search takes somebody's home
+  // directory for the dev checkpoint.
+  check(ltx25::variant_of_filename(
+            "/Users/dev/models/whatever/diffusion_models")
+        == Variant::kUnknown, "but not from further up the path");
+  check(ltx25::variant_of_filename("/Users/dev/models/plain.safetensors")
+        == Variant::kUnknown, "nor from a parent that is not the role dir");
 }
 
 void
@@ -166,6 +190,156 @@ test_rejects_lookalike(const char* root)
         : "refused (" + err + ")");
 }
 
+
+// The SELF-CONTAINED layout: `model-quantize`'s registered-family path
+// replaces a whole role subdir with the quantized component, so the
+// config.json sits AT `diffusion_models/` and `text_encoders/` rather
+// than in a pack inside them. Needs no checkpoint -- it is a question
+// about directory shapes, and the answer is a silent wrong one: a
+// resolver that does not know the shape reports "no readable DiT" for a
+// model that plainly has one.
+//
+// It also pins the rule this must NOT break. A quantized encoder is
+// never preferred over a released bf16 one implicitly, because every
+// conditioning token comes out of it; the self-contained case is
+// different only because there is no bf16 file there to prefer.
+void
+test_self_contained_layout()
+{
+  namespace fs = std::filesystem;
+  std::printf("self-contained (role dir IS the checkpoint)\n");
+  std::error_code ec;
+  const fs::path base =
+      fs::temp_directory_path(ec) / "ltx25-selfcontained-test";
+  fs::remove_all(base, ec);
+
+  auto write = [](const fs::path& f, const std::string& body) {
+    std::error_code wec;
+    fs::create_directories(f.parent_path(), wec);
+    std::ofstream o(f);
+    o << body;
+  };
+  // Minimal but REAL: parse_dit_config refuses anything whose
+  // _class_name is not AVTransformer3DModel, so this is the same gate a
+  // genuine pack passes.
+  const std::string dit_cfg =
+      R"({"transformer":{"_class_name":"AVTransformer3DModel"}})";
+  const std::string enc_cfg = R"({"model_type":"gemma3n_text"})";
+
+  write(base / "diffusion_models" / "config.json", dit_cfg);
+  write(base / "text_encoders" / "config.json", enc_cfg);
+
+  ltx25::Config cfg;
+  std::string err;
+  const bool ok = ltx25::resolve(base.string(), cfg, &err);
+  check(ok, "a self-contained model resolves" +
+                (ok ? std::string() : (" -- " + err)));
+  if (ok) {
+    check(cfg.dit_file == (base / "diffusion_models").string(),
+          "the DiT is the diffusion_models/ role dir itself");
+    check(cfg.dit_is_dir, "and it is reported as a directory checkpoint");
+    check(cfg.enc_file == (base / "text_encoders").string(),
+          "the encoder is the text_encoders/ role dir itself");
+  }
+
+  // A NESTED pack beside it still wins when it is asked for by name --
+  // the role dir is a fallback for "there is nothing else", not a new
+  // preference that outranks an explicit request.
+  write(base / "text_encoders" / "enc-w4g64" / "config.json", enc_cfg);
+  ltx25::Config c2;
+  const bool ok2 = ltx25::resolve(base.string(), c2, &err, {}, "w4g64");
+  check(ok2 && c2.enc_file ==
+                   (base / "text_encoders" / "enc-w4g64").string(),
+        "an asked-for nested pack still outranks the role dir");
+
+  fs::remove_all(base, ec);
+}
+
+// The QUANTIZE family's claim, which is what routes an LTX repo to
+// `model-quantize`'s self-contained path instead of the single-component
+// fallback. Two directions matter and they fail differently: a claim
+// that is too narrow silently drops the model back to the old shape,
+// and one that is too broad quantizes SOMEONE ELSE'S weights with LTX's
+// scope -- which writes a checkpoint that loads and is wrong.
+void
+test_quant_family_claim()
+{
+  namespace fs = std::filesystem;
+  std::printf("quantize-family claim\n");
+  std::error_code ec;
+  const fs::path base = fs::temp_directory_path(ec) / "ltx25-claim-test";
+  fs::remove_all(base, ec);
+  auto write = [](const fs::path& f, const std::string& body) {
+    std::error_code wec;
+    fs::create_directories(f.parent_path(), wec);
+    std::ofstream o(f);
+    o << body;
+  };
+
+  ltx25::Ltx25QuantFamily fam;
+  check(fam.tag() == std::string_view("ltx-2.5"), "it names itself ltx-2.5");
+
+  // An LTX repo, in the shape a chain's SECOND pass is handed: the DiT
+  // already quantized to a directory checkpoint. Claiming this is what
+  // lets the encoder pass run at all.
+  write(base / "ltx" / "diffusion_models" / "config.json",
+        R"({"transformer":{"_class_name":"AVTransformer3DModel"}})");
+  check(fam.claims((base / "ltx").string()),
+        "claims an LTX repo whose DiT is already a directory checkpoint");
+
+  // A look-alike: same layout, another family's DiT. Refusing is the
+  // half that protects other people's checkpoints.
+  write(base / "other" / "diffusion_models" / "config.json",
+        R"({"transformer":{"_class_name":"WanTransformer3DModel"}})");
+  check(!fam.claims((base / "other").string()),
+        "refuses a repo whose DiT is another family's");
+  check(!fam.claims((base / "nope").string()),
+        "refuses a path that does not exist");
+
+  // The recipe. These two scopes ARE the port's quantization contract:
+  // the DiT excludes the modulation tables and gate logits, and the
+  // encoder's single prefix is what leaves the embedding table and
+  // LTX's projection dense.
+  const auto comps = fam.components();
+  check(comps.size() == 2, "describes two components");
+  if (comps.size() == 2) {
+    check(comps[0].target == "dit" && comps[0].role == "diffusion_models",
+          "the DiT: diffusion_models/");
+    // The scope by what it SELECTS, not by its spelling. It is a
+    // SUBSTRING, and it has to reach two stacks that are named
+    // differently: the DiT's `transformer_blocks.` and the two text
+    // connectors' `transformer_1d_blocks.`. The connectors were outside
+    // it once and shipped dense in a pack asked for at w8 -- 3.75 GB of
+    // bf16 that never streams -- so a scope that stops matching them is
+    // the regression to catch, and the literal cannot say that.
+    auto in_scope = [&](const char* n) {
+      return std::string(n).find(comps[0].scope) != std::string::npos;
+    };
+    check(in_scope("model.diffusion_model.transformer_blocks.0.attn1.to_q"
+                   ".weight"),
+          "the scope reaches the DiT block stack");
+    check(in_scope("model.diffusion_model.video_embeddings_connector"
+                   ".transformer_1d_blocks.0.attn1.to_k.weight") &&
+          in_scope("model.diffusion_model.audio_embeddings_connector"
+                   ".transformer_1d_blocks.7.ff.net.2.weight"),
+          "and BOTH text connectors' block stacks");
+    // And stops there: the trunk is read dense by bind_trunk, and the
+    // registers are a learned table rather than a matrix.
+    check(!in_scope("model.diffusion_model.patchify_proj.weight") &&
+          !in_scope("model.diffusion_model.adaln_single.linear.weight") &&
+          !in_scope("model.diffusion_model.video_embeddings_connector"
+                    ".learnable_registers"),
+          "but not the trunk or the connectors' learnable registers");
+    check(comps[0].exclude.find("scale_shift") != std::string::npos &&
+              comps[0].exclude.find("to_gate_logits") != std::string::npos,
+          "and it excludes the modulation tables and the gate logits");
+    check(comps[1].target == "text_encoder" &&
+              comps[1].role == "text_encoders" &&
+              comps[1].scope == "model.layers.",
+          "the encoder: text_encoders/, scoped to the Gemma backbone");
+  }
+  fs::remove_all(base, ec);
+}
 }  // namespace
 
 int
@@ -173,6 +347,8 @@ main()
 {
   test_frame_rule();
   test_variant_from_filename();
+  test_self_contained_layout();
+  test_quant_family_claim();
 
   if (const char* root = std::getenv("VPIPE_LTX25_TEST_MODEL_PATH")) {
     test_real_checkpoint(root);

@@ -25,7 +25,7 @@ pass per step, and output in **8 steps**.
 |---|---|
 | **Machine** | Apple Silicon Mac (M-series). |
 | **Memory** | **64 GB** for the bf16 checkpoint as shipped. Less needs the quantized pack — see [Memory](#memory). |
-| **Disk** | **~65 GB** to fetch; **+23 GB** if you quantize. |
+| **Disk** | **~65 GB** to fetch; **+38 GB** for the 8-bit model. |
 | **Build** | An Apple Silicon build of vpipe, plus this plugin built against it. See the [README](../README.md). |
 
 ### Disk space
@@ -39,7 +39,7 @@ five files this port reads:
 | Text encoder (Gemma-4 12B with LTX projections) | **~24 GB** |
 | Video VAE + audio VAE + duration head | **~1.5 GB** |
 | **Fetched total** | **~65 GB** |
-| w8g64 DiT, kept alongside the bf16 one | **+23 GB** |
+| the w8g64 model, built alongside (DiT 23 + encoder 15) | **+38 GB** |
 
 > **Do not fetch the whole repo.** It is **174 GB**, most of it `int8-convrot`
 > and `nvfp4` packings that are ComfyUI-only and deliberately not read here.
@@ -50,10 +50,14 @@ five files this port reads:
 
 - **[`prepare-ltx-2.5.vpipeline`](pipelines/prepare-ltx-2.5.vpipeline)** —
   download the checkpoint. Run once.
-- **[`prepare-ltx-2.5-w8.vpipeline`](pipelines/prepare-ltx-2.5-w8.vpipeline)**
-  — quantize the DiT to 8-bit. What the text-to-video pipeline below is
-  configured for, and what makes its 5-second clip comfortable; see
-  [Memory](#memory).
+- **[`prepare-ltx-2.5-8bit.vpipeline`](pipelines/prepare-ltx-2.5-8bit.vpipeline)**
+  — **the whole preparation in one run**: fetch, then quantize the DiT (its
+  block stack AND both text connectors, in one step) and the text encoder to
+  w8g64 into **one self-contained model**,
+  `local/LTX-2.5-distilled-8bit`. Start here on a fresh machine. Idempotent
+  (`skip_existing_files` on the fetch, `skip_existing` on both quantize
+  steps), so re-running after an interruption resumes rather than repeating
+  a finished half.
 - **[`ltx-2.5-text-to-video.vpipeline`](pipelines/ltx-2.5-text-to-video.vpipeline)**
   — prompt in, five seconds of `.mp4` with sound out.
 - **[`ltx-2.5-image-to-video.vpipeline`](pipelines/ltx-2.5-image-to-video.vpipeline)**
@@ -62,6 +66,24 @@ five files this port reads:
   — an audio file and a prompt in: the soundtrack is guided by the reference.
 
 They are plain JSON — read them, edit them, keep them in version control.
+
+> **What the 8-bit pipeline produces.** Two chained passes and one
+> directory: a quantized DiT, a quantized encoder, the VAEs untouched — a
+> model that can be named, moved and deleted as one thing, exactly like a
+> built-in family's quantized output. Everything it does not quantize is
+> **hard-linked**, so the second pass and the passthrough components cost no
+> extra bytes. Point a pipeline at `local/LTX-2.5-distilled-8bit` and both
+> precisions come with it: no `variant` and no `encoder_variant`, because a
+> self-contained model holds exactly one of each. Those two keys are for the
+> other arrangement — several DiTs, or a quantized pack sitting beside a
+> bf16 file, in one repo — and are covered in
+> [Choosing the pack](#choosing-the-pack).
+>
+> **The VAEs, vocoder, BWE, connector and audio encoder stay dense**, and
+> that is not an oversight: the `QWeight` path that can read a quantized
+> tensor at all exists only in the DiT blocks and (through the host's Gemma)
+> the encoder backbone. It is also where the bytes are not — both VAEs
+> together are 1.4 GB against the DiT's 42 GB and the encoder's 24.5 GB.
 
 **Every one of them needs the plugin**, because the stages and the catalogue
 entries come from it:
@@ -76,7 +98,7 @@ panel will load it for you instead — see
 Without it, launching any of these fails with `unknown stage type
 'ltx-2.5-conditioner'`.
 
-## Step 1 — fetch the model
+## Step 1 — fetch and prepare the model
 
 ### First, choose a work directory
 
@@ -90,22 +112,30 @@ its state there:
 | `data.mdb`, `lock.mdb` | the LMDB database — model registry, logs, stage output |
 | `sandbox/` | created by **`vpipe-web-ui`** only: the directory it confines stage file I/O to |
 
-Pick one on the volume with the ~65 GB, and use the **same** directory in
-step 2 — the model you are about to fetch is recorded in that directory's
-registry.
+Pick one on the volume with the ~103 GB (65 fetched + 38 quantized), and use
+the **same** directory in step 2 — the models you are about to build are
+recorded in that directory's registry, and step 2 names one of them.
 
 ### Then run it
 
 ```sh
 cd ~/vpipe-work
-cp ~/src/vpipe-ltx-2.5/docs/pipelines/prepare-ltx-2.5.vpipeline .
+cp ~/src/vpipe-ltx-2.5/docs/pipelines/prepare-ltx-2.5-8bit.vpipeline .
 ~/src/vpipe/build/apps/vpipe/vpipe \
     --plugin ~/src/vpipe-ltx-2.5/build/vpipe-ltx-2.5.so \
-    --launch prepare-ltx-2.5.vpipeline
+    --launch prepare-ltx-2.5-8bit.vpipeline
 ```
 
-One `model-fetch` stage. `skip_existing_files` is on, so an interrupted fetch
-resumes rather than starting over.
+Fetch, then two quantize passes, then the intermediate is removed — ending at
+`models/local/LTX-2.5-distilled-8bit`, which is what step 2 loads. Every step
+is resumable (`skip_existing_files` on the fetch, `skip_existing` on both
+quantizes), so an interrupted run continues rather than starting over.
+
+**Use [`prepare-ltx-2.5.vpipeline`](pipelines/prepare-ltx-2.5.vpipeline)
+instead if you want the bf16 checkpoint and nothing else** — it is the fetch
+on its own. The shipped text-to-video pipeline expects the 8-bit model, and
+names it in ONE place: point its `model-select` stage at
+`./models/Lightricks/LTX-2.5` if you go that way.
 
 **`model_variant: LTX-2.5-distilled` is required, not decorative.** That repo
 publishes two DiTs — `distilled` and `dev` — at 39 GB each, over the same
@@ -153,17 +183,63 @@ default wherever the head width has an entry point, and the log line
 `attention kernel: steel` at the start of each denoise says which arm ran.
 On an M5 the same attention moves to the GPU's matrix cores automatically.
 
-So the pipeline ships with `variant: "w8g64"` on `ltx-2.5-model-config`, and
-you want that pack: 24 GB rather than 42 leaves the room the activations at
-this size need. Run
-[`prepare-ltx-2.5-w8.vpipeline`](pipelines/prepare-ltx-2.5-w8.vpipeline)
-first — see [Quantizing](#quantizing-for-a-smaller-machine).
+So the pipeline points at the **8-bit model** `local/LTX-2.5-distilled-8bit`,
+and you want it: a 21 GB DiT rather than 42 leaves the room the activations
+at this size need, and the encoder comes down with it. It is named once, on
+the `model-select` stage, and read from there by the conditioner, the
+generator and both VAE decoders — so changing which checkpoint a run uses is
+one edit, not five, and the five cannot drift apart. That model is what
+[`prepare-ltx-2.5-8bit.vpipeline`](pipelines/prepare-ltx-2.5-8bit.vpipeline)
+builds — see [Quantizing](#quantizing-for-a-smaller-machine).
 
-**Without it the run still works**, because an unavailable variant falls back
-to the shipped `distilled` bf16 checkpoint and says so in the log — but at
-42 GB on a 64 GB box, and slower. For a first run, drop to 512 × 320 and keep
-`frames: 121`: the soundtrack is the same five seconds either way, since audio
-length is `frames / fps`, not resolution.
+**Run that first**, because unlike a missing `variant` — which falls back to
+bf16 and says so — a missing MODEL is not something the graph can substitute
+for. It fails naming the directory it wanted, which is the better error: a
+silent fall back to 42 GB on a 64 GB box is the outcome this geometry cannot
+afford. For a first run, drop to 512 × 320 and keep `frames: 121`: the
+soundtrack is the same five seconds either way, since audio length is
+`frames / fps`, not resolution.
+
+**What it costs, measured.** On the 64 GB M4 Pro at 960 × 544 × 121 with the
+w8g64 pack: **532 s end to end**, of which 410.9 s is the denoise
+(51.4 s/step across 8 steps) and the rest is the model load, the two VAE
+decodes and the mux.
+
+What lands is one file — `save-video` with `enable_audio` muxes the frames
+and the soundtrack together:
+
+```
+h264 960x544 @ 24/1 fps + aac 48000 Hz stereo, 5.041667 s, 1.1 MB
+```
+
+The audio is not an afterthought bolted on at the end: it was denoised
+jointly with the video by the same DiT, on the same schedule, and
+`audio-vae-decode` turns those latents into 2 x 240480 samples that the muxer
+puts alongside the frames.
+
+The **8 steps are the checkpoint's own**. The distilled DiT ships a fixed
+schedule, so a `steps` of 6 is reported and ignored:
+
+```
+ltx-2.5: the distilled checkpoint's schedule is fixed at 8 steps; the configured 6 is ignored
+```
+
+### You do not have to compute legal geometries
+
+The VAE compresses space by 32 and time in chunks of 8 (`8k + 1` frames), so
+`960 × 544 × 121` is a legal shape and `953 × 550 × 120` is not. Ask for
+you want anyway — the stage rounds **up** and says so:
+
+```
+frames 120 -> 121, the nearest count at or above it that the ltx-2.5 VAE can chunk
+953x550 -> 960x576, the nearest size at or above it that the ltx-2.5 VAE and DiT patch can tile
+```
+
+Up rather than down, so you never get less than you asked for, and reported
+rather than silent, because the clip that comes back is a different shape from
+the one requested and a downstream stage would otherwise meet that as a
+surprise. Rounding rather than rejecting is what lets one graph be pointed at
+a different model family without being re-authored.
 
 The graph is eight stages:
 
@@ -326,12 +402,13 @@ soundtrack being generated.
 **The bf16 checkpoint wants a 64 GB machine, it is marginal even there, and
 the reason is not the DiT alone.**
 
-The DiT asks for `Mapped` weights and **gets copies**: this checkpoint's
+The bf16 DiT asks for `Mapped` weights and **gets copies**: this checkpoint's
 safetensors data section starts at an offset ≡ 8 (mod 16), and vpipe's
 zero-copy path needs 16-byte alignment, so all 39.1 GB silently falls back to
-`Copied`. The text encoder is another ~24 GB, also copied. Both are anonymous
-memory — reclaimable only through the compressor and swap — so on a 64 GB box
-they cannot coexist, and the machine compresses its way through the denoise.
+`Copied`. (The quantized packs are written by vpipe and are aligned, so they
+do map.) The text encoder is another ~24 GB, also copied. Anonymous memory is
+reclaimable only through the compressor and swap, so on a 64 GB box the two
+cannot coexist, and the machine compresses its way through the denoise.
 
 Measured at 768 × 448 × 9 frames, 8 steps, before and after the encoder is
 released:
@@ -353,9 +430,30 @@ which is where it takes an **irreversible** streaming decision.
 
 ### Quantizing, for a smaller machine
 
+From nothing — fetches first, then quantizes:
+
 ```sh
-vpipe --plugin build/vpipe-ltx-2.5.so --launch prepare-ltx-2.5-w8.vpipeline
+vpipe --plugin build/vpipe-ltx-2.5.so --launch prepare-ltx-2.5-8bit.vpipeline
 ```
+
+It assembles `local/LTX-2.5-distilled-8bit`: a whole model, ready to name as
+an `hf_dir` with nothing else to configure. The fetch it chains from is
+skipped if the checkpoint is already on disk, so this is also the command to
+run when only the quantize is wanted.
+
+Disk:
+
+| | fetched | + w8g64 |
+|---|---|---|
+| DiT | 42 GB | 21 GB |
+| Text encoder | 24.5 GB | 15 GB |
+| VAEs + duration head (stay dense) | ~1.5 GB | hard-linked, 0 |
+| **added by preparing** | — | **~38 GB** |
+
+The self-contained model costs the same as the two packs, because
+everything it does not quantize is hard-linked rather than copied — its
+`vae/` shares inodes with the fetched repo's. That also means deleting the
+fetched repo afterwards frees only what the packs replaced.
 
 Measured on the 22B distilled DiT, same seed:
 
@@ -364,15 +462,50 @@ Measured end to end on the 64 GB M4 Pro, same pipeline, 768 × 448 × 9, 8 steps
 | pack | size | peak footprint | wall clock | zero-copy mapped | PSNR vs bf16 |
 |---|---|---|---|---|---|
 | bf16 | 42.0 GB | 55.2 GB | 338 s | **no** — 39.1 GB copied | — |
-| **w8g64** | 23 GB | **27.4 GB** | **210 s** | **yes** | 33.29 dB |
+| **w8g64** | 21 GB | **27.4 GB** | **210 s** | **yes** | 33.29 dB |
 | w4g64 | 14 GB | — | — | yes | 25.87 dB |
 
-The w8 row is **1.6× faster on half the peak footprint**, and the mapping
-column is most of why: quantized packs are written by vpipe's own
-`SafetensorsWriter`, which pads its header so the data section is 16-byte
-aligned, so their tensors are handed to Metal as zero-copy views. The
-published bf16 file is not aligned, so all 39.1 GB of it is copied into
-anonymous memory — the loader now says so, once per shard.
+The peak and wall clock in that row were measured when the pack was
+23 GB, before the text connectors came into scope (below); at 21 GB they are
+if anything pessimistic. The quality figures are unaffected — the connectors
+were bf16 in the measured pack and are w8 now, which is the one number that
+moved, and `ltx25-connector-test` puts it at rel-L2 1.170e-02 against the
+reference where bf16 reads 7.654e-03, both far inside the 5e-2 bar.
+
+The w8 row is **1.6× faster on half the peak footprint**. Two things
+contribute and it is worth keeping them apart: it is half the bytes to read,
+AND it maps where bf16 cannot. Quantized packs are written by vpipe's own
+`SafetensorsWriter`, which pads the data section to 16 bytes and writes
+odd-sized tensors last, so their tensors are handed to Metal as zero-copy
+views; the published bf16 file is not aligned, so all 39.1 GB of it is copied
+into anonymous memory. The loader says which case it is, once per shard.
+
+### Holding the blocks: preload vs stream
+
+Whether the blocks are mapped or owned is **not a fixed property of this
+port** — it follows the residency verdict, and the two arms want opposite
+things:
+
+| | preload (box holds the pack) | stream (it does not) |
+|---|---|---|
+| blocks held | all of them | a leading prefix, sized to fit |
+| read as | `Mapped` — clean file pages | `Copied` — owned |
+| the rest | — | read per forward, dropped after |
+| the read | — | issued under the previous block's GPU work |
+| growth | — | streamed blocks promoted back as RAM allows |
+
+Owning the bytes is what makes a pinned prefix mean anything: a prefix the
+kernel can evict is not a prefix. And a forward is a **cyclic scan**, which
+is the one access pattern an LRU page cache handles worst — each block
+dropped exactly before it comes round again, so the cache stays full of data
+that is never the data wanted next. A fixed resident subset gives exactly its
+share of hits instead of none.
+
+The reverse is just as true, which is why preloading maps. MEASURED at
+960 × 544 × 121 on the 64 GB box, same seed, w8g64, both arms run together:
+**409.7 s** of denoise mapped against **473.5 s** owning the same bytes — the copies became 36 GB of
+compressor traffic and the model's own weights fell to 2-3% resident. Free-to-
+drop file pages are strictly better when everything fits.
 
 **w8 is the sensible default at any size, not just below 64 GB.** It is
 smaller, it is faster, and — because vpipe wrote it — it is the only one of
@@ -382,12 +515,45 @@ softens the subject — the scene and composition survive, the detail does not.
 For scale, a conditioning bug elsewhere in this tree moved PSNR 20.4 → 45.6
 dB, so 45+ is indistinguishable, 33 is close, and 26 is a real degradation.
 
-**`quant_exclude` is not optional**, and the prepare pipeline sets it. The
-wholesale scope rule takes every 2D floating-point tensor whose leaf is not a
-norm or an embedding — which over `transformer_blocks.` also catches the f32
-`scale_shift_table`s (modulation tables, not matrices) and the `[32, dim]`
-gate logits. Quantizing either produces a checkpoint that loads, runs, and
-generates the wrong thing.
+**The exclusions are not optional**, and the FAMILY sets them — not the
+pipeline, which names only a target, bits and a group size. The wholesale
+scope rule takes every 2D floating-point tensor whose leaf is not a norm or
+an embedding, which inside a block also catches the f32 `scale_shift_table`s
+(modulation tables, not matrices) and the `[32, dim]` gate logits. Quantizing
+either produces a checkpoint that loads, runs, and generates the wrong thing.
+Keeping that list with the scope rather than in the pipeline is what stops
+the two drifting apart.
+
+#### The text connectors are quantized too, by the same step
+
+There is no separate stage for them. `target: "dit"` covers the DiT's own
+`transformer_blocks.` **and** the two text connectors'
+`transformer_1d_blocks.` — the scope is a substring and `_blocks.` is the one
+both share. The quantizer says so when it runs: `1440 quantized, 2909
+passthrough`, which is 1344 block tensors plus 96 connector ones, leaving the
+connectors' 162 norms, biases and learnable registers dense.
+
+It matters more than its 2 GB suggests. The connectors are **trunk**: unlike
+the blocks they never stream, so they are resident for the whole denoise. On
+a 16 GB box they were 3.75 GB off the top before a single block could be
+pinned.
+
+> **A pack built before this has dense connectors, and re-running the prepare
+> pipeline will not fix it.** `skip_existing` on the second quantize step sees
+> `local/LTX-2.5-distilled-8bit` already there and skips — so the run
+> re-quantizes the DiT and then throws the result away. Delete the model
+> first:
+>
+> ```sh
+> vpipe --plugin build/vpipe-ltx-2.5.so \
+>     --launch-stage model-remove \
+>     --stage-cfg model='"local/LTX-2.5-distilled-8bit"' \
+>     --stage-cfg delete_files=true --stage-cfg missing_ok=true
+> ```
+>
+> then run the prepare pipeline again. Nothing else needs changing: the
+> reader was taught the quantized layout in the same change, so an old pack
+> still loads — it is simply 2 GB larger and 2 GB more resident.
 
 > **The declaration follows the choice.** `declare_resources()` runs before
 > any beat exists, so it cannot know which pack `variant` will name — it
@@ -426,6 +592,42 @@ ltx-2.5: DiT weights from .../ltx-2.5-22b-distilled-w8g64 (quantized pack)
 the pipeline, and **warns when it does** — an env var silently beating a
 checked-in pipeline is the same trap as a config key that selects nothing,
 pointed the other way.
+
+The **text encoder is chosen separately**, on the conditioner rather than the
+config stage, because it is a different component with a different tradeoff:
+
+```json
+{
+  "id": "cond", "type": "ltx-2.5-conditioner",
+  "config": { "encoder_variant": "w8g64" }
+}
+```
+
+Same rule — a name substring matched against the directories under
+`text_encoders/`, and **empty by default**, which takes the released bf16
+file. This one is deliberately conservative: every conditioning token in the
+clip comes out of this model, so a precision change nobody requested reads as
+a port bug rather than as a setting. What it buys is the peak that decides
+whether a small box runs at all — the bf16 encoder is 24.5 GB and peaks at
+**27.1 GB** of footprint against the DiT denoise's 2.6–2.8 GB, so the encoder,
+not the DiT, is what a 32 GB machine runs out of room on.
+
+Graded on the cross-attention context it emits, cosine against the bf16
+encoder over the real caption rows:
+
+| pack | cosine | rel-L2 | size |
+|---|---|---|---|
+| **w8g64** | **0.99996** | 0.0088 | 15 GB |
+| w4g64 | 0.99387 | 0.1105 | 9.9 GB |
+
+**w8g64 is the safe default** — 0.99996 is the same caption for practical
+purposes. Judge either by that grading and not by comparing frames: a
+diffusion sample moves to a different mode on *any* conditioning change, so a
+w4 run scores about 21 dB against a bf16 run, which is roughly what two
+different frames of the same clip score against each other. Reading that as
+"4-bit is lossy" is a mistake this port already made once.
+`VPIPE_LTX25_COND_DUMP=<prefix>` writes both contexts so they can be compared
+directly instead of inferred from pixels.
 
 ## What this port does not do
 

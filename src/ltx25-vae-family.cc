@@ -53,6 +53,11 @@ public:
     return _dec ? _dec->resident_bytes() : 0;
   }
 
+  void release_idle() override
+  {
+    if (_dec) { _dec->release_idle(); }
+  }
+
   bool decode(const VaeDecodeRequest& req, const VaeFrameSink& sink,
               std::string* err) override
   {
@@ -72,7 +77,11 @@ public:
       return fail("degenerate latent geometry");
     }
 
-    std::vector<float> pix;
+    // The BUFFER form, not the vector one: this is UMA memory, so the
+    // sink reads it where it was written. The vector form would copy the
+    // whole clip -- 758 MB at 960x544x121 -- to hand over bytes that are
+    // already host-addressable.
+    vpipe::metal_compute::SharedBuffer pix;
     std::array<int, 4> shape{};
     if (!_dec->decode(req.latent, T, lh, lw, &pix, &shape, err)) {
       return false;
@@ -82,7 +91,7 @@ public:
     // what VaeFrameChunk wants: f32 channel-first [C][F][H][W] in
     // [-1, 1], so nothing is copied or converted here.
     VaeFrameChunk c;
-    c.rgb          = pix.data();
+    c.rgb          = static_cast<const float*>(pix.contents());
     c.channels     = shape[0];
     c.frame0       = 0;
     c.n            = shape[1];

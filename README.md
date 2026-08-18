@@ -15,6 +15,18 @@ stock `generate-video` / `vae-decode` / `audio-vae-decode` stages on a 64 GB
 M4 Pro: 9 frames at 768x448 of "a red fox walking through snow at dawn", plus
 0.53 s of 48 kHz stereo, in 338 s on the bf16 checkpoint.
 
+**At the geometry the model is built for** — 960 x 544, 121 frames (5.0 s at
+24 fps) with its 5.04 s soundtrack, on the w8g64 pack — the same box takes
+**532 s end to end** through the shipped text-to-video pipeline: 410.9 s of
+denoise (51.4 s/step over the distilled checkpoint's 8 steps), plus the model
+load, both VAE decodes and the mux. Out comes a **1.1 MB mp4 -- h264
+960x544 at 24 fps, AAC 48 kHz stereo, 5.04 s** -- from `save-video` with
+`enable_audio`, not a directory of frames.
+
+> The **8 steps are the checkpoint's**, not a setting. The distilled DiT
+> ships a fixed schedule, so a `steps` of 6 is reported and ignored rather
+> than silently honoured.
+
 **It also generates FROM an image.** `load-image -> vae-encode ->
 generate-video` anchors the clip to a reference picture: at 512x320x9,
 seed 1234, the anchored frame 0 comes back at **31.1 dB** against the
@@ -123,6 +135,23 @@ vpipe --plugin build/vpipe-ltx-2.5.so --launch-stage generate-video \
       --stage-cfg height=544 --stage-cfg width=960 --stage-cfg frames=121
 ```
 
+### Ask for the picture you want
+
+**Size and frame count round UP to what the model can tile.** LTX-2.5's VAE
+compresses space by 32 and time in chunks of 8 (`8k + 1` frames), so a
+literal reading of the checkpoint would have you computing legal geometries
+by hand. You do not have to:
+
+```
+frames 120 -> 121, the nearest count at or above it that the ltx-2.5 VAE can chunk
+953x550 -> 960x576, the nearest size at or above it that the ltx-2.5 VAE and DiT patch can tile
+```
+
+Both are **reported, not silent** — the clip that comes back is a different
+shape from the one asked for, and a graph downstream would otherwise discover
+that as a surprise. Rounding up rather than rejecting is deliberate too: a
+graph can be pointed at a different model family without being re-authored.
+
 ## Getting the weights
 
 The repo is **gated**: accept the licence on HuggingFace first, then
@@ -164,6 +193,30 @@ Measured on the 22B distilled DiT (same seed, 768x448x9):
 | bf16 | 42.0 GB | STREAM, ~67 s/step | — |
 | **w8g64** | 23 GB | PRELOAD | **33.29 dB** |
 | w4g64 | 14 GB | PRELOAD | 25.87 dB |
+
+### How the blocks are held
+
+A box that can hold the pack **preloads** it and reads the blocks `Mapped` —
+clean file pages, which the kernel drops for free and re-reads cheaply, and
+which cost the process almost nothing to keep.
+
+A box that cannot **streams**: a leading prefix of blocks stays resident, the
+rest are read per forward and dropped, and each read is issued under the
+previous block's GPU work so it is not on the critical path. Those blocks are
+read `Copied`, because a pinned prefix means nothing if the kernel can evict
+it — and because a forward is a cyclic scan, the one access pattern an LRU
+page cache handles worst: every block dropped exactly before it comes round
+again. As free RAM allows, streamed blocks are promoted back to resident, and
+if the measurement says the resident set is being squeezed out of RAM they
+are handed back one at a time.
+
+The two are not interchangeable, and the split is measured rather than
+argued. At 960x544x121 on the 64 GB box, in one paired run, mapping the
+preloaded pack takes **409.7 s** of denoise where owning the same bytes takes
+**473.5 s** — the
+copies turn into 36 GB of compressor traffic, and the model's own weights
+drop to 2-3% resident. On a box that cannot hold the pack the choice inverts,
+which is what the streaming arm is for.
 
 Both widths escape streaming, so the bit width is a quality/size trade with
 the throughput win already banked. **w8 is the sensible default on a 64 GB

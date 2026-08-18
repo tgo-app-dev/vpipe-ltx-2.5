@@ -120,25 +120,37 @@ resolve_dit_(const std::string& root, const std::string& prefer_variant,
   // quantized pack silently always loaded the bf16 one -- a 4x footprint
   // difference decided by resolution order, with nothing in the log
   // saying so.
+  //
+  // A THIRD shape, which is the same directory checkpoint one level up:
+  // `model-quantize`'s self-contained output replaces the whole
+  // `diffusion_models/` role with the quantized DiT, so the config.json
+  // is AT the role dir rather than in a pack inside it. That layout has
+  // no bf16 file beside it to choose against -- it is the only DiT in
+  // the model -- so taking it silently is not the precision surprise the
+  // rule below guards against; there is no choice being made.
   namespace fs = std::filesystem;
   std::error_code ec;
   const fs::path dm = fs::path(root) / "diffusion_models";
-  std::vector<std::string> cands;
-  for (const auto& de : fs::directory_iterator(dm, ec)) {
-    if (ec) { break; }
-    if (!de.is_directory()) { continue; }
+  auto is_dit_ckpt = [](const fs::path& dir) {
     std::string txt;
-    if (!read_file_((de.path() / "config.json").string(), &txt)) { continue; }
+    if (!read_file_((dir / "config.json").string(), &txt)) { return false; }
     FlexData c;
-    try { c = FlexData::from_json(txt); } catch (...) { continue; }
-    if (!c.is_object()) { continue; }
+    try { c = FlexData::from_json(txt); } catch (...) { return false; }
+    if (!c.is_object()) { return false; }
     auto co = c.as_object();
-    if (!co.contains("transformer")) { continue; }
+    if (!co.contains("transformer")) { return false; }
     const FlexData t = co.at("transformer");
     auto to = t.as_object();
     const FlexData cn = to.contains("_class_name") ? to.at("_class_name")
                                                    : FlexData();
-    if (std::string(cn.as_string("")) != kDitClassName) { continue; }
+    return std::string(cn.as_string("")) == kDitClassName;
+  };
+  std::vector<std::string> cands;
+  if (is_dit_ckpt(dm)) { cands.push_back(dm.string()); }
+  for (const auto& de : fs::directory_iterator(dm, ec)) {
+    if (ec) { break; }
+    if (!de.is_directory()) { continue; }
+    if (!is_dit_ckpt(de.path())) { continue; }
     cands.push_back(de.path().string());
   }
 
@@ -210,7 +222,20 @@ stage2_distilled_sigmas()
 Variant
 variant_of_filename(const std::string& file)
 {
-  const std::string n = lower_(fs::path(file).filename().string());
+  const fs::path p(file);
+  std::string n = lower_(p.filename().string());
+  // A SELF-CONTAINED pack names the variant on its ROOT, not on the
+  // component. `model-quantize` writes `<name>/diffusion_models/`, so the
+  // leaf here is the role directory and says nothing -- which is how a
+  // pack called `LTX-2.5-distilled-8bit` came out kUnknown, and with it
+  // every decision keyed on the variant.
+  //
+  // Only when the leaf IS the role directory, and only ONE level up: the
+  // variant words are ordinary English and a full-path search would take
+  // `/Users/dev/...` for the dev checkpoint.
+  if (n == "diffusion_models" && p.has_parent_path()) {
+    n = lower_(p.parent_path().filename().string());
+  }
   // "distilled" is checked first because a distilled file's name does
   // not contain "dev" -- but a future "dev-distilled" spelling would,
   // and taking it for the dev checkpoint would silently sample a
@@ -402,8 +427,8 @@ resolve_enc_(const std::string& root, const std::string& prefer)
 {
   namespace fs = std::filesystem;
   std::error_code ec;
+  const fs::path dir = fs::path(root) / "text_encoders";
   if (!prefer.empty()) {
-    const fs::path dir = fs::path(root) / "text_encoders";
     for (const auto& e : fs::directory_iterator(dir, ec)) {
       if (ec) { break; }
       if (!e.is_directory()) { continue; }
@@ -416,8 +441,19 @@ resolve_enc_(const std::string& root, const std::string& prefer)
       }
     }
   }
-  return vpipe::genai::comfy::resolve_component(
+  const std::string released = vpipe::genai::comfy::resolve_component(
       root, "text_encoders", kEncMetaKey, {"gemma4", "with-proj"});
+  if (!released.empty()) { return released; }
+  // `model-quantize`'s self-contained output replaces the whole
+  // `text_encoders/` role with the quantized encoder, so the config.json
+  // is AT the role dir. Taken only AFTER the released file, and only
+  // because reaching here means there is no released file to take: the
+  // rule above is "never silently prefer a quantized encoder OVER the
+  // bf16 one", not "never load a model that has only a quantized one".
+  // A self-contained model holds exactly one encoder, so there is no
+  // preference left to express.
+  if (fs::exists(dir / "config.json", ec)) { return dir.string(); }
+  return {};
 }
 
 bool

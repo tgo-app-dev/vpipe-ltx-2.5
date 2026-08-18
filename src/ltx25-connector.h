@@ -2,6 +2,7 @@
 #define VPIPE_LTX25_CONNECTOR_H
 
 #include "ltx25-config.h"
+#include "ltx25-dit-weights.h"
 #include "ltx25-metal-ops.h"
 #include "ltx25-rope.h"
 
@@ -40,9 +41,15 @@ class Ltx25Connector {
 public:
   // Load one connector. `audio` picks the audio twin (2048 wide, 64
   // head_dim) over the video one (4096, 128).
+  // `kept` is the MODEL's residency verdict (kept_residency): the
+  // connectors are TRUNK -- never streamed, read every step -- so on a
+  // streaming model they are Copied, not left as page cache the streamed
+  // tail will evict.
   static std::unique_ptr<Ltx25Connector>
   load(const DitConfig& cfg, vpipe::genai::WeightSet& ws, const MetalOps& ops,
-       bool audio, std::string* err);
+       bool audio, std::string* err,
+       vpipe::genai::WeightSet::Residency kept =
+           vpipe::genai::WeightSet::Residency::Mapped);
 
   // Size the scratch for a sequence of `tokens`. `tokens` must be a
   // multiple of the register count, for the tiling above.
@@ -66,11 +73,19 @@ public:
 private:
   Ltx25Connector() = default;
 
+  // The six MATRICES are QWeight because the quantizer takes them: the
+  // connectors sit inside the DiT file and the same pass that quantizes
+  // the block stack reaches them too. A dense-only reader against such a
+  // pack binds u32 codes as bf16 and produces plausible conditioning at
+  // full speed, so this side has to move with the scope that selects
+  // them. Everything else -- biases, the two norms, the per-head gate --
+  // stays dense, as it does in a block.
   struct Block {
-    vpipe::metal_compute::SharedBuffer q_w, q_b, k_w, k_b, v_w, v_b, o_w, o_b;
+    QWeight q_w, k_w, v_w, o_w, ff_in, ff_out;
+    vpipe::metal_compute::SharedBuffer q_b, k_b, v_b, o_b;
     vpipe::metal_compute::SharedBuffer q_norm, k_norm;
     vpipe::metal_compute::SharedBuffer gate_w, gate_b;
-    vpipe::metal_compute::SharedBuffer ff_in, ff_in_b, ff_out, ff_out_b;
+    vpipe::metal_compute::SharedBuffer ff_in_b, ff_out_b;
     bool has_gate = false;
   };
 

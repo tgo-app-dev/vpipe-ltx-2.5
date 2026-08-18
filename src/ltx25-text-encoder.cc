@@ -1,5 +1,9 @@
 #include "ltx25-text-encoder.h"
 
+#include "stages/model-memory.h"
+
+#include <cstdlib>
+
 #include "generative-models/shared/comfy-checkpoint.h"
 
 #include "apple-silicon/metal-compute/metal-compute.h"
@@ -116,6 +120,35 @@ Ltx25TextEncoder::load(const Config& cfg, std::shared_ptr<WeightSet> ws,
   a.metal   = mc;
   a.session = session;
   a.config  = gcfg;
+  // STREAM THE BACKBONE when the graph has no room to hold it.
+  //
+  // This encoder runs ONE prefill per prompt and is then destroyed, which
+  // is what makes the trade sane here and not for a chat model: the cost
+  // is re-reading the stack once, against a DiT that re-reads its own
+  // per denoise step. MEASURED at w8: 15.3 GB resident and a 16.14 GB
+  // load peak, on a box where the whole run has 16.
+  //
+  // The same rule the DiT uses, so the two answer the memory question
+  // the same way -- and asked in the DENOISE phase for the same reason
+  // it is there: what matters is what has to coexist, and this encoder
+  // is gone by then.
+  {
+    namespace mm = vpipe::model_memory;
+    const auto plan = mm::plan_streaming(session, cfg.dit_file, cfg.enc_file,
+                                         mm::kStreamHeadroom);
+    a.stream_layers = plan.stream;
+    a.pin_frac      = plan.pin_frac;
+    if (const char* e = std::getenv("VPIPE_LTX25_STREAM_ENCODER")) {
+      a.stream_layers = (std::atoi(e) != 0);
+      if (!a.stream_layers) { a.pin_frac = 0.0; }
+    }
+    if (a.stream_layers && session != nullptr) {
+      session->info(vpipe::fmt(
+          "ltx-2.5: streaming the text encoder's layers (pin_frac {:.3f}) "
+          "-- it prefills once per prompt and is dropped after",
+          a.pin_frac));
+    }
+  }
   std::string oerr;
   e->_lm = HiddenStateEncoderRegistry::get().open(a, &oerr);
   if (!e->_lm) { return fail("text encoder: " + oerr); }

@@ -27,6 +27,7 @@ add_library(ltx25_dit_obj OBJECT
   src/ltx25-bwe.cc
   src/ltx25-conditioner-stage.cc
   src/ltx25-vae-family.cc
+  src/ltx25-quant-family.cc
   src/ltx25-vae-ref.cc
   src/ltx25-vae.cc
     src/ltx25-generator.cc
@@ -94,7 +95,8 @@ endif()
 enable_testing()
 add_executable(ltx25-config-test
     tests/ltx25-config-test.cc
-    src/ltx25-config.cc)
+    src/ltx25-config.cc
+    src/ltx25-quant-family.cc)
 target_include_directories(ltx25-config-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(ltx25-config-test PRIVATE vpipe::vpipe)
 target_compile_features(ltx25-config-test PRIVATE cxx_std_20)

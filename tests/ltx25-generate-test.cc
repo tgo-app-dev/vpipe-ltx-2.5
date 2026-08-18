@@ -12,6 +12,8 @@
 // finite, that the schedule actually moved the latent away from its
 // initial noise, and that two seeds differ.
 
+#include "apple-silicon/metal-compute/shared-buffer.h"
+
 #include "ltx25-config.h"
 #include "ltx25-metal-ops.h"
 #include "ltx25-vocoder.h"
@@ -26,11 +28,19 @@
 
 #include <chrono>
 #include <cmath>
+
+#include <mach/mach.h>
+#include <mach/task_info.h>
+
+#include <mach/mach.h>
+#include <mach/task_info.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <random>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -44,6 +54,29 @@ using vpipe::metal_compute::MetalCompute;
 namespace {
 
 int g_fail = 0;
+
+int
+env_int_(const char* k, int dflt)
+{
+  const char* v = std::getenv(k);
+  if (v == nullptr || *v == '\0') { return dflt; }
+  const int n = std::atoi(v);
+  return n > 0 ? n : dflt;
+}
+
+// The whole process, phys_footprint rather than resident_size: a Metal
+// buffer's pages are wired through IOKit and resident_size misses them.
+double
+footprint_mb_()
+{
+  task_vm_info_data_t info{};
+  mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+  if (task_info(mach_task_self(), TASK_VM_INFO,
+                (task_info_t)&info, &cnt) != KERN_SUCCESS) {
+    return 0.0;
+  }
+  return (double)info.phys_footprint / (1024.0 * 1024.0);
+}
 
 void
 check(bool ok, const std::string& what)
@@ -113,11 +146,33 @@ main()
       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
           .count();
   std::printf("  loaded in %.1f s\n", load_s);
+  // WHAT THE STREAMING DECISION ACTUALLY DID. The pin count is the term
+  // that decides whether a bounded box survives, and it is derived from
+  // the checkpoint's own shape (per-block bytes, the trunk that never
+  // streams) against a fraction of RAM -- so nothing outside this line
+  // can check it. Drive it with VPIPE_RAM_LIMIT_MB + VPIPE_LTX25_STREAM
+  // to see the decision a smaller box would take.
+  if (auto* g = dynamic_cast<ltx25::Ltx25Generator*>(gen.get())) {
+    const auto st0 = vpipe::metal_compute::shared_buffer_memory_stats();
+    std::printf("  AFTER LOAD: shared buffers live %llu MB in %llu handles\n",
+                (unsigned long long)(st0.live_bytes >> 20),
+                (unsigned long long)st0.live_count);
+    std::printf("  streaming=%s, %d blocks pinned (%llu MB), "
+                "footprint %.0f MB\n",
+                g->streaming_blocks() ? "yes" : "no", g->pinned_blocks(),
+                (unsigned long long)(g->pinned_weight_bytes() >> 20),
+                footprint_mb_());
+  }
   check(gen->latent_channels() == 128, "128 latent channels");
   check(gen->spatial_compression() == 32, "1/32 spatial");
 
   // A small request: 256x256 x 9 frames -> latent [128, 2, 8, 8].
-  const int W = 256, H = 256, F = 9;
+  // Geometry knobs: the memory behaviour of this model is only visible
+  // at the geometry it will actually be asked for -- the scratch, the
+  // attention and the per-forward streaming all scale with the tokens.
+  const int W = env_int_("VPIPE_LTX25_W", 256);
+  const int H = env_int_("VPIPE_LTX25_H", 256);
+  const int F = env_int_("VPIPE_LTX25_F", 9);
   const int TT = 256;      // a whole number of connector register tiles
   const int CD = 4096;     // cross_attention_dim
   std::vector<std::uint16_t> cond((std::size_t)TT * CD);
@@ -130,7 +185,7 @@ main()
   req.width = W;
   req.frames = F;
   req.fps = 24.0;
-  req.steps = 8;
+  req.steps = env_int_("VPIPE_LTX25_STEPS", 8);
   req.seed = 1234;
   req.cond = cond.data();
   req.cond_rows = TT;
@@ -142,6 +197,33 @@ main()
   // there is no un-baked path left to compare with.
   ::setenv("VPIPE_LTX25_NO_ADALN_BAKE", "1", 1);
 
+  // PROGRESS, counted. A reporting hook that silently never fires looks
+  // exactly like one that works, and this family shipped for months with
+  // the DiT's per-block hook unset and nothing noticing.
+  int prog_steps = 0, prog_blocks = 0, last_step = 0, last_total = 0;
+  int block_total = 0;
+  req.progress = [&](int step, int total) {
+    ++prog_steps; last_step = step; last_total = total;
+    return true;
+  };
+  req.block_progress = [&](int done, int total) {
+    ++prog_blocks; block_total = total; (void)done;
+    return true;
+  };
+
+  const double fp_pre = footprint_mb_();
+  std::atomic<bool> sampling{true};
+  std::atomic<double> fp_peak{fp_pre};
+  std::thread sampler([&]{
+    while (sampling.load(std::memory_order_relaxed)) {
+      const double n = footprint_mb_();
+      if (n > fp_peak.load(std::memory_order_relaxed)) {
+        fp_peak.store(n, std::memory_order_relaxed);
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+  });
+
   vpipe::genai::VideoGenResult res;
   auto t1 = std::chrono::steady_clock::now();
   if (!gen->generate(req, &res)) {
@@ -152,8 +234,43 @@ main()
   const double gen_s =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - t1)
           .count();
-  std::printf("  8-step generation in %.1f s (%.1f s/step)\n", gen_s,
-              gen_s / 8.0);
+  sampling.store(false, std::memory_order_relaxed);
+  sampler.join();
+  std::printf("  %d-step generation in %.1f s (%.1f s/step)\n", req.steps,
+              gen_s, gen_s / (double)req.steps);
+  std::printf("  DENOISE FOOTPRINT: %.0f MB before -> %.0f MB peak "
+              "(+%.0f MB while denoising)\n",
+              fp_pre, fp_peak.load(), fp_peak.load() - fp_pre);
+  // The SAME question asked of the buffer accounting rather than of the
+  // OS: if these disagree with the process footprint, the buffers are
+  // being freed and something else is holding the memory.
+  {
+    const auto st = vpipe::metal_compute::shared_buffer_memory_stats();
+    std::printf("  SHARED BUFFERS: live %llu MB in %llu handles, "
+                "peak %llu MB, cumulative %llu MB\n",
+                (unsigned long long)(st.live_bytes >> 20),
+                (unsigned long long)st.live_count,
+                (unsigned long long)(st.peak_bytes >> 20),
+                (unsigned long long)(st.total_bytes >> 20));
+  }
+  if (std::getenv("VPIPE_LTX25_ONE_SHOT") != nullptr) {
+    std::printf("ONE_SHOT: stopping after the first generation\n");
+    return 0;
+  }
+
+  // One step report per step, ONE-BASED and at the end -- the host's bar
+  // takes the index of the step that just finished, so a zero-based or
+  // start-of-step report runs the bar ahead of the work.
+  check(prog_steps == 8, "the step hook fired once per step (" +
+        std::to_string(prog_steps) + ")");
+  check(last_step == last_total && last_total > 0,
+        "the last step report is 1-based and reaches the total (" +
+        std::to_string(last_step) + "/" + std::to_string(last_total) + ")");
+  // And the block hook, which is what makes the bar move within a step.
+  check(prog_blocks == prog_steps * block_total && block_total > 0,
+        "the block hook fired once per block per step (" +
+        std::to_string(prog_blocks) + " over " +
+        std::to_string(block_total) + " blocks)");
 
   const std::vector<int> want_shape = {128, 2, 8, 8};
   check(res.video_shape == want_shape,

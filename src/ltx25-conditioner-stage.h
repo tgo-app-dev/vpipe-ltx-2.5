@@ -87,7 +87,22 @@ public:
   // The 12B encoder is the second-largest thing an LTX graph loads, and
   // nothing else declares it -- without this the DiT stage sizes itself
   // against a box it does not know is about to hold 24 GB.
+  // The model-select beat, delivered BEFORE the planning phase.
+  //
+  // Without this the stage learns its checkpoint at the first process(),
+  // which is after every peer has sized itself -- so declare_resources()
+  // below sees an empty directory and declares NOTHING, and a 15 GB text
+  // encoder is invisible to the graph that has to make room for it.
+  void apply_constant(unsigned iport, const vpipe::FlexData& beat) override;
+
   std::vector<vpipe::ResourceClaim> declare_resources() const override;
+
+  // Pass two: re-declare the encoder as a CONDITION-phase claim once
+  // every stage has declared, so a peer sizing the denoise does not count
+  // an encoder that will be gone by then. Only when it will genuinely be
+  // gone -- see the body.
+  std::vector<vpipe::ResourceClaim> decide_resources() const override;
+
   void reset_run_state() override;
 
 private:

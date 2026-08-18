@@ -33,6 +33,9 @@
 #include <string>
 #include <vector>
 
+#include <mach/mach.h>
+#include <mach/task_info.h>
+
 extern "C" const unsigned char ltx25_kernels_bf16_metallib[];
 extern "C" const unsigned long ltx25_kernels_bf16_metallib_len;
 
@@ -52,6 +55,21 @@ env_(const char* k)
 {
   const char* v = std::getenv(k);
   return (v != nullptr) ? std::string(v) : std::string();
+}
+
+// The whole process, the way the tree measures memory -- phys_footprint
+// and not resident_size, because a Metal buffer's pages are wired
+// through IOKit and resident_size does not see all of them.
+double
+footprint_mb_()
+{
+  task_vm_info_data_t info{};
+  mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+  if (task_info(mach_task_self(), TASK_VM_INFO,
+                (task_info_t)&info, &cnt) != KERN_SUCCESS) {
+    return 0.0;
+  }
+  return (double)info.phys_footprint / (1024.0 * 1024.0);
 }
 
 }  // namespace
@@ -76,9 +94,19 @@ main()
                                ltx25_kernels_bf16_metallib_len);
   auto* mc = &metal;
 
+  // WHICH ENCODER, because the answer decides whether the run fits.
+  // Empty is the shipped default, which deliberately prefers the released
+  // bf16 file over any quantized directory; VPIPE_LTX25_ENC_VARIANT is how
+  // a bounded box asks for one of the packs beside it. The footprint
+  // printed below is the reason this knob is here: the encoder is the
+  // largest single thing a conditioning graph loads, and 24 GB, 15 GB and
+  // 9.9 GB are three different machines.
+  const std::string enc_variant = env_("VPIPE_LTX25_ENC_VARIANT");
+  const double fp_start = footprint_mb_();
+
   ltx25::Config cfg;
   std::string err;
-  if (!ltx25::resolve(root, cfg, &err)) {
+  if (!ltx25::resolve(root, cfg, &err, {}, enc_variant)) {
     check(false, "resolve: " + err);
     std::printf("FAILURES\n");
     return 1;
@@ -105,6 +133,9 @@ main()
     return 1;
   }
   check(true, "the text encoder loaded");
+  std::printf("       encoder '%s'\n", cfg.enc_file.c_str());
+  std::printf("       footprint %.0f MB -> %.0f MB (+%.0f MB to load it)\n",
+              fp_start, footprint_mb_(), footprint_mb_() - fp_start);
   check(enc->layers() == 49, "49 hidden states (48 layers + the embedding)");
   check(enc->hidden_dim() == 3840, "3840-wide hidden states");
 

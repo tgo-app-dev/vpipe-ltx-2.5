@@ -31,13 +31,20 @@
 #include "common/flex-data.h"
 #include "generative-models/vae-model-registry.h"
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
+
+#include <mach/mach.h>
+#include <mach/task_info.h>
 
 extern "C" const unsigned char ltx25_kernels_bf16_metallib[];
 extern "C" const unsigned long ltx25_kernels_bf16_metallib_len;
@@ -60,6 +67,31 @@ env_(const char* k)
 {
   const char* v = std::getenv(k);
   return (v != nullptr) ? std::string(v) : std::string();
+}
+
+int
+env_int_(const char* k, int dflt)
+{
+  const std::string v = env_(k);
+  if (v.empty()) { return dflt; }
+  const int n = std::atoi(v.c_str());
+  return n > 0 ? n : dflt;
+}
+
+// What the WHOLE PROCESS is holding, the way the tree measures memory --
+// phys_footprint rather than resident_size, because a Metal buffer's
+// pages are wired through IOKit and resident_size does not see all of
+// them.
+double
+footprint_mb_()
+{
+  task_vm_info_data_t info{};
+  mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
+  if (task_info(mach_task_self(), TASK_VM_INFO,
+                (task_info_t)&info, &cnt) != KERN_SUCCESS) {
+    return 0.0;
+  }
+  return (double)info.phys_footprint / (1024.0 * 1024.0);
 }
 
 }  // namespace
@@ -132,7 +164,16 @@ main()
   std::printf("       decoder %.1f MB\n",
               (double)dec->resident_bytes() / (1024.0 * 1024.0));
 
-  const int Z = 128, T = 2, LH = 2, LW = 2;
+  // THE GEOMETRY IS A KNOB, and its absence is why a 100x scaling in this
+  // decoder's transient memory went unseen. The default is the smallest
+  // latent that still pins the causal rule; a bigger one costs only time
+  // here, and the footprint line below is what makes the cost of a real
+  // clip's geometry visible before a 16 GB box finds it.
+  const int Z = 128;
+  const int T  = env_int_("VPIPE_LTX25_VAE_T",  2);
+  const int LH = env_int_("VPIPE_LTX25_VAE_LH", 2);
+  const int LW = env_int_("VPIPE_LTX25_VAE_LW", 2);
+  const int want_frames = 8 * (T - 1) + 1;
   std::vector<float> lat((std::size_t)Z * T * LH * LW);
   for (std::size_t i = 0; i < lat.size(); ++i) {
     lat[i] = 0.7f * std::sin(0.031f * (float)i);
@@ -147,7 +188,35 @@ main()
   bool in_range = true, uniform = true;
   float first = 0.0f;
   std::string err;
+  // The output picture, f32 -- the unit the transient budget is expressed
+  // in below, and the only figure here that does not depend on how the
+  // decoder is written.
+  const double out_mb = (double)((std::size_t)3 * (std::size_t)want_frames *
+                                 (std::size_t)(32 * LH) *
+                                 (std::size_t)(32 * LW) * 4) /
+                        (1024.0 * 1024.0);
+  const double fp_before = footprint_mb_();
+
+  // SAMPLED, not read at the end. The peak is inside the decode -- at
+  // the widest block, with the picture allocated on top of pages the
+  // kernel has not taken back yet -- and by the time the sink runs the
+  // stack has already unwound past it. Reading the footprint at the sink
+  // reports a decode that has already released most of what it held.
+  std::atomic<bool> sampling{true};
+  std::atomic<double> fp_peak{fp_before};
+  std::thread sampler([&] {
+    while (sampling.load(std::memory_order_relaxed)) {
+      const double now = footprint_mb_();
+      if (now > fp_peak.load(std::memory_order_relaxed)) {
+        fp_peak.store(now, std::memory_order_relaxed);
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+  });
+
+  double fp_in_sink = 0.0;
   const bool ok = dec->decode(req, [&](const genai::VaeFrameChunk& c) {
+    fp_in_sink = footprint_mb_();
     total = c.frames_total;
     chan = c.channels; hh = c.height; ww = c.width;
     for (int k = 0; k < c.n; ++k) { seen.push_back(c.frame0 + k); }
@@ -160,11 +229,38 @@ main()
     }
     return true;
   }, &err);
+  sampling.store(false, std::memory_order_relaxed);
+  sampler.join();
+
   check(ok, ok ? "decode succeeded" : "decode: " + err);
   std::printf("       latent [%d,%d,%d,%d] -> [%d,%d,%d,%d]\n", Z, T, LH, LW,
               chan, (int)seen.size(), hh, ww);
-  check((int)seen.size() == 9, "the sink saw 9 frames");
-  check(total == 9, "frames_total agrees with what arrived");
+  const double measured = fp_peak.load(std::memory_order_relaxed) - fp_before;
+  std::printf("       footprint %.0f MB before, %.0f MB peak during, "
+              "%.0f MB at the sink -> %.0f MB of transients\n",
+              fp_before, fp_peak.load(std::memory_order_relaxed), fp_in_sink,
+              measured);
+  std::printf("       that is %.1fx the %.0f MB output picture\n",
+              out_mb > 0.0 ? measured / out_mb : 0.0, out_mb);
+  // THE REGRESSION GUARD, in units of the output rather than in bytes, so
+  // it holds at whatever geometry the knob above selects.
+  //
+  // This decoder used to encode its whole graph into one command buffer
+  // and commit once at the end. An un-committed Metal command buffer
+  // retains every resource it references, so every intermediate of all
+  // nine levels stayed allocated: 20.3 GB of transients at 121 frames of
+  // 960x544, which is ~27x the picture. Committing per block and reusing
+  // three slots puts it at ~6x.
+  //
+  // 12x is the line: comfortably above what the per-block path measures
+  // at every geometry tested, and less than half of what the accumulating
+  // one did. A failure here means the commits or the slots have been
+  // undone, which no correctness test would notice -- the pixels are
+  // identical either way.
+  check(measured <= 12.0 * out_mb + 512.0,
+        "the decode's transients stay within 12x the output picture");
+  check((int)seen.size() == want_frames, "the sink saw 8(T-1)+1 frames");
+  check(total == want_frames, "frames_total agrees with what arrived");
   check(chan == 3, "3 channels");
   check(hh == 32 * LH && ww == 32 * LW, "32x spatial in the chunk");
   bool ordered = true;

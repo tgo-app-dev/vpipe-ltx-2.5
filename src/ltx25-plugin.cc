@@ -29,6 +29,7 @@
 #include "ltx25-family.h"
 #include "ltx25-conditioner-stage.h"
 #include "ltx25-model-config-stage.h"
+#include "ltx25-quant-family.h"
 #include "ltx25-vae-family.h"
 
 #include <memory>
@@ -82,6 +83,14 @@ ltx25_register(vpipe::VpipePluginContext* ctx)
   // video model registers BOTH families -- one makes the latent, the
   // other decodes it -- and needs no stage for either.
   ctx->register_vae_family(std::make_unique<ltx25::Ltx25VaeFamily>());
+
+  // register_quantize_family is the seam that lets `model-quantize`
+  // package this checkpoint as ONE self-contained model -- a quantized
+  // DiT, a quantized text encoder and the VAEs untouched, in one
+  // directory -- instead of leaving packs scattered through the fetched
+  // repo. The family supplies only where its components live and which
+  // of their tensors are matrices; see ltx25-quant-family.h.
+  ctx->register_quantize_family(std::make_unique<ltx25::Ltx25QuantFamily>());
 
   // The kernels, before anything can dispatch them. Two dtype twins
   // under the names the model layer resolves with load_library(); the

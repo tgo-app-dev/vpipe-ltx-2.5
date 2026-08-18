@@ -90,7 +90,7 @@ const ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
    .doc = "the LTX-2.5 checkpoint root. The text encoder is resolved out "
           "of it the same way the DiT is, so both stages take the same "
-          "path. A model-select source on iport1 overrides this",
+          "path. A model-select source on the `model` iport (2) overrides this",
    .def_str = ""},
   {.key = "pad_to", .type = ConfigType::Int, .required = false,
    .doc = "the padded context width. The reference's "
@@ -260,6 +260,32 @@ Ltx25ConditionerStage::Ltx25ConditionerStage(const SessionContextIntf* session,
 
 Ltx25ConditionerStage::~Ltx25ConditionerStage() = default;
 
+// The pre-launch twin of the model-select read in process(). Bookkeeping
+// only: nothing loads here, and the pipeline is not assembled yet.
+//
+// `model-select` has no iport, so its output is a constant of the run --
+// which the runtime folds and delivers before the planning phase exactly
+// so a consumer can declare against it. This stage was not taking it,
+// and the cost was not subtle: a graph that names its checkpoint through
+// model-select rather than through this stage's own `hf_dir` left
+// `_hf_dir` empty for the whole planning phase, so declare_resources()
+// returned nothing and the 15 GB encoder never reached the ledger. The
+// DiT then sized its irreversible streaming decision against an on-disk
+// guess for a component nobody had claimed.
+//
+// Resolved to a DIRECTORY here, as process() does, because everything
+// downstream of `_hf_dir` walks it on disk. resolve_model_dir returns a
+// path unchanged, so a beat naming a path still works.
+void
+Ltx25ConditionerStage::apply_constant(unsigned iport, const FlexData& beat)
+{
+  if (iport != kModelPort) { return; }
+  std::string ref;
+  if (!vpipe::apply_model_select_beat(beat, ref) || ref.empty()) { return; }
+  const std::string d = vpipe::resolve_model_dir(this->session(), ref);
+  if (!d.empty()) { _hf_dir = d; }
+}
+
 std::vector<ResourceClaim>
 Ltx25ConditionerStage::declare_resources() const
 {
@@ -271,6 +297,49 @@ Ltx25ConditionerStage::declare_resources() const
   // and declaring that here would double-count what generate-video
   // already claims.
   return vpipe::model_memory::weight_claims({cfg.enc_file});
+}
+
+// Pass TWO. Everything above has been declared by every stage; nothing
+// from this pass has been applied yet, so every stage deciding here sees
+// the same picture.
+//
+// WHY THE PHASE MATTERS, and it is not bookkeeping. `generate-video`
+// takes an irreversible block-streaming decision on the first
+// conditioning beat -- which is after this stage has produced its output
+// and before it has dropped the encoder. So an announcement at unload
+// time arrives one decision too late, and the only thing that reaches the
+// decision is a DECLARATION made now.
+//
+// MEASURED on a 16 GB box, w8 throughout: with the encoder declared for
+// the whole run, the DiT read "footprint 39 GB (peers 39 GB)" -- 15.3 GB
+// of which was an encoder destroyed before the first denoise step -- and
+// plan_streaming's pinned-prefix fraction is gated on `ram > others +
+// 5 GB`, so an inflated `others` silently left it at zero.
+//
+// ONLY when the encoder will really go. `park` releases NOTHING here:
+// park_weights() walks a weight set's CACHED entries and this encoder is
+// a Gemma LM reading uncached into its own members, so it parks 0 bytes
+// and stays entirely resident. A peer that subtracted it would be short
+// by the encoder's whole size. `keep` says so outright.
+std::vector<ResourceClaim>
+Ltx25ConditionerStage::decide_resources() const
+{
+  if (_hf_dir.empty()) { return {}; }
+  Config cfg;
+  if (!resolve(_hf_dir, cfg, nullptr, {}, _enc_variant)) { return {}; }
+  if (cfg.enc_file.empty()) { return {}; }
+  namespace mm = vpipe::model_memory;
+  // The same question resolve_idle_policy_() will answer at the first
+  // beat, asked here because the answer has to be on the record before
+  // any peer acts on it. `bounded` is unphased on purpose: it is the
+  // no-release worst case, which is what "is this box tight" means.
+  const bool releases =
+      _unload_cfg == mm::UnloadPolicy::kDestroy ||
+      (_unload_cfg == mm::UnloadPolicy::kAuto &&
+       mm::bounded(this->session(), {cfg.enc_file, cfg.dit_file},
+                   mm::kHeadroom));
+  if (!releases) { return {}; }
+  return mm::weight_claims_in_phase({cfg.enc_file}, mm::kPhaseCondition);
 }
 
 void
@@ -339,9 +408,22 @@ Ltx25ConditionerStage::process(RuntimeContext& ctx)
     auto mb = co_await ctx.read(kModelPort);
     if (const auto* mp = mb ? dynamic_cast<const FlexDataPayload*>(mb.get())
                             : nullptr) {
-      const std::string d = vpipe::resolve_model_dir(
-          this->session(), std::string(mp->data.as_string("")));
-      if (!d.empty()) { _hf_dir = d; }
+      // Parse the beat with the SHARED reader rather than reading it as
+      // a string. `model-select` emits an OBJECT ({"hf_dir": ...}), and
+      // as_string() on an object yields "" -- which then resolved the
+      // empty key and surfaced as MDB_BAD_VALSIZE out of the registry,
+      // naming neither this stage nor the beat it mis-read.
+      // apply_model_select_beat also accepts the plain-string form, so
+      // this reads both shapes the beat is allowed to take.
+      std::string ref;
+      if (vpipe::apply_model_select_beat(mp->data, ref) && !ref.empty()) {
+        // The beat carries a REFERENCE (a registry key or a path); the
+        // rest of this stage wants a checkpoint ROOT, since `resolve`
+        // walks it on disk. resolve_model_dir returns the ref unchanged
+        // when it is not a registry key, so a path beat still works.
+        const std::string d = vpipe::resolve_model_dir(this->session(), ref);
+        if (!d.empty()) { _hf_dir = d; }
+      }
     }
   }
   // A wired negative port is READ unconditionally, before anything can

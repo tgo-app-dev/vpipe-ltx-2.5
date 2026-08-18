@@ -2,6 +2,14 @@
   "id": "ltx-2.5-text-to-video",
   "stages": [
     {
+      "id": "model-select",
+      "type": "model-select",
+      "iports": [],
+      "config": {
+        "hf_dir": "local/LTX-2.5-distilled-8bit"
+      }
+    },
+    {
       "id": "text-prompt",
       "type": "text-prompt",
       "iports": [],
@@ -16,10 +24,17 @@
         {
           "src": "text-prompt",
           "oport": 0
+        },
+        {
+          "src": "",
+          "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
         }
       ],
       "config": {
-        "hf_dir": "./models/Lightricks/LTX-2.5",
         "unload_when_idle": "auto"
       }
     },
@@ -28,8 +43,7 @@
       "type": "ltx-2.5-model-config",
       "iports": [],
       "config": {
-        "audio_seconds": 0.0,
-        "variant": "w8g64"
+        "audio_seconds": 0.0
       }
     },
     {
@@ -45,7 +59,7 @@
           "oport": 0
         },
         {
-          "src": "",
+          "src": "model-select",
           "oport": 0
         },
         {
@@ -82,7 +96,6 @@
         }
       ],
       "config": {
-        "hf_dir": "./models/Lightricks/LTX-2.5",
         "height": 544,
         "width": 960,
         "frames": 121,
@@ -99,11 +112,13 @@
         {
           "src": "gen",
           "oport": 0
+        },
+        {
+          "src": "model-select",
+          "oport": 0
         }
       ],
-      "config": {
-        "hf_dir": "./models/Lightricks/LTX-2.5"
-      }
+      "config": {}
     },
     {
       "id": "avae",
@@ -112,11 +127,13 @@
         {
           "src": "gen",
           "oport": 1
+        },
+        {
+          "src": "model-select",
+          "oport": 0
         }
       ],
-      "config": {
-        "hf_dir": "./models/Lightricks/LTX-2.5"
-      }
+      "config": {}
     },
     {
       "id": "rgb-to-video",

@@ -81,9 +81,29 @@ Ltx25Generator::warn_(const std::string& m) const
   if (_session != nullptr) { _session->warn(fmt("ltx-2.5: {}", m)); }
 }
 
+bool
+Ltx25Generator::streaming_blocks() const noexcept
+{
+  return _dit && _dit->streaming();
+}
+
+int
+Ltx25Generator::pinned_blocks() const noexcept
+{
+  return _dit ? _dit->pinned_blocks() : 0;
+}
+
+std::size_t
+Ltx25Generator::pinned_weight_bytes() const noexcept
+{
+  return _dit ? _dit->pinned_bytes() : 0;
+}
+
 std::unique_ptr<Ltx25Generator>
 Ltx25Generator::create(const Config& cfg, std::shared_ptr<WeightSet> ws,
                        MetalCompute* mc, bool stream_blocks,
+                       double pin_frac, int plan_w, int plan_h,
+                       int plan_frames,
                        const vpipe::SessionContextIntf* session,
                        std::string* err)
 {
@@ -94,11 +114,16 @@ Ltx25Generator::create(const Config& cfg, std::shared_ptr<WeightSet> ws,
   // must unmap when the LAST holder goes away, not the first.
   g->_ws = std::move(ws);
   g->_stream_blocks = stream_blocks;
+  g->_pin_frac = pin_frac;
+  g->_plan_w = plan_w;
+  g->_plan_h = plan_h;
+  g->_plan_frames = plan_frames;
   g->_session = session;
   if (!g->_ops.init(mc, err)) { return nullptr; }
   // The connectors come with the DiT: this generator takes a PRE-
   // connector caption, so it needs them.
-  g->_dit = Ltx25Dit::load(cfg, *g->_ws, g->_ops, stream_blocks, err,
+  g->_dit = Ltx25Dit::load(cfg, g->_ws, g->_ops, stream_blocks,
+                           pin_frac, plan_w, plan_h, plan_frames, err,
                            /*with_connectors=*/true);
   if (!g->_dit) { return nullptr; }
   return g;
@@ -378,7 +403,8 @@ Ltx25Generator::generate(const VideoGenRequest& req, VideoGenResult* out)
     log_("the reference strengths changed, so the baked adaLN schedule no "
          "longer covers this request; rebuilding the DiT");
     std::string lerr;
-    _dit = Ltx25Dit::load(_cfg, *_ws, _ops, _stream_blocks, &lerr,
+    _dit = Ltx25Dit::load(_cfg, _ws, _ops, _stream_blocks, _pin_frac,
+                          _plan_w, _plan_h, _plan_frames, &lerr,
                           /*with_connectors=*/true);
     if (!_dit) {
       warn_("rebuilding the DiT: " + lerr);
@@ -419,6 +445,36 @@ Ltx25Generator::generate(const VideoGenRequest& req, VideoGenResult* out)
              (double)_dit->scratch_bytes() / 1e9, _dit->num_layers(),
              (double)_dit->scratch_bytes() * _dit->num_layers() / 1e9)());
     log_(fmt("attention kernel: {}", _ops.attn_kernel())());
+
+    // WHAT MUST STAY CLEAR when the DiT decides to keep a streamed block,
+    // and the honest answer here is NOTHING.
+    //
+    // BlockResidency::set_reserve says it plainly: zero "is the honest
+    // answer for a caller that FREES this model before the next peer
+    // runs -- reserving room for a coexistence that does not happen buys
+    // nothing and costs the whole denoise". That is this graph.
+    // generate-video destroys the DiT at its idle point, and only then
+    // does vae-decode load anything, so the two never coexist.
+    //
+    // The flat 1 GB that was here protected nobody and cost real blocks.
+    // admit() asks for the block, the reserve, and ONE MORE block as
+    // hysteresis, so a 1 GB reserve turned a 393 MB question into a
+    // 1.8 GB one. MEASURED on a 16 GB box whose Metal working set is
+    // 12124 MB: the run settled at 2 resident blocks with the box under
+    // 10 GB and half a gigabyte of swap -- it had the room and could not
+    // ask for it. And the figure was never right in the other direction
+    // either: the VAE decode at this geometry wants ~4.7 GB, so 1 GB was
+    // not protection, it was a number.
+    //
+    // The arena is still declared, because note_reserve_allocated then
+    // subtracts it straight back out -- set_geometry has already
+    // allocated it. Saying it and retracting it is not a no-op: it is
+    // what makes the reserve DECLARED, and growth stays off until a
+    // caller declares one.
+    //
+    // A graph that keeps this DiT resident across the decode would need
+    // a real figure here, not a token one. Nothing wires that today.
+    _dit->set_residency_reserve((std::size_t)_dit->scratch_bytes());
     log_(fmt("latent {}x{}x{} ({} tokens{}) from {} frames at {}x{}, "
              "{} caption rows", lf, lh, lw, lf * lh * lw,
              v_tokens > bc.v_target
@@ -431,15 +487,33 @@ Ltx25Generator::generate(const VideoGenRequest& req, VideoGenResult* out)
   //
   // The DISTILLED checkpoint's schedule is FIXED at 8 steps -- it is a
   // property of the distillation, not a knob. A `steps` that disagrees
-  // is reported rather than honoured, because interpolating this list
-  // is not the same model.
+  // is reported rather than honoured, because interpolating this list is
+  // not the same model.
   std::vector<double> sigmas = distilled_sigmas();
-  if (_cfg.variant == Variant::kDistilled &&
-      req.steps > 0 && req.steps != (int)sigmas.size() - 1) {
-    log_(fmt("the distilled checkpoint's schedule is fixed at {} steps; "
-             "the configured {} is ignored", sigmas.size() - 1, req.steps)());
-  }
   const int steps = (int)sigmas.size() - 1;
+
+  // REPORTED WHATEVER THE VARIANT SAYS, because the schedule is fixed
+  // whatever it says. This notice used to be gated on the probe having
+  // returned kDistilled -- so the one case where the probe FAILS was
+  // also the case where a caller who asked for 12 steps, got 8, and was
+  // told nothing. A silent override is the thing worth reporting, and
+  // it is least excusable exactly when the model is unsure what it is.
+  if (req.steps > 0 && req.steps != steps) {
+    log_(fmt("this checkpoint's schedule is fixed at {} steps; the "
+             "configured {} is ignored -- interpolating the distilled "
+             "sigma list is not the same model", steps, req.steps)());
+  }
+  // And there IS only the distilled ladder here. A `dev` checkpoint
+  // needs its own schedule and real classifier-free guidance, neither of
+  // which this port has; running it on this list samples a model that
+  // was never distilled as though it had been. Loud, because the output
+  // is plausible rather than obviously broken.
+  if (_cfg.variant == Variant::kDev) {
+    warn_(fmt("this is the DEV checkpoint, but only the distilled {}-step "
+              "sigma schedule is implemented -- the result will be a dev "
+              "model sampled on a distilled ladder, which is not what "
+              "either was meant to do", steps)());
+  }
 
   // ---- the denoise loop ------------------------------------------------
   const std::size_t n = (std::size_t)d.in_channels * v_tokens;
@@ -519,11 +593,19 @@ Ltx25Generator::generate(const VideoGenRequest& req, VideoGenResult* out)
   // sizes the load dominates a total badly enough to hide a 2x.
   const auto t_denoise = std::chrono::steady_clock::now();
 
+  // PER-BLOCK REPORTING, wired straight through. The DiT has always had
+  // this hook and nothing set it, so the only thing the host could be
+  // told was "a step finished" -- and a step here is one forward of a
+  // 48-block stack that may be streaming ~19 GB of weights, so a
+  // step-granular bar sits still for minutes at a time and a Stop waits
+  // just as long. It costs a compare per block.
+  if (req.block_progress) {
+    in.progress = [&req](int done, int total) {
+      return req.block_progress(done, total);
+    };
+  }
+
   for (int s = 0; s < steps; ++s) {
-    if (req.progress && !req.progress(s, steps)) {
-      log_("stopped mid-denoise");
-      return false;
-    }
     in.video = x.data();
     in.audio = (na > 0) ? xa.data() : nullptr;
     in.step  = s;
@@ -603,6 +685,17 @@ Ltx25Generator::generate(const VideoGenRequest& req, VideoGenResult* out)
         hold_conditioned(xa.data(), bc.a_clean.data(), bc.a_mask.data(),
                          d.audio_out_channels, a_tokens);
       }
+    }
+
+    // AT THE END, ONE-BASED. This used to fire at the START of the step
+    // with a zero-based index, which is not what the host's bar re-syncs
+    // on: it takes the step that just FINISHED, so the old call reported
+    // step s as complete before it had run and the bar ran one step
+    // ahead of the work for the whole denoise. The abort is unaffected --
+    // the per-block hook above catches a Stop far sooner anyway.
+    if (req.progress && !req.progress(s + 1, steps)) {
+      log_("stopped mid-denoise");
+      return false;
     }
   }
 

@@ -196,6 +196,21 @@ MetalBlock::set_rope(const RopeTable* v_self, const RopeTable* a_self,
 }
 
 std::uint64_t
+BlockScratch::predict_bytes(std::size_t t, std::size_t d, std::size_t f,
+                            std::size_t l) noexcept
+{
+  if (d == 0 || t == 0) { return 0; }
+  if (l < 1) { l = 1; }
+  // 15 planes (a,b,c,d,e / q,k,v,o / qh,kh,vh,oh / snap_v,snap_a), the
+  // wide feed-forward buffer, the [tokens][64] gate logits, three
+  // per-level modulation rows and the two cross-attention K/V rows --
+  // reserve()'s allocation list, in its order.
+  const std::uint64_t elems = 15ull * t * d + (std::uint64_t)t * std::max(d, f)
+                            + 64ull * t + 3ull * d * l + 2ull * d;
+  return elems * 2;               // MetalOps::alloc is bf16
+}
+
+std::uint64_t
 BlockScratch::bytes() const noexcept
 {
   const vpipe::metal_compute::SharedBuffer* all[] = {

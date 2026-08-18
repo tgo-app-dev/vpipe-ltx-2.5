@@ -25,6 +25,57 @@ shape_of_(WeightSet& ws, const std::string& name, std::vector<int>& out)
   return true;
 }
 
+// The three working buffers one block of the up-stack needs, reused
+// across every block of the decode.
+//
+// REUSE IS SAFE ONLY BECAUSE OF THE COMMIT. The stack is strictly
+// sequential, and each block ends with a commit().wait(), so by the time
+// the next block asks for slot 0 the previous block's GPU work has
+// retired and its bytes are genuinely dead. Without that wait these
+// would alias live work; with it they are the same three allocations
+// nine levels in a row.
+//
+// GROW-ONLY, and never shrunk between levels. The levels get wider in
+// cells as they get narrower in channels, so the widest slot is the one
+// the last level asks for -- sizing each level exactly would reallocate
+// nine times and arrive at the same peak, having also freed and re-faulted
+// a gigabyte on the way.
+class Slots {
+public:
+  explicit Slots(const MetalOps& ops) : _ops(&ops) {}
+
+  SharedBuffer& get(int i, std::size_t elems)
+  {
+    SharedBuffer& s = _s[i];
+    if (s.empty() || s.byte_size() < elems * 2) {
+      // Freed BEFORE the bigger one is asked for. Holding both across
+      // the allocation is a needless peak, and on the box this exists
+      // for it is the difference between fitting and not.
+      s = SharedBuffer{};
+      s = _ops->alloc(elems);
+      if (s.empty()) { _failed = true; }
+    }
+    return s;
+  }
+
+  // Hand every slot back. The output head reads only the residual
+  // stream, so releasing here keeps the tail under the stack's own peak
+  // rather than adding the picture on top of it.
+  void release()
+  {
+    for (SharedBuffer& s : _s) { s = SharedBuffer{}; }
+  }
+
+  // Sticky: any allocation having failed makes the whole decode wrong,
+  // and a GEMM into an empty buffer is silent.
+  bool failed() const { return _failed; }
+
+private:
+  const MetalOps* _ops;
+  SharedBuffer    _s[3];
+  bool            _failed = false;
+};
+
 }  // namespace
 
 bool
@@ -170,7 +221,7 @@ Ltx25VaeDecoder::conv3d_(CommandStream& stream, const Conv& c,
 
 bool
 Ltx25VaeDecoder::decode(const float* latent, int F, int H, int W,
-                        std::vector<float>* out, std::array<int, 4>* shape,
+                        SharedBuffer* out, std::array<int, 4>* shape,
                         std::string* err)
 {
   auto fail = [&](std::string m) {
@@ -186,6 +237,7 @@ Ltx25VaeDecoder::decode(const float* latent, int F, int H, int W,
   const SharedBuffer d_lat = _ops->upload_f32(lat);
 
   CommandStream stream = _ops->mc()->make_command_stream();
+  Slots scr(*_ops);
 
   // ---- conv_in, into channel-last ------------------------------------
   SharedBuffer x = _ops->alloc((std::size_t)F * H * W * C);
@@ -197,16 +249,36 @@ Ltx25VaeDecoder::decode(const float* latent, int F, int H, int W,
   }
   SharedBuffer y =
       _ops->alloc((std::size_t)F * H * W * _conv_in.cout);
+  if (x.empty() || y.empty()) { return fail("out of memory at conv_in"); }
   conv3d_(stream, _conv_in, x, F, H, W, y);
+  // THE COMMIT IS WHAT FREES, and it is the whole fix. Until this
+  // returns, the command buffer holds a reference to every buffer it
+  // was handed, so `x`'s bytes survive the assignment below however the
+  // C++ scoping reads. See the note on Slots.
+  stream.commit().wait();
   x = std::move(y);
   int cc = _conv_in.cout, cf = F, ch = H, cw = W;
 
   // ---- the up blocks --------------------------------------------------
+  //
+  // One commit per BLOCK, not per stack. Nine levels of feature map at
+  // this model's real geometry is 32.6 GB if they are allowed to
+  // accumulate; retired per block and reused, the same decode peaks at
+  // the widest single block. The cost is nine CPU waits on a decode
+  // whose GPU time is measured in tens of seconds.
   for (const UpBlock& u : _ups) {
     if (u.is_res) {
       for (const ResBlock& rb : u.res) {
         const std::size_t n = (std::size_t)cf * ch * cw * cc;
-        SharedBuffer h = _ops->alloc(n);
+        // Separate slots because all three are live at once: `h` is
+        // read by conv1 while `t` is written, and `x` is the residual
+        // the block adds back at the end.
+        SharedBuffer& h = scr.get(0, n);
+        SharedBuffer& t =
+            scr.get(1, (std::size_t)cf * ch * cw * rb.conv1.cout);
+        SharedBuffer& t2 =
+            scr.get(2, (std::size_t)cf * ch * cw * rb.conv2.cout);
+        if (scr.failed()) { return fail("out of memory in a res block"); }
         {
           // h = SiLU(PixelNorm(x)) -- copy first, since the norm is in
           // place and `x` is the residual this block adds back.
@@ -215,15 +287,12 @@ Ltx25VaeDecoder::decode(const float* latent, int F, int H, int W,
           _ops->vae_pixel_norm_silu(enc, h, cc, cf * ch * cw);
           enc.end();
         }
-        SharedBuffer t = _ops->alloc((std::size_t)cf * ch * cw * rb.conv1.cout);
         conv3d_(stream, rb.conv1, h, cf, ch, cw, t);
         {
           auto enc = stream.begin_compute();
           _ops->vae_pixel_norm_silu(enc, t, rb.conv1.cout, cf * ch * cw);
           enc.end();
         }
-        SharedBuffer t2 =
-            _ops->alloc((std::size_t)cf * ch * cw * rb.conv2.cout);
         conv3d_(stream, rb.conv2, t, cf, ch, cw, t2);
         {
           // The shortcut is Identity (in == out everywhere), so the
@@ -232,20 +301,28 @@ Ltx25VaeDecoder::decode(const float* latent, int F, int H, int W,
           _ops->vae_add_into(enc, x, t2, n);
           enc.end();
         }
+        stream.commit().wait();
       }
     } else {
-      SharedBuffer t = _ops->alloc((std::size_t)cf * ch * cw * u.conv.cout);
+      SharedBuffer& t = scr.get(0, (std::size_t)cf * ch * cw * u.conv.cout);
+      if (scr.failed()) { return fail("out of memory in an up block"); }
       conv3d_(stream, u.conv, x, cf, ch, cw, t);
       const int drop = (u.st == 2) ? 1 : 0;
       const int of = cf * u.st - drop, oh = ch * u.sh, ow = cw * u.sw;
       const int oc = u.conv.cout / (u.st * u.sh * u.sw);
+      // NOT a slot: this becomes the residual stream and outlives the
+      // block that made it.
       SharedBuffer o = _ops->alloc((std::size_t)of * oh * ow * oc);
+      if (o.empty()) { return fail("out of memory upsampling"); }
       {
         auto enc = stream.begin_compute();
         _ops->vae_d2s(enc, t, o, u.conv.cout, cf, ch, cw, u.st, u.sh, u.sw,
                       drop);
         enc.end();
       }
+      // Before the move, so the level this block just left goes back to
+      // the box instead of riding along under the next one.
+      stream.commit().wait();
       x = std::move(o);
       cc = oc; cf = of; ch = oh; cw = ow;
     }
@@ -257,7 +334,13 @@ Ltx25VaeDecoder::decode(const float* latent, int F, int H, int W,
     _ops->vae_pixel_norm_silu(enc, x, cc, cf * ch * cw);
     enc.end();
   }
+  // The head reads `x` and nothing else, so the slots -- which by now
+  // are the widest allocations in the process -- go back before the
+  // picture is asked for.
+  scr.release();
+
   SharedBuffer o48 = _ops->alloc((std::size_t)cf * ch * cw * _conv_out.cout);
+  if (o48.empty()) { return fail("out of memory at the output head"); }
   conv3d_(stream, _conv_out, x, cf, ch, cw, o48);
 
   const int patch = _cfg.patch_size;
@@ -273,11 +356,40 @@ Ltx25VaeDecoder::decode(const float* latent, int F, int H, int W,
   }
   stream.commit().wait();
 
-  out->resize(npix);
-  std::memcpy(out->data(), pix.contents(), npix * sizeof(float));
+  // Handed out, not copied out. This is UMA memory; a frame sink reads
+  // contents() directly.
+  *out = std::move(pix);
   if (shape != nullptr) { *shape = {oc, cf, oh, ow}; }
   return true;
 }
+
+bool
+Ltx25VaeDecoder::decode(const float* latent, int F, int H, int W,
+                        std::vector<float>* out, std::array<int, 4>* shape,
+                        std::string* err)
+{
+  if (out == nullptr) {
+    if (err != nullptr) { *err = "null argument"; }
+    return false;
+  }
+  SharedBuffer pix;
+  std::array<int, 4> s{};
+  if (!decode(latent, F, H, W, &pix, &s, err)) { return false; }
+  const std::size_t npix =
+      (std::size_t)s[0] * (std::size_t)s[1] * (std::size_t)s[2] *
+      (std::size_t)s[3];
+  out->resize(npix);
+  std::memcpy(out->data(), pix.contents(), npix * sizeof(float));
+  if (shape != nullptr) { *shape = s; }
+  return true;
+}
+
+void
+Ltx25VaeDecoder::release_idle()
+{
+  _im2col = SharedBuffer{};
+}
+
 
 // ---------------------------------------------------------------------
 // The ENCODER.
@@ -454,6 +566,7 @@ Ltx25VaeEncoder::encode(const float* pixels, int F, int H, int W,
   const SharedBuffer d_px = _ops->upload_f32(host);
 
   CommandStream stream = _ops->mc()->make_command_stream();
+  Slots scr(*_ops);
 
   // ---- patchify, into channel-last ------------------------------------
   const int patch = _cfg.patch_size;
@@ -466,53 +579,74 @@ Ltx25VaeEncoder::encode(const float* pixels, int F, int H, int W,
     enc.end();
   }
   SharedBuffer y = _ops->alloc((std::size_t)cf * ch * cw * _conv_in.cout);
+  if (x.empty() || y.empty()) { return fail("out of memory at conv_in"); }
   conv3d_(stream, _conv_in, x, cf, ch, cw, y);
+  stream.commit().wait();          // see the decoder: the commit is the free
   x = std::move(y);
   cc = _conv_in.cout;
 
   // ---- the down blocks -------------------------------------------------
+  //
+  // Committed per block and worked out of three reused slots, for the
+  // reason spelled out on Ltx25VaeDecoder::decode: the encoder's widest
+  // level is its FIRST (full pixel resolution at 128 channels), so a
+  // reference CLIP -- as opposed to a single frame -- puts it in exactly
+  // the same territory the decoder was in.
   for (const DownBlock& dn : _downs) {
     if (dn.is_res) {
       for (const ResBlock& rb : dn.res) {
         const std::size_t n = (std::size_t)cf * ch * cw * cc;
-        SharedBuffer h = _ops->alloc(n);
+        SharedBuffer& h = scr.get(0, n);
+        SharedBuffer& t =
+            scr.get(1, (std::size_t)cf * ch * cw * rb.conv1.cout);
+        SharedBuffer& t2 =
+            scr.get(2, (std::size_t)cf * ch * cw * rb.conv2.cout);
+        if (scr.failed()) { return fail("out of memory in a res block"); }
         {
           auto enc = stream.begin_compute();
           _ops->copy(enc, x, h, (int)n);
           _ops->vae_pixel_norm_silu(enc, h, cc, cf * ch * cw);
           enc.end();
         }
-        SharedBuffer t =
-            _ops->alloc((std::size_t)cf * ch * cw * rb.conv1.cout);
         conv3d_(stream, rb.conv1, h, cf, ch, cw, t);
         {
           auto enc = stream.begin_compute();
           _ops->vae_pixel_norm_silu(enc, t, rb.conv1.cout, cf * ch * cw);
           enc.end();
         }
-        SharedBuffer t2 =
-            _ops->alloc((std::size_t)cf * ch * cw * rb.conv2.cout);
         conv3d_(stream, rb.conv2, t, cf, ch, cw, t2);
         {
           auto enc = stream.begin_compute();
           _ops->vae_add_into(enc, x, t2, n);
           enc.end();
         }
+        stream.commit().wait();
       }
     } else {
       // A time-halving block sees ONE EXTRA FRAME: its own frame 0,
       // duplicated -- and BOTH its conv and its skip read the padded
       // volume. That is what keeps 1 + 8k -> 1 + k exact rather than
       // losing a frame at each of the three halvings.
-      SharedBuffer in = std::move(x);
+      //
+      // By POINTER rather than by move, so the padded volume can live in
+      // a reused slot; `x` is released explicitly below once the pad has
+      // read it, which is what the move used to do.
+      const SharedBuffer* in = &x;
       int inf = cf;
       if (dn.st == 2) {
-        SharedBuffer dup =
-            _ops->alloc((std::size_t)(cf + 1) * ch * cw * cc);
-        auto enc = stream.begin_compute();
-        _ops->vae_dup_frame0(enc, in, dup, cc, cf, ch, cw);
-        enc.end();
-        in = std::move(dup);
+        SharedBuffer& dup =
+            scr.get(0, (std::size_t)(cf + 1) * ch * cw * cc);
+        if (scr.failed()) { return fail("out of memory padding the clip"); }
+        {
+          auto enc = stream.begin_compute();
+          _ops->vae_dup_frame0(enc, x, dup, cc, cf, ch, cw);
+          enc.end();
+        }
+        // The commit retires the READ of x, so the level below can have
+        // its bytes while this block is still running.
+        stream.commit().wait();
+        x = SharedBuffer{};
+        in = &dup;
         inf = cf + 1;
       }
       const int prod = dn.st * dn.sh * dn.sw;
@@ -523,17 +657,22 @@ Ltx25VaeEncoder::encode(const float* pixels, int F, int H, int W,
       // channel groups averaged down to the output width. A mean, not a
       // projection -- there is nothing to bind, which is exactly why
       // leaving it out loads cleanly and encodes something plausible.
-      SharedBuffer skip = _ops->alloc((std::size_t)of * oh * ow * oc);
+      SharedBuffer& skip = scr.get(1, (std::size_t)of * oh * ow * oc);
+      if (scr.failed()) { return fail("out of memory in the skip"); }
       {
         auto enc = stream.begin_compute();
-        _ops->vae_s2d(enc, in, skip, cc, inf, ch, cw, dn.st, dn.sh, dn.sw,
+        _ops->vae_s2d(enc, *in, skip, cc, inf, ch, cw, dn.st, dn.sh, dn.sw,
                       dn.group_size);
         enc.end();
       }
       // The CONV path: a stride-1 convolution, then the same regroup.
-      SharedBuffer t = _ops->alloc((std::size_t)inf * ch * cw * dn.conv.cout);
-      conv3d_(stream, dn.conv, in, inf, ch, cw, t);
+      SharedBuffer& t =
+          scr.get(2, (std::size_t)inf * ch * cw * dn.conv.cout);
+      if (scr.failed()) { return fail("out of memory in a down block"); }
+      conv3d_(stream, dn.conv, *in, inf, ch, cw, t);
+      // NOT a slot: this becomes the residual stream.
       SharedBuffer o = _ops->alloc((std::size_t)of * oh * ow * oc);
+      if (o.empty()) { return fail("out of memory downsampling"); }
       {
         auto enc = stream.begin_compute();
         _ops->vae_s2d(enc, t, o, dn.conv.cout, inf, ch, cw, dn.st, dn.sh,
@@ -541,6 +680,7 @@ Ltx25VaeEncoder::encode(const float* pixels, int F, int H, int W,
         _ops->vae_add_into(enc, o, skip, (std::size_t)of * oh * ow * oc);
         enc.end();
       }
+      stream.commit().wait();
       x = std::move(o);
       cc = oc; cf = of; ch = oh; cw = ow;
     }
@@ -552,8 +692,13 @@ Ltx25VaeEncoder::encode(const float* pixels, int F, int H, int W,
     _ops->vae_pixel_norm_silu(enc, x, cc, cf * ch * cw);
     enc.end();
   }
+  // The head reads only the residual stream; the slots are the widest
+  // allocations left, so they go back before the latent is asked for.
+  scr.release();
+
   SharedBuffer head =
       _ops->alloc((std::size_t)cf * ch * cw * _conv_out.cout);
+  if (head.empty()) { return fail("out of memory at the head"); }
   conv3d_(stream, _conv_out, x, cf, ch, cw, head);
 
   const int C = _cfg.latent_channels;

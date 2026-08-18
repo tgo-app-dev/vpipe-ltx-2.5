@@ -81,15 +81,72 @@ inline constexpr const char* kDitPrefix = "model.diffusion_model.";
 // False (with `err` naming the first missing tensor) rather than a
 // partially-bound block: a block with one unbound projection runs at
 // full cost and produces noise.
+// Copied or Mapped for the bytes this model KEEPS, decided by the
+// model's residency verdict rather than per call.
+//
+//   PRELOADING -> Mapped. Everything is resident either way, so owning
+//     the bytes buys nothing and costs their KIND: clean file pages the
+//     kernel drops for free become anonymous memory it can only
+//     compress. load_mapped() wrapping the whole shard is the usual
+//     objection and does not apply -- the whole checkpoint being
+//     resident is what preloading MEANS.
+//   STREAMING  -> Copied, for the PINNED PREFIX and the trunk as well as
+//     the tail. A prefix the kernel can evict is not a prefix, and a
+//     forward is a cyclic scan: the one access pattern an LRU page cache
+//     handles worst, dropping each block exactly before it comes round
+//     again.
+//
+// This is MiniMax-H3's rule (kept_residency_ there) and the reason it is
+// spelled out again rather than left implicit: this port decided it PER
+// TENSOR instead -- streamed reads Copied, everything else Mapped -- so
+// a streaming model's pinned prefix came out mapped, which is the one
+// combination H3's note rules out. MEASURED on a 16 GB box: the prefix
+// was evicted inside the first forward, the residency check saw it leave
+// RAM ("resident weights are only 88% in RAM"), and shed it -- so the
+// pin bought nothing and cost a re-read per forward.
+//
+// The 409.7 s vs 473.5 s that favours mapping was measured PRELOADED on
+// a 64 GB box; generalising it to the streaming prefix is what went
+// wrong here.
+inline vpipe::genai::WeightSet::Residency kept_residency(bool stream_blocks)
+{
+  return stream_blocks ? vpipe::genai::WeightSet::Residency::Copied
+                       : vpipe::genai::WeightSet::Residency::Mapped;
+}
+
 bool bind_block(vpipe::genai::WeightSet& ws,
                 vpipe::metal_compute::MetalCompute* mc, const DitConfig& cfg,
                 int layer, bool stream, GpuBlockWeights& out,
-                std::string* err);
+                std::string* err,
+                vpipe::genai::WeightSet::Residency kept =
+                    vpipe::genai::WeightSet::Residency::Mapped);
 
 // Bind the trunk. Always cached -- it is small and every step reads it.
 bool bind_trunk(vpipe::genai::WeightSet& ws,
                 vpipe::metal_compute::MetalCompute* mc, const DitConfig& cfg,
-                DitTrunk& out, std::string* err);
+                DitTrunk& out, std::string* err,
+                vpipe::genai::WeightSet::Residency kept =
+                    vpipe::genai::WeightSet::Residency::Mapped);
+
+// ONE linear that may be group-affine quantized, for a caller outside the
+// block stack. Same rule as the blocks': the `.scales`/`.biases` siblings
+// decide, and bits and group are recovered from the SHAPES rather than
+// from a config, so a mixed pack loads as it sits.
+//
+// Exported because the connectors are quantized by the same pass as the
+// blocks and must therefore be READ the same way. A dense-only reader
+// against a quantized pack does not fail -- it binds the u32 codes as
+// bf16 and produces plausible conditioning at full speed -- so the two
+// have to move together, and sharing this is what keeps them together.
+//
+// `K` is the width the linear READS; `*group` is filled on the first
+// quantized tensor and checked against every one after.
+bool bind_qlinear(vpipe::genai::WeightSet& ws,
+                  vpipe::metal_compute::MetalCompute* mc,
+                  const std::string& name, int K, bool stream, QWeight& out,
+                  int* group, std::string* miss, std::string* err,
+                  vpipe::genai::WeightSet::Residency kept =
+                      vpipe::genai::WeightSet::Residency::Mapped);
 
 }  // namespace ltx25
 

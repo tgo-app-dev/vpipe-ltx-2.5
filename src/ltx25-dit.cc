@@ -1,9 +1,15 @@
 #include "ltx25-dit.h"
 
+#include "ltx25-text-encoder.h"
+
+#include "apple-silicon/metal-compute/shared-buffer.h"
+#include "generative-models/shared/stream-pin.h"
+
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 
 #include <chrono>
+#include <cstdio>
 #include <future>
 #include <cmath>
 #include <cstdlib>
@@ -194,11 +200,12 @@ Ltx25Dit::bake_adaln(const std::vector<double>& sigmas, std::string* err)
   }
 
   // Count what the per-step chains were touching, then clear the
-  // handles. The count is WORK AVOIDED, not memory freed: these are
-  // Mapped views the WeightSet also caches, so dropping them here
-  // returns no RSS. Clearing is enforcement -- after the bake nothing
-  // may read them, and an empty buffer makes that a crash rather than a
-  // silent success.
+  // handles. On a PRELOADING model the count is work avoided rather than
+  // memory freed -- the chains are Mapped views the WeightSet also
+  // caches. On a STREAMING one they are this model's own bytes
+  // (kept_residency), so the release is real. Clearing is enforcement
+  // either way: after the bake nothing may read them, and an empty
+  // buffer makes that a crash rather than a silent success.
   const DitTrunk::AdaLN* all[] = {
       &_trunk.video, &_trunk.audio, &_trunk.prompt, &_trunk.audio_prompt,
       &_trunk.av_video_ss, &_trunk.av_audio_ss,
@@ -219,6 +226,22 @@ Ltx25Dit::bake_adaln(const std::vector<double>& sigmas, std::string* err)
     a->out_w  = SharedBuffer(); a->out_b  = SharedBuffer();
     a->valid  = false;
   }
+
+  // THE GROUND MOVED, and the residency policy cannot see it.
+  //
+  // Whatever the ratchet concluded about this box a moment ago was
+  // measured against a load this model no longer carries. That matters
+  // because the ratchet is deliberately slow to climb -- one block per
+  // three quiet forwards -- and this schedule is 8 steps, so a shed
+  // taken during the bake would stand for the whole run and leave the
+  // box half empty. MiniMax-H3 resets it here for the same reason and a
+  // bigger one (13.2 GB of per-step projections against this model's
+  // 0.85 GB).
+  //
+  // Deliberately not automatic: a caller that resets on nothing in
+  // particular has simply turned the ratchet off. This is the one moment
+  // the model KNOWS.
+  if (_stream_blocks && freed > 0) { _resid.note_landscape_changed(); }
   _baked_freed = freed;
   _baked_v_levels = _v_levels;
   _baked_a_levels = _a_levels;
@@ -228,79 +251,52 @@ Ltx25Dit::bake_adaln(const std::vector<double>& sigmas, std::string* err)
 
 namespace {
 
-// Bring a block's weight pages back into RAM, by touching one byte per
-// page.
-//
-// WHAT IS BEING FAULTED depends on the pack, and the two are not the
-// same cost:
-//
-//   w8g64 / w4g64   sharded, and every tensor lands 16-byte aligned, so
-//                   the WeightSet maps them. These are clean file pages:
-//                   the kernel drops them for free and a touch re-reads
-//                   from the file (or from the buffer cache).
-//   bf16            ONE file whose data section starts at 677624 == 8
-//                   (mod 16), so every one of its 4349 tensors is
-//                   unaligned, load_mapped refuses, and all 39 GB come
-//                   in as COPIES. These are anonymous, so a touch is a
-//                   decompress or a swap-in, not a file read.
-//
-// Not madvise(MADV_WILLNEED): it is advisory, and only the anonymous
-// case has anything for it to advise about anyway. A read per page is
-// what actually makes the page present, and it is cheap.
-//
-// `volatile` because the sum is dead and every optimiser knows it; the
-// whole point of the loop is its side effect on residency.
-void
-warm_pages_(const GpuBlockWeights& w)
-{
-  const std::size_t page = (std::size_t)::getpagesize();
-  volatile std::uint8_t sink = 0;
-  for_each_weight(w, [&](const SharedBuffer& b) {
-    if (b.empty()) { return; }
-    const auto* p = static_cast<const std::uint8_t*>(b.contents());
-    if (p == nullptr) { return; }
-    const std::size_t n = b.byte_size();
-    for (std::size_t off = 0; off < n; off += page) { sink = sink ^ p[off]; }
-    if (n > 0) { sink = sink ^ p[n - 1]; }
-  });
-  (void)sink;
-}
 
 // Is enough of this block missing to be worth warming? Sampled coarsely
 // -- a block is faulted in as a whole, so one page in 64 answers it --
 // and it is what keeps the prefetch free on a box where the weights
 // never leave RAM: there, this returns false for every block and no
 // thread is ever started.
-bool
-block_is_cold_(const GpuBlockWeights& w)
+// Bytes one block holds, for the affordability question the prefetch
+// asks before allocating a second one.
+std::size_t
+block_bytes_(const MetalBlock* b)
 {
-  std::size_t ex = 0, ic = 0;
-  for_each_weight(w, [&](const SharedBuffer& b) {
-    if (b.empty()) { return; }
-    const auto r = b.page_residency(64);
-    if (!r.valid) { return; }
-    ex += r.examined;
-    ic += r.incore;
+  if (b == nullptr) { return 0; }
+  std::size_t n = 0;
+  for_each_weight(b->weights(), [&](const SharedBuffer& x) {
+    n += x.byte_size();
   });
-  // 95%, not 100%: a handful of pages missing is measurement noise and
-  // not worth a thread, while a block that was genuinely dropped reads
-  // at a few percent (MEASURED: 1.0-17% on the first step of the 39 GB
-  // bf16 pack, against 100% on every step after it).
-  return ex > 0 && (double)ic < 0.95 * (double)ex;
+  return n;
 }
 
 }  // namespace
 
 std::unique_ptr<Ltx25Dit>
-Ltx25Dit::load(const Config& cfg, WeightSet& ws, const MetalOps& ops,
-               bool stream_blocks, std::string* err, bool with_connectors)
+Ltx25Dit::load(const Config& cfg, std::shared_ptr<WeightSet> ws_in,
+               const MetalOps& ops, bool stream_blocks, double pin_frac,
+               int plan_w, int plan_h, int plan_frames, std::string* err,
+               bool with_connectors)
 {
+  if (!ws_in) {
+    if (err != nullptr) { *err = "no weight set"; }
+    return nullptr;
+  }
+  WeightSet& ws = *ws_in;
   std::unique_ptr<Ltx25Dit> d(new Ltx25Dit());
   d->_ops = &ops;
   d->_cfg = cfg.dit;
+  d->_ws = std::move(ws_in);
+  d->_stream_blocks = stream_blocks;
   d->_have_audio = cfg.dit.use_audio_video_cross_attention;
 
-  if (!bind_trunk(ws, ops.mc(), cfg.dit, d->_trunk, err)) { return nullptr; }
+  // The trunk is KEPT for the model's life and read every step, so its
+  // residency follows the model's verdict -- Copied when streaming, so a
+  // 2.8 GB trunk is not competing with the streamed tail for page cache.
+  const auto kept = kept_residency(stream_blocks);
+  if (!bind_trunk(ws, ops.mc(), cfg.dit, d->_trunk, err, kept)) {
+    return nullptr;
+  }
   d->_has_connector =
       ws.has(std::string(kDitPrefix) +
              "video_embeddings_connector.learnable_registers") ||
@@ -308,18 +304,115 @@ Ltx25Dit::load(const Config& cfg, WeightSet& ws, const MetalOps& ops,
              "audio_embeddings_connector.learnable_registers");
 
   if (with_connectors && d->_has_connector) {
-    d->_v_conn = Ltx25Connector::load(cfg.dit, ws, ops, false, err);
+    d->_v_conn = Ltx25Connector::load(cfg.dit, ws, ops, false, err, kept);
     if (!d->_v_conn) { return nullptr; }
     if (d->_have_audio) {
-      d->_a_conn = Ltx25Connector::load(cfg.dit, ws, ops, true, err);
+      d->_a_conn = Ltx25Connector::load(cfg.dit, ws, ops, true, err, kept);
       if (!d->_a_conn) { return nullptr; }
     }
   }
 
-  d->_blocks.reserve((std::size_t)cfg.dit.num_layers);
-  for (int i = 0; i < cfg.dit.num_layers; ++i) {
+  // HOW MANY BLOCKS STAY RESIDENT.
+  //
+  // Not streaming: all of them, which is what every box that can hold
+  // the checkpoint does. Streaming: a LEADING PREFIX sized by the shared
+  // rule the other DiTs in the host tree use, so pinned + the in-flight
+  // block + scratch stays inside a fraction of RAM. The tail is read per
+  // forward and dropped.
+  //
+  // A prefix rather than a cache, and the difference is the reason this
+  // works: a forward is a cyclic scan, so recency predicts nothing and
+  // an LRU set of any size gives ~0% hits, while a FIXED subset gives
+  // exactly its share. At least one, because the arena is sized from a
+  // resident block and a stack with none could not run at all.
+  d->_pinned = cfg.dit.num_layers;
+  if (stream_blocks) {
+    // THE HOST'S FRACTION, not a constant of this file. This used to pass
+    // a hardcoded 0.60, which is the one thing in this port that differed
+    // from every built-in DiT in the host tree -- and it is why a 16 GB
+    // box pinned 20 of 48 blocks (7850 MB) while the plan had computed
+    // that there was room for NONE. The fraction is a property of the
+    // graph, not of the model: what the prefix has to coexist with is
+    // whatever else is resident during the denoise.
+    //
+    // At 0 this still pins one block, unlike the built-ins -- see the
+    // note on load() in the header.
+    // Hoisted so the log below can report what the count was sized
+    // against; a pin count without those two numbers is unfalsifiable.
+    std::size_t scratch = 0, trunk = 0;
+    if (pin_frac > 0.0) {
+      std::vector<std::string> prefixes((std::size_t)cfg.dit.num_layers);
+      for (int i = 0; i < cfg.dit.num_layers; ++i) {
+        prefixes[(std::size_t)i] = std::string(kDitPrefix) +
+                                   "transformer_blocks." + std::to_string(i) +
+                                   ".";
+      }
+      // THE ARENA THIS CLIP WILL NEED, not a constant. The pinned prefix
+      // has to fit beside it, and it scales with the token count -- 1.03
+      // GB at 6630 video tokens and more at a larger canvas -- so a flat
+      // figure is wrong at every geometry but one. BlockScratch::
+      // predict_bytes is the same arithmetic reserve() allocates from,
+      // and a test holds the two together.
+      //
+      // Zero geometry means the stage could not settle one; then this
+      // falls back on stream_pin_count's own default rather than
+      // pretending to know.
+      if (plan_w > 0 && plan_h > 0 && plan_frames > 0) {
+        const int lf = (plan_frames - 1) / kTemporalCompression + 1;
+        const int lh = plan_h / kSpatialCompression;
+        const int lw = plan_w / kSpatialCompression;
+        const bool ha = cfg.dit.use_audio_video_cross_attention;
+        const std::size_t d0 =
+            (std::size_t)std::max(cfg.dit.inner_dim(),
+                                  ha ? cfg.dit.audio_inner_dim() : 0);
+        // The caption is the other candidate for the widest axis, and on
+        // a short clip it wins -- which is exactly how a 49.6 GB arena
+        // once hid behind small test geometries.
+        const std::size_t tok = (std::size_t)std::max(
+            lf * lh * lw, Ltx25TextEncoder::kMaxTokens);
+        scratch = (std::size_t)BlockScratch::predict_bytes(tok, d0, 4 * d0, 1);
+      }
+      d->_pinned = vpipe::genai::stream_pin_count(
+          ws.src(), prefixes, pin_frac,
+          scratch > 0 ? scratch : (std::size_t{1} << 30), &trunk);
+    } else {
+      d->_pinned = 0;
+    }
+    if (d->_pinned < 1) { d->_pinned = 1; }
+    if (d->_pinned > cfg.dit.num_layers) { d->_pinned = cfg.dit.num_layers; }
+    if (ops.mc()->session() != nullptr) {
+      // At normal, not debug: when a bounded run turns out to thrash this
+      // is the first number anyone needs, and the pin count alone does
+      // not say whether the model chose it or was told it.
+      if (pin_frac > 0.0) {
+        ops.mc()->session()->log_normal(vpipe::fmt(
+            "ltx-2.5: pinning {} of {} blocks at pin_frac {:.3f} -- trunk "
+            "{} MB + {} MB arena reserved beside them",
+            d->_pinned, cfg.dit.num_layers, pin_frac, trunk >> 20,
+            (scratch > 0 ? scratch : (std::size_t{1} << 30)) >> 20));
+      } else {
+        // Reporting the trunk and arena here would be reporting numbers
+        // nothing computed: at pin_frac 0 the sizing block is skipped
+        // entirely. Say what actually happened instead.
+        ops.mc()->session()->log_normal(vpipe::fmt(
+            "ltx-2.5: pinning {} of {} blocks -- the plan sized no prefix "
+            "(pin_frac 0), so block residency grows from here by measuring",
+            d->_pinned, cfg.dit.num_layers));
+      }
+    }
+  }
+
+  // Sized to the FULL depth even when only the prefix is filled: an
+  // empty slot is what the forward tests to decide whether to stream.
+  d->_blocks.resize((std::size_t)cfg.dit.num_layers);
+  for (int i = 0; i < d->_pinned; ++i) {
     GpuBlockWeights gw;
-    if (!bind_block(ws, ops.mc(), cfg.dit, i, stream_blocks, gw, err)) {
+    // CACHED, because a pinned block is one the model KEEPS -- which is
+    // the weight set's own rule, and it is what makes the manager's
+    // accounting of this checkpoint true. Only the streamed tail is read
+    // uncached, in build_block_, where it is genuinely consumed.
+    if (!bind_block(ws, ops.mc(), cfg.dit, i, /*stream=*/false, gw, err,
+                    kept)) {
       return nullptr;
     }
     // A quantized checkpoint on a host whose affine kernels did not
@@ -339,9 +432,132 @@ Ltx25Dit::load(const Config& cfg, WeightSet& ws, const MetalOps& ops,
     d->_quant_group = gw.quant_group;
     auto b = MetalBlock::create(ops, std::move(gw), err);
     if (!b) { return nullptr; }
-    d->_blocks.push_back(std::move(b));
+    d->_blocks[(std::size_t)i] = std::move(b);
+  }
+  // A streamed stack still has to know its quantization group, and only
+  // a BOUND block reports it -- so when the prefix is short of the whole
+  // stack the value comes from the blocks that were built, which are
+  // packed identically to the ones that were not.
+  if (ops.mc() != nullptr && ops.mc()->session() != nullptr &&
+      stream_blocks) {
+    ops.mc()->session()->log_normal(vpipe::fmt(
+        "ltx-2.5: streaming blocks -- {} of {} pinned resident, the rest "
+        "read per forward", d->_pinned, cfg.dit.num_layers));
   }
   return d;
+}
+
+// The arena MetalBlock::reserve() will allocate, computed from the same
+// widths it does. Kept next to nothing in particular on purpose: the
+// authority is reserve(), and the test named in the header is what holds
+// the two together.
+std::uint64_t
+Ltx25Dit::scratch_bytes(const DitConfig& cfg, int video_tokens,
+                        int audio_tokens, int text_tokens, int levels)
+{
+  const bool have_audio = cfg.use_audio_video_cross_attention;
+  const std::uint64_t vd = (std::uint64_t)cfg.inner_dim();
+  const std::uint64_t ad = have_audio ? (std::uint64_t)cfg.audio_inner_dim()
+                                      : 0;
+  const std::uint64_t d = std::max(vd, ad);
+  // Every stream's feed-forward is 4x its own width, so the widest is
+  // 4*d -- the one buffer that is not a plane.
+  const std::uint64_t f = 4 * d;
+  const std::uint64_t t = (std::uint64_t)std::max(
+      std::max(video_tokens, audio_tokens), text_tokens);
+  const std::uint64_t l = (std::uint64_t)std::max(1, levels);
+  if (d == 0 || t == 0) { return 0; }
+  // BlockScratch owns the arithmetic; this only maps a DitConfig onto
+  // the four widths reserve() reduces to.
+  return BlockScratch::predict_bytes((std::size_t)t, (std::size_t)d,
+                                     (std::size_t)f, (std::size_t)l);
+}
+
+std::size_t
+Ltx25Dit::pinned_bytes() const noexcept
+{
+  std::size_t n = 0;
+  for (const auto& b : _blocks) {
+    if (!b) { continue; }
+    for_each_weight(b->weights(), [&](const SharedBuffer& x) {
+      n += x.byte_size();
+    });
+  }
+  return n;
+}
+
+void
+Ltx25Dit::set_residency_reserve(std::size_t bytes)
+{
+  _resid.set_reserve(bytes);
+}
+
+std::size_t
+Ltx25Dit::evict_tail_block_(bool allow_pinned)
+{
+  // From the TAIL. Highest index first because the forward is about to
+  // start again at 0: giving back the block furthest from the next use
+  // is the one choice that is right whatever the schedule does next.
+  const int floor = allow_pinned ? 0 : _pinned;
+  for (int i = (int)_blocks.size() - 1; i >= floor; --i) {
+    auto& b = _blocks[(std::size_t)i];
+    if (!b) { continue; }
+    const std::size_t n = block_bytes_(b.get());
+    b.reset();
+    // Taking one out of the PINNED prefix un-pins it. That prefix was
+    // sized at load against what the box was believed to hold, and a
+    // measurement saying its pages are no longer in RAM is that belief
+    // being wrong. The forward decides resident-or-streamed by whether
+    // the slot is EMPTY, not by this count, so it simply streams now.
+    if (i < _pinned) { _pinned = i; }
+    return n;
+  }
+  return 0;
+}
+
+void
+Ltx25Dit::resident_pages_(std::size_t* examined, std::size_t* incore) const
+{
+  std::size_t ex = 0, ic = 0;
+  for (int i = 0; i < (int)_blocks.size(); ++i) {
+    const auto& b = _blocks[(std::size_t)i];
+    if (!b) { continue; }
+    for_each_weight(b->weights(), [&](const SharedBuffer& x) {
+      if (x.empty()) { return; }
+      const auto r = x.page_residency(64);
+      if (!r.valid) { return; }
+      ex += r.examined;
+      ic += r.incore;
+    });
+  }
+  if (examined != nullptr) { *examined = ex; }
+  if (incore != nullptr) { *incore = ic; }
+}
+
+bool
+Ltx25Dit::build_block_(int i, std::shared_ptr<BlockScratch> arena,
+                       std::unique_ptr<MetalBlock>& out,
+                       std::string* err) const
+{
+  GpuBlockWeights gw;
+  // Uncached ALWAYS: this block is read, run and dropped, and caching it
+  // would keep the whole streamed tail alive -- which is the one thing
+  // streaming exists to avoid. It is also what counts the traffic, so
+  // the manager can tell a bounded model from one thrashing.
+  if (!bind_block(*_ws, _ops->mc(), _cfg, i, /*stream=*/true, gw, err)) {
+    return false;
+  }
+  auto b = MetalBlock::create(*_ops, std::move(gw), err);
+  if (!b) { return false; }
+  b->set_rope(&_v_self, _have_audio ? &_a_self : nullptr,
+              _have_audio ? &_v_cross : nullptr,
+              _have_audio ? &_a_cross : nullptr);
+  if (!b->reserve(_video_tokens, _audio_tokens, _text_tokens, err,
+                  _geo_levels, &arena)) {
+    return false;
+  }
+  out = std::move(b);
+  return true;
 }
 
 bool
@@ -469,7 +685,11 @@ Ltx25Dit::set_geometry(int latent_frames, int latent_h, int latent_w,
   // and nothing in the scratch survives a forward, so 48 private arenas
   // were 47 copies of dead memory. See BlockScratch.
   _scratch.reset();
+  // Remembered for the blocks that do not exist yet: a streamed one is
+  // built inside the forward and has to be given the same geometry.
+  _geo_levels = levels;
   for (auto& b : _blocks) {
+    if (!b) { continue; }          // streamed: built per forward
     b->set_rope(&_v_self, _have_audio ? &_a_self : nullptr,
                 _have_audio ? &_v_cross : nullptr,
                 _have_audio ? &_a_cross : nullptr);
@@ -728,7 +948,15 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
                _ax, _audio_tokens, zc, ad);
     }
   }
-  stream.commit().wait();
+  {
+    // Checked, for the reason spelled out at the block fence below: an
+    // over-committed command buffer fails silently under a bare wait().
+    std::string perr;
+    if (!stream.commit().wait_ok(&perr)) {
+      return fail("patchify: " +
+                  (perr.empty() ? std::string("GPU error") : perr));
+    }
+  }
 
   // ---- the block stack -----------------------------------------------
   //
@@ -776,106 +1004,196 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
   double bp_ms = 0.0;
   std::size_t bp_examined = 0, bp_incore = 0, bp_cold_blocks = 0;
 
-  // ---- weight prefetch (OPT-IN: VPIPE_LTX25_PREFETCH=1) -------------
+  // ---- streaming + prefetch -----------------------------------------
   //
-  // Warm block i+1's pages while the GPU runs block i -- the same idea,
-  // in the same place, as the streamed-block prefetch in the host's
-  // MiniMax-H3. What differs is what is being hidden, and it is worth
-  // being exact about it because it decides whether this helps at all.
+  // A block with no resident slot is READ here, used, and dropped. The
+  // read is the whole cost of streaming, and it sits on the critical
+  // path unless something moves it: between a block's commit() and its
+  // wait() the GPU is busy and this thread is not, which is exactly the
+  // window the NEXT block's read fits into.
   //
-  // H3 READS block L per forward, so it always has a read to move off
-  // the critical path. This model does not: bind_block runs ONCE, at
-  // load, and the blocks are then held for the model's lifetime. So the
-  // only per-forward cost here is the pages having LEFT -- evicted
-  // between one step and the next -- and on a box that can hold the
-  // checkpoint they never do.
-  //
-  // MEASURED on a 64 GB M4 Pro, 512x320x9, 8 steps, both packs: blocks
-  // arrive 100% resident on every step after the first, so this fires
-  // 19 times on step 1 and 0 times thereafter, and the wall clock moves
-  // by less than the run-to-run spread. It is OFF BY DEFAULT for that
-  // reason -- a box this model fits has nothing for it to hide, and an
-  // on-by-default knob that never fires is just a slower way to read
-  // the same number.
-  //
-  // Where it should earn its keep is a box the checkpoint does NOT fit,
-  // which is where H3 measured its own 4.1%: there every block is cold
-  // every step. That case is NOT measured here -- deliberately, because
-  // creating it means over-committing the machine during a DiT run, and
-  // that is what panicked this box's kernel once already.
-  //
-  // Depth is structurally ONE: a single outstanding warm of a single
-  // block, so nothing queues and the extra pressure is one block.
+  // Depth is structurally ONE -- a single outstanding read into a single
+  // spare block -- so nothing queues and the extra live memory is one
+  // block. That is what keeps a tight box safe: the failure mode there
+  // is not slowness but thrash, and a second live block is the most this
+  // can ever cost.
   //
   // DECLARATION ORDER: `fut` LAST, so it destroys FIRST. Its destructor
-  // joins the worker, and the worker reads `_blocks` -- which every
-  // early return out of this loop (abort, block failure) would otherwise
-  // leave it racing against.
-  static const bool pf_on =
-      std::getenv("VPIPE_LTX25_PREFETCH") != nullptr;
+  // joins the worker while `blk` -- the block that worker is building --
+  // is still alive. Reversing these two lines is a use-after-free on
+  // every early return out of this loop (abort, a block that failed to
+  // bind, a GPU error).
+  const bool pf_on = _stream_blocks &&
+                     std::getenv("VPIPE_LTX25_NO_PREFETCH") == nullptr;
   struct PrefetchSlot {
-    int               block = -1;
-    std::future<void> fut;
+    std::unique_ptr<MetalBlock> blk;
+    int                         block = -1;
+    std::future<bool>           fut;
   } pf;
-  int pf_started = 0, pf_hit = 0;
+  int pf_started = 0, pf_hit = 0, streamed_n = 0;
+  // The next layer that will actually be STREAMED. A resident one is
+  // skipped: prefetching it would re-read bytes the forward already has.
+  auto pf_next = [&](int from) {
+    for (int n = from; n < (int)_blocks.size(); ++n) {
+      if (!_blocks[(std::size_t)n]) { return n; }
+    }
+    return -1;
+  };
+  // The block the forward is running when the slot is not resident.
+  std::unique_ptr<MetalBlock> streamed;
+
+  // ---- growing back into free RAM (mechanism 4) ---------------------
+  //
+  // The scratch is allocated by set_geometry, BEFORE this reads the
+  // budget, so those bytes are already out of `available_physical`.
+  // Reserving them again is asking for the same room twice, which is the
+  // documented way this refuses a block it could afford.
+  _resid.note_reserve_allocated((std::size_t)scratch_bytes());
+  const auto mb0 = o.mc()->memory_budget();
+  _resid.begin_forward(mb0, [this] { return evict_tail_block_(); });
+
+  // The one signal that is not arithmetic: are the blocks we kept STILL
+  // in RAM? Free-memory figures cannot tell a cache about to be dropped
+  // from one being used, so the ceiling is found by watching what
+  // happened rather than by predicting it. Gated on our own compressed
+  // footprint having moved, because the page walk is not free.
+  bool resid_short = false;
+  if ((_resid.count() > 0 || _pinned > 0) &&
+      _resid.self_compression_grew(mb0.self_compressed)) {
+    std::size_t ex = 0, ic = 0;
+    resident_pages_(&ex, &ic);
+    if (ex > 0 && ic < ex) {
+      resid_short = true;
+      std::size_t freed = _resid.note_weight_residency(
+          ex, ic, [this] { return evict_tail_block_(); });
+      // Nothing left outside the prefix and the pages are STILL leaving
+      // RAM: the prefix itself is what does not fit. Give one of it back
+      // rather than sit in the thrash it was meant to prevent -- a block
+      // re-read from the file costs a read, a block faulted out of the
+      // compressor costs the compress AND the decompress.
+      if (freed == 0 && _pinned > 0) {
+        freed = evict_tail_block_(/*allow_pinned=*/true);
+      }
+      if (freed > 0 && o.mc()->session() != nullptr) {
+        o.mc()->session()->log_normal(vpipe::fmt(
+            "ltx-2.5: resident weights are only {}% in RAM -- released "
+            "{} MB, now {} blocks resident",
+            (int)(100.0 * (double)ic / (double)ex), freed >> 20,
+            _pinned + _resid.count()));
+      }
+    }
+  }
+  if (!resid_short) { _resid.note_healthy_forward(); }
+  int promoted_n = 0;
   for (int i = 0; i < (int)_blocks.size(); ++i) {
     if (in.progress && !in.progress(i, (int)_blocks.size())) {
       return fail("aborted at block " + std::to_string(i));
     }
     const auto t0 = kBlkProf ? std::chrono::steady_clock::now()
                              : std::chrono::steady_clock::time_point{};
+
+    // ---- the block: resident, prefetched, or read now ---------------
+    MetalBlock* blk = _blocks[(std::size_t)i].get();
+    if (blk == nullptr) {
+      ++streamed_n;
+      if (pf.block == i && pf.fut.valid()) {
+        // Issued under block i-1's GPU work, so waiting here costs only
+        // the part that did not fit under that window.
+        const bool ok = pf.fut.get();
+        pf.block = -1;
+        if (!ok) { return fail("streaming block " + std::to_string(i)); }
+        streamed = std::move(pf.blk);
+        pf.blk.reset();
+        ++pf_hit;
+      } else if (!build_block_(i, _scratch, streamed, err)) {
+        return false;
+      }
+      blk = streamed.get();
+    }
+
     if (kBlkProf) {
-      // Stride 8: a page either survived or it did not, and the whole
-      // block was faulted in by one contiguous read, so a sample of one
-      // page in eight finds an evicted block just as well as a full walk
-      // at an eighth of the mincore vector.
+      // Stride 8: a page either survived or it did not, and a block is
+      // faulted in as a whole, so one page in eight answers it at an
+      // eighth of the mincore vector.
       std::size_t ex = 0, ic = 0;
-      for_each_weight(_blocks[(std::size_t)i]->weights(),
-                      [&](const SharedBuffer& b) {
-                        if (b.empty()) { return; }
-                        const auto r = b.page_residency(8);
-                        if (!r.valid) { return; }
-                        ex += r.examined;
-                        ic += r.incore;
-                      });
+      for_each_weight(blk->weights(), [&](const SharedBuffer& b) {
+        if (b.empty()) { return; }
+        const auto r = b.page_residency(8);
+        if (!r.valid) { return; }
+        ex += r.examined;
+        ic += r.incore;
+      });
       bp_examined += ex;
       bp_incore += ic;
       if (ex > 0 && ic * 4 < ex * 3) { ++bp_cold_blocks; }   // < 75% in RAM
     }
-    // The prefetch issued under block i-1's GPU work. Joining here
-    // costs only the part that did not fit under that window.
-    if (pf.block == i && pf.fut.valid()) {
-      pf.fut.get();
-      pf.block = -1;
-      ++pf_hit;
-    }
+
     auto s = o.mc()->make_command_stream();
     {
       auto enc = s.begin_compute();
-      if (!_blocks[(std::size_t)i]->forward(enc, gv, ga, err)) { return false; }
+      if (!blk->forward(enc, gv, ga, err)) { return false; }
     }
     // BETWEEN THE COMMIT AND THE WAIT is the whole opportunity: the GPU
     // is busy with block i and this thread has nothing to do.
     auto fence = s.commit();
-    if (pf_on && pf.block < 0 && i + 1 < (int)_blocks.size()) {
-      // Gated on paging() rather than on H3's fits_growth(). H3 is
-      // deciding whether to ALLOCATE a second block; this decides
-      // whether to fault clean file pages back in, which the kernel can
-      // drop again for free and which cost no anonymous memory. What
-      // both must refuse is a box already in distress, where warming
-      // block i+1 evicts block i out from under the GPU still reading
-      // it -- turning a hidden fault into a fault plus a re-fault.
+    if (pf_on && pf.block < 0) {
+      const int nxt = pf_next(i + 1);
+      // Asked PER BLOCK, with the same budget question growth asks,
+      // because on a box that fits one block the failure mode is not
+      // slowness but thrash -- a second live block tips the machine into
+      // the compressor and the block being read is evicted before the
+      // GPU reads it. A no simply makes the next iteration serial again;
+      // nothing accumulates and nothing has to be unwound.
       const auto mb = o.mc()->memory_budget();
-      if (!mb.paging() &&
-          block_is_cold_(_blocks[(std::size_t)(i + 1)]->weights())) {
-        pf.block = i + 1;
+      if (nxt >= 0 && mb.recommended != 0 &&
+          mb.fits_growth(block_bytes_(blk))) {
+        pf.block = nxt;
         ++pf_started;
-        pf.fut = std::async(std::launch::async, [this, i]() {
-          warm_pages_(_blocks[(std::size_t)(i + 1)]->weights());
+        auto arena = _scratch;
+        pf.fut = std::async(std::launch::async, [this, &pf, nxt, arena]() {
+          std::string perr;
+          return build_block_(nxt, arena, pf.blk, &perr);
         });
       }
     }
-    fence.wait();
+    // wait_ok, not wait: a command buffer can END IN ERROR, and the one
+    // that matters here is an OUT-OF-MEMORY or page fault from
+    // over-committing GPU memory -- exactly what a bounded box produces
+    // under a streamed forward. A bare wait() returns happily and leaves
+    // the output buffer silently corrupt, so the run finishes and the
+    // clip is wrong. MiniMax-H3 checks this on the same commit; this did
+    // not.
+    std::string blk_err;
+    if (!fence.wait_ok(&blk_err)) {
+      return fail("block " + std::to_string(i) + ": " +
+                  (blk_err.empty() ? std::string("GPU error") : blk_err));
+    }
+    // The streamed block dies HERE, after the GPU is done reading it --
+    // unless there is room to KEEP it, in which case the next forward
+    // finds it resident and reads one block fewer. Asked after the wait
+    // so the budget reflects a settled forward rather than one with a
+    // command buffer still in flight.
+    if (_blocks[(std::size_t)i] == nullptr) {
+      const std::size_t nb = block_bytes_(streamed.get());
+      if (nb > 0 && _resid.admit(o.mc(), nb)) {
+        _blocks[(std::size_t)i] = std::move(streamed);
+        _resid.note_admitted(nb);
+        ++promoted_n;
+      }
+      streamed.reset();
+    }
+    if (kBlkProf && (i % 12 == 0 || i + 1 == (int)_blocks.size())) {
+      // WHERE the memory goes, per block. A streaming DiT that ends a
+      // forward holding more than a couple of blocks is not streaming,
+      // and nothing else in this loop would say so.
+      const auto st = vpipe::metal_compute::shared_buffer_memory_stats();
+      std::fprintf(stderr,
+                   "  [blk %2d] shared buffers live %6llu MB in %5llu "
+                   "handles, resident blocks %d\n",
+                   i, (unsigned long long)(st.live_bytes >> 20),
+                   (unsigned long long)st.live_count,
+                   _pinned + _resid.count());
+    }
     if (kBlkProf) {
       bp_ms += std::chrono::duration<double, std::milli>(
                    std::chrono::steady_clock::now() - t0).count();
@@ -893,7 +1211,10 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
         bp_incore, bp_examined, bp_cold_blocks,
         mb.compressed >> 20, mb.swap_used >> 20));
     o.mc()->session()->log_normal(vpipe::fmt(
-        "ltx-2.5: prefetch {}/{} hit", pf_hit, pf_started));
+        "ltx-2.5: {} of {} blocks streamed, prefetch {}/{} hit; resident "
+        "set {} blocks / {} MB (+{} this forward)",
+        streamed_n, _blocks.size(), pf_hit, pf_started,
+        _pinned + _resid.count(), _resid.bytes() >> 20, promoted_n));
   }
 
   // ---- the output head ------------------------------------------------
@@ -936,7 +1257,11 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
                  c.audio_out_channels);
       }
     }
-    s.commit().wait();
+    std::string herr;
+    if (!s.commit().wait_ok(&herr)) {
+      return fail("output head: " +
+                  (herr.empty() ? std::string("GPU error") : herr));
+    }
   }
 
   // Back to CHANNEL-major, the shape the sampler and the VAE expect.
