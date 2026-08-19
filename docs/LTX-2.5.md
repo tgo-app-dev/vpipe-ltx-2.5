@@ -158,15 +158,27 @@ cd ~/vpipe-work
 
 The shipped prompt asks for both halves at once:
 
-> *Cinematic video of a young Asian female pianist passionately playing a
-> grand piano.*
+> *cinematic sci-fi spaceport at night, close-up. A 30-year-old woman in a
+> form-fitting high-end outfit walks toward the camera while the camera
+> smoothly tracks backward. In the background, a large spacecraft slowly
+> takes off with rumbling engine sounds. She first turns to look at the
+> spacecraft, then looks back toward the camera, delivering the line,
+> 'Looks like we made it just in time,' with crisp environmental footsteps
+> and low ambient hums.*
 
 There is no separate audio prompt — both streams are conditioned from the same
 text, through two projections of the same Gemma hidden states — so **the
-subject carries the soundtrack**. "Playing a grand piano" is doing audio work;
-a prompt that says only what a scene looks like gets whatever the model thinks
-it sounds like. If the sound matters, name it: *its paws crunching through the
-crust*, *canvas snapping in the breeze*.
+subject carries the soundtrack**. Half of that prompt is audio direction:
+*rumbling engine sounds*, *crisp environmental footsteps*, *low ambient
+hums*, and a spoken line given verbatim. A prompt that says only what a scene
+looks like gets whatever the model thinks it sounds like. If the sound
+matters, name it.
+
+**It is also long on purpose.** A short prompt — one clause naming a subject
+and an action — underperforms here: this model was conditioned on dense
+descriptions, and it fills what you leave unsaid rather than keeping it
+simple. Say the shot, the camera move, what the subject does in order, and
+what is heard. Quote dialogue you want spoken.
 
 ### This one is 5 seconds, and that is not free
 

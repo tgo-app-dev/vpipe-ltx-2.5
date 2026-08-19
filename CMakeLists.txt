@@ -116,6 +116,22 @@ if(NOT MSVC)
 endif()
 add_test(NAME ltx25-rope COMMAND ltx25-rope-test)
 
+# The streamed weight read against the read it replaces. Needs the model
+# but not a forward: what is under test is that preading a tensor into a
+# destination gives the same bytes as the mapped copy, across the dtype
+# mix a real block carries.
+add_executable(ltx25-dit-weights-test
+    tests/ltx25-dit-weights-test.cc
+    src/ltx25-config.cc)
+target_include_directories(ltx25-dit-weights-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(ltx25-dit-weights-test PRIVATE vpipe::vpipe)
+target_compile_features(ltx25-dit-weights-test PRIVATE cxx_std_20)
+if(NOT MSVC)
+    target_compile_options(ltx25-dit-weights-test PRIVATE -Wall -Werror)
+endif()
+add_test(NAME ltx25-dit-weights COMMAND ltx25-dit-weights-test)
+
 # The conditioning bookkeeping -- the image / video / audio reference
 # paths -- against goldens taken from the reference's OWN conditioning
 # classes. Needs no weights and no GPU: LTX conditions by rewriting a

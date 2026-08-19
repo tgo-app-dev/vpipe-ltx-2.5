@@ -83,7 +83,13 @@ public:
     // already host-addressable.
     vpipe::metal_compute::SharedBuffer pix;
     std::array<int, 4> shape{};
-    if (!_dec->decode(req.latent, T, lh, lw, &pix, &shape, err)) {
+    // `req.progress` is BOTH the report and the cancel answer, and this
+    // branch used to pass neither on -- so a decode that takes tens of
+    // seconds said nothing and could not be stopped until it was over.
+    // The decoder reports per up block, which is the unit it already
+    // commits and waits on.
+    if (!_dec->decode(req.latent, T, lh, lw, &pix, &shape, err,
+                      req.progress)) {
       return false;
     }
     // ONE chunk. Ltx25VaeDecoder returns the whole clip -- the sink's

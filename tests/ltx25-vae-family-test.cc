@@ -41,6 +41,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <mach/mach.h>
@@ -280,6 +281,46 @@ main()
     return false;
   }, &err);
   check(!aborted && calls == 1, "a false sink aborts the decode");
+
+  // `req.progress` reports, and reports something USABLE: monotonic,
+  // bounded, and ending at the total. A bar fed counts that go backwards
+  // or stop short is worse than no bar, so those are what is checked
+  // rather than the mere fact of a call.
+  std::vector<std::pair<int, int>> prog;
+  genai::VaeDecodeRequest preq = req;
+  preq.progress = [&prog](int done, int total) {
+    prog.emplace_back(done, total);
+    return true;
+  };
+  const bool pok = dec->decode(preq, [&](const genai::VaeFrameChunk&) {
+    return true;
+  }, &err);
+  check(pok, "the decode with progress attached still succeeds");
+  check(prog.size() >= 2, "progress was reported more than once (" +
+        std::to_string(prog.size()) + " calls)");
+  bool monotonic = !prog.empty();
+  for (std::size_t i = 0; i < prog.size(); ++i) {
+    if (prog[i].second <= 0 || prog[i].first < 0 ||
+        prog[i].first > prog[i].second) { monotonic = false; }
+    if (i > 0 && prog[i].first < prog[i - 1].first) { monotonic = false; }
+    if (i > 0 && prog[i].second != prog[0].second) { monotonic = false; }
+  }
+  check(monotonic, "the counts are monotonic, in range, and one total");
+  check(!prog.empty() && prog.back().first == prog.back().second,
+        "the last report is complete");
+
+  // And it is the cancel path the stage relies on: a false return stops
+  // the decode instead of running it to the end.
+  int pcalls = 0;
+  genai::VaeDecodeRequest creq = req;
+  creq.progress = [&pcalls](int, int) { ++pcalls; return false; };
+  int csink = 0;
+  const bool cok = dec->decode(creq, [&](const genai::VaeFrameChunk&) {
+    ++csink;
+    return true;
+  }, &err);
+  check(!cok && pcalls == 1 && csink == 0,
+        "a false progress cancels the decode before any frame is emitted");
 
   std::printf("%s\n", g_fail == 0 ? "ALL PASSED" : "FAILURES");
   return g_fail == 0 ? 0 : 1;

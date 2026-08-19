@@ -1,5 +1,7 @@
 #include "ltx25-dit-weights.h"
 
+#include "generative-models/shared/streamed-refill.h"
+
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -44,8 +46,47 @@ get_(WeightSet& ws, MetalCompute* mc, const std::string& name, bool stream,
   // model's pinned prefix and trunk come out Copied too. kept_residency()
   // in the header is where that distinction is argued.
   const auto res = stream ? WeightSet::Residency::Copied : kept;
-  return stream ? ws.stream_tensor(name, mc, res)
-                : ws.tensor(name, mc, res);
+  if (!stream) { return ws.tensor(name, mc, res); }
+  // The streamed read, which is the one that happens 140 times a block,
+  // 48 blocks a step, every step. Allocate the destination and pread the
+  // bytes straight into it rather than letting stream_tensor allocate
+  // and then memcpy out of the shard's mmap: MEASURED on an M5 over a
+  // 206 MB block, arms interleaved and their ORDER rotated, 0.86-1.48
+  // GB/s the mapped way against 6.7-6.9 GB/s for the pread. The mapped
+  // rate also swings 2x between rounds where pread's does not, which is
+  // what a streamed forward turns into GPU occupancy that will not sit
+  // still.
+  //
+  // Falls back on ANYTHING the raw read cannot serve, per tensor rather
+  // than per block -- an f32 table among bf16 matrices costs its own old
+  // path and nothing else. See generative-models/shared/streamed-refill.h
+  // for why the two refusals are distinguished.
+  //
+  // The allocation stays. Removing it as well needs a destination that
+  // outlives the block, which is a change to who owns a MetalBlock; this
+  // is the part that needs no ownership change and is most of the win.
+  const auto* ti = ws.src().info(name);
+  // Asked BEFORE allocating: an LTX block is 140 tensors of which this
+  // route serves 78, and allocating for the other 62 only to drop them
+  // would add 24.5 MB of pointless allocation per block per step.
+  if (ti != nullptr && ti->nbytes > 0 &&
+      vpipe::genai::refill_serves(ws, name, vpipe::genai::RefillDst::kRaw)) {
+    SharedBuffer dst = mc->make_shared_buffer(ti->nbytes);
+    if (!dst.empty()) {
+      // kRaw: this function hands back the checkpoint's OWN bytes, and
+      // the f16 scales a quantized pack carries are converted by
+      // need_as_bf16_ instead. Asking for kBf16 here would convert them
+      // a second time -- silently, into plausible numbers off by an
+      // exponent bias.
+      const auto r = vpipe::genai::refill_streamed_tensor(
+          ws, name, dst, vpipe::genai::RefillDst::kRaw);
+      if (r == vpipe::genai::Refill::kFilled) { return dst; }
+      // kFailed leaves `dst` partly written, so it is dropped rather
+      // than returned; either refusal falls through to the read that
+      // always worked.
+    }
+  }
+  return ws.stream_tensor(name, mc, res);
 }
 
 // The scale/shift TABLES are F32 where every other tensor in the DiT is

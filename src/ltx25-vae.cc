@@ -1,5 +1,7 @@
 #include "ltx25-vae.h"
 
+#include <functional>
+
 #include "apple-silicon/metal-compute/command-stream.h"
 
 #include <algorithm>
@@ -222,7 +224,8 @@ Ltx25VaeDecoder::conv3d_(CommandStream& stream, const Conv& c,
 bool
 Ltx25VaeDecoder::decode(const float* latent, int F, int H, int W,
                         SharedBuffer* out, std::array<int, 4>* shape,
-                        std::string* err)
+                        std::string* err,
+                        const std::function<bool(int, int)>& progress)
 {
   auto fail = [&](std::string m) {
     if (err != nullptr) { *err = std::move(m); }
@@ -266,6 +269,13 @@ Ltx25VaeDecoder::decode(const float* latent, int F, int H, int W,
   // accumulate; retired per block and reused, the same decode peaks at
   // the widest single block. The cost is nine CPU waits on a decode
   // whose GPU time is measured in tens of seconds.
+  // The output head is counted as one more step: it is a full-width
+  // conv plus the unpatchify at the FINAL resolution, so reporting the
+  // last up block as 100% would leave the bar sitting complete through
+  // the most expensive single commit of the decode.
+  const int prog_total = (int)_ups.size() + 1;
+  int prog_done = 0;
+  bool cancelled = false;
   for (const UpBlock& u : _ups) {
     if (u.is_res) {
       for (const ResBlock& rb : u.res) {
@@ -326,7 +336,17 @@ Ltx25VaeDecoder::decode(const float* latent, int F, int H, int W,
       x = std::move(o);
       cc = oc; cf = of; ch = oh; cw = ow;
     }
+    // Per block, where the decode has just committed and waited anyway.
+    // Cancellation is honoured at the block boundary rather than inside
+    // one: the scratch slots are live mid-block and the picture does not
+    // exist yet, so there is nothing to hand back until here.
+    ++prog_done;
+    if (progress && !progress(prog_done, prog_total)) {
+      cancelled = true;
+      break;
+    }
   }
+  if (cancelled) { return fail("the decode was cancelled"); }
 
   // ---- the output head ------------------------------------------------
   {
@@ -355,6 +375,10 @@ Ltx25VaeDecoder::decode(const float* latent, int F, int H, int W,
     enc.end();
   }
   stream.commit().wait();
+
+  if (progress && !progress(prog_total, prog_total)) {
+    return fail("the decode was cancelled");
+  }
 
   // Handed out, not copied out. This is UMA memory; a frame sink reads
   // contents() directly.

@@ -7,6 +7,7 @@
 #include "generative-models/weight-set.h"
 
 #include <array>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -66,9 +67,18 @@ public:
   // [3][8*(F-1)+1][32*H][32*W] into `out`, which is UMA memory the
   // caller may read directly -- a frame sink gets `contents()` without a
   // copy. At this model's real geometry that copy is 758 MB.
+  //
+  // `progress`, when set, is called once per UP BLOCK with (done,
+  // total). That is the unit the decode already commits and waits on --
+  // nine of them at this model's real geometry, tens of seconds of GPU
+  // apiece -- so it is the only place inside a decode where a report
+  // costs nothing and means something. Returning false cancels: the
+  // decode stops at the next block boundary and returns false with
+  // `err` saying so.
   bool decode(const float* latent, int F, int H, int W,
               vpipe::metal_compute::SharedBuffer* out,
-              std::array<int, 4>* shape, std::string* err);
+              std::array<int, 4>* shape, std::string* err,
+              const std::function<bool(int done, int total)>& progress = {});
 
   // The same decode, copied into host memory. For callers holding the
   // picture as a plain vector (the reference tests); the real path uses
