@@ -110,7 +110,7 @@ main()
 
   auto t0 = std::chrono::steady_clock::now();
   auto dit = ltx25::Ltx25Dit::load(cfg, ws, ops, /*stream_blocks=*/false,
-                                   /*pin_frac=*/0.0, 0, 0, 0, &err);
+                                   0, 0, 0, &err);
   if (!dit) {
     check(false, "load: " + err);
     std::printf("FAILURES\n");
@@ -221,7 +221,7 @@ main()
   if (std::getenv("VPIPE_LTX25_STACK_CONNECTORS") != nullptr) {
     std::printf("  --- with connectors (raw caption in) ---\n");
     auto dit2 = ltx25::Ltx25Dit::load(cfg, ws, ops, /*stream_blocks=*/false,
-                                      /*pin_frac=*/0.0, 0, 0, 0, &err,
+                                      0, 0, 0, &err,
                                       /*with_connectors=*/true);
     if (!dit2) {
       check(false, "load with connectors: " + err);

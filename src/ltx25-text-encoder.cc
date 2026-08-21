@@ -134,8 +134,12 @@ Ltx25TextEncoder::load(const Config& cfg, std::shared_ptr<WeightSet> ws,
   // is gone by then.
   {
     namespace mm = vpipe::model_memory;
-    const auto plan = mm::plan_streaming(session, cfg.dit_file, cfg.enc_file,
-                                         mm::kStreamHeadroom);
+    // The DiT is generate-video's, not this stage's, and it has already
+    // declared it -- so naming it here resolves it a SECOND time, from a
+    // config that has this stage's `encoder_variant` but not that
+    // stage's `variant`. Only what THIS caller is about to hold.
+    const auto plan = mm::plan_streaming(session, /*dit_dir=*/std::string(),
+                                         cfg.enc_file, mm::kStreamHeadroom);
     a.stream_layers = plan.stream;
     a.pin_frac      = plan.pin_frac;
     if (const char* e = std::getenv("VPIPE_LTX25_STREAM_ENCODER")) {

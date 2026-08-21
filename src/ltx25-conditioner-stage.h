@@ -103,6 +103,14 @@ public:
   // gone -- see the body.
   std::vector<vpipe::ResourceClaim> decide_resources() const override;
 
+  // The topological plan's half of the same story: the encoder this
+  // stage holds, the floor its streamed layers reduce it to, and the
+  // four conditioning beats it hands downstream. See
+  // docs/MODEL-MEMORY.md -- the conditioning is the textbook payload,
+  // alive from the encoder that produces it until the denoise that
+  // consumes it, and belonging to neither phase alone.
+  vpipe::StageMemory declare_memory() const override;
+
   void reset_run_state() override;
 
 private:

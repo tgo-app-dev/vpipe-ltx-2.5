@@ -8,6 +8,7 @@
 
 #include "generative-models/weight-set.h"
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -69,6 +70,21 @@ public:
 
   int dim() const { return _dim; }
   int registers() const { return _n_registers; }
+
+  // Every WEIGHT buffer this connector holds. It is TRUNK -- never
+  // streamed, read once per prompt through the whole stack -- so it is
+  // counted with the trunk and wired with it. Scratch is deliberately
+  // NOT here: parking or counting a buffer that a forward writes into
+  // loses live state instead of reclaiming dead bytes.
+  void for_each_weight(
+      const std::function<void(const vpipe::metal_compute::SharedBuffer&)>& fn)
+      const;
+
+  // The scratch this connector reserved, for the wired pool. Separate
+  // from the weights because the two answer different questions and one
+  // of them must never be handed to parking.
+  void for_each_scratch(
+      const std::function<void(vpipe::metal_compute::SharedBuffer&)>& fn);
 
 private:
   Ltx25Connector() = default;

@@ -108,7 +108,7 @@ main()
   ltx25::Config small = cfg;
   small.dit.num_layers = 0;      // no blocks: only the trunk is wanted
   auto dit = ltx25::Ltx25Dit::load(small, ws, ops, /*stream_blocks=*/false,
-                                   /*pin_frac=*/0.0, 0, 0, 0, &err);
+                                   0, 0, 0, &err);
   if (!dit) { std::printf("FAILED to build a 0-block DiT: %s\n", err.c_str()); return 1; }
 
   struct { const char* name; const ltx25::DitTrunk::AdaLN* a; } kAda[] = {

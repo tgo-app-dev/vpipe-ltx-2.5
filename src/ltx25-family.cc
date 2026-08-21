@@ -8,6 +8,7 @@
 #include "interfaces/session-services-intf.h"
 #include "stages/model-memory.h"
 
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
@@ -66,6 +67,27 @@ prefer_variant_(const vpipe::genai::VideoModelCreateArgs* args,
         "stage's variant '{}'", e, from_cfg));
   }
   return std::string(e);
+}
+
+// The least this DiT can be held at while still being HELD: everything
+// outside the block stack, plus the two in-flight slots a streamer
+// refills into.
+//
+// The stem is the checkpoint's, `model.diffusion_model.` +
+// `transformer_blocks.`, and a stem that matches nothing yields 0 --
+// which reads as "no smaller form", the safe answer for a pack this
+// does not recognise. The trunk it leaves behind is real and not small:
+// both text connectors live there and never stream.
+std::size_t
+dit_floor_bytes(const std::string& dit)
+{
+  if (dit.empty()) { return 0; }
+  // Both spellings, prefixed first: the shipped packs carry the
+  // `model.diffusion_model.` prefix, and a stem that matches nothing
+  // costs one miss and falls through to the next.
+  return vpipe::model_memory::streaming_floor_bytes(
+      dit, {"model.diffusion_model.transformer_blocks.",
+            "transformer_blocks."});
 }
 
 }  // namespace
@@ -148,7 +170,116 @@ Ltx25Family::declare_resources(const std::string& root) const
   // `diffusion-conditioner`, a different stage, which declares it
   // itself -- claiming it twice would size every peer against 24 GB
   // that this stage never holds.
-  return vpipe::model_memory::weight_claims(dirs);
+  //
+  // BOTH numbers, not just the size on disk. This DiT streams its 48
+  // blocks when the box is tight, and the floor it can be reduced to --
+  // the trunk plus two in-flight slots -- is what says whether a graph
+  // that does not fit preloaded fits anyway. A streamable component
+  // that declares no floor is counted at full size by the pool check,
+  // and reads as a graph that cannot run when it can.
+  std::vector<ResourceClaim> out;
+  out.reserve(dirs.size());
+  for (const std::string& d : dirs) {
+    out.push_back(vpipe::model_memory::weight_claim_streamable(
+        d, dit_floor_bytes(d)));
+  }
+  return out;
+}
+
+std::vector<vpipe::StageHolding>
+Ltx25Family::declare_holdings(const std::string& root) const
+{
+  // The SAME checkpoint the claim above names, and it has to be the
+  // same string: the plan merges two stages holding one checkpoint by
+  // this name, and the stage remembers it as what the removable pool
+  // will later be asked for.
+  std::vector<ResourceClaim> claims = declare_resources(root);
+  std::vector<vpipe::StageHolding> out;
+  out.reserve(claims.size());
+  for (const ResourceClaim& c : claims) {
+    if (c.kind != vpipe::model_memory::kWeightsKind) { continue; }
+    vpipe::StageHolding h;
+    h.source  = c.key;
+    h.preload = vpipe::model_memory::dir_weights_bytes(c.key);
+    h.floor   = dit_floor_bytes(c.key);
+    // `releases` and `reclaimable` are deliberately left alone -- they
+    // are generate-video's `unload_when_idle`, which a family cannot
+    // see, and the stage stamps them on.
+    if (h.preload > 0) { out.push_back(std::move(h)); }
+  }
+  return out;
+}
+
+std::size_t
+Ltx25Family::latent_bytes(const std::string& root, int width, int height,
+                          int frames) const
+{
+  if (width <= 0 || height <= 0 || frames <= 0) { return 0; }
+  // The CHANNEL COUNT from the checkpoint, not from a literal here. It
+  // is 128 on everything that ships, but this figure feeds a claim
+  // peers size against and the config already says so -- resolve() is
+  // one metadata parse off a header, no weights, which is what makes it
+  // answerable in the planning phase at all. Unresolvable means "cannot
+  // say", and the stage then declares nothing rather than a plausible
+  // number.
+  Config cfg;
+  if (!resolve(root, cfg, nullptr, prefer_variant_(nullptr, nullptr))) {
+    return 0;
+  }
+  // What Ltx25Generator actually writes into VideoGenResult::video:
+  // f32, [in_channels, (F-1)/8+1, H/32, W/32] -- from the same
+  // constants the generator divides by, so the two cannot end up
+  // describing different clips.
+  const std::size_t lf = (std::size_t)((frames - 1) / kTemporalCompression + 1);
+  const std::size_t lh = (std::size_t)(height / kSpatialCompression);
+  const std::size_t lw = (std::size_t)(width / kSpatialCompression);
+  if (lf == 0 || lh == 0 || lw == 0 || cfg.dit.in_channels <= 0) { return 0; }
+  return (std::size_t)cfg.dit.in_channels * lf * lh * lw * sizeof(float);
+}
+
+bool
+Ltx25Family::audio_cost(const std::string& root, int frames, double fps,
+                        std::size_t* latent, std::size_t* pcm,
+                        std::size_t* arena) const
+{
+  (void)root;
+  if (frames <= 0 || fps <= 0.0) { return false; }
+  // The reference derives the audio length from the clip's PIXEL frames
+  // over fps, NOT from the video latent frame count -- see
+  // kAudioLatentsPerSecond. Substituting the latter is wrong by the
+  // temporal compression factor, which is 8x.
+  const double secs = (double)frames / fps;
+  const std::size_t at =
+      (std::size_t)std::llround(secs * kAudioLatentsPerSecond);
+  if (at == 0) { return false; }
+  // f32 [channels, frames, mel] -- the transposed layout the generator
+  // emits, not the DiT's internal packing.
+  if (latent != nullptr) {
+    *latent = (std::size_t)kAudioLatentChannels * at *
+              (std::size_t)kAudioLatentMelBins * sizeof(float);
+  }
+  // f32 stereo at the BWE's output rate. An UPPER BOUND on purpose: a
+  // checkpoint with no `bwe` section falls back to the vocoder alone and
+  // plays at its own lower rate, so this over-declares there -- which is
+  // the safe direction, and the rate is not knowable without loading the
+  // pack. See docs/MODEL-MEMORY.md: an under-estimate is not a
+  // conservative error.
+  const std::size_t samples = (std::size_t)std::llround(secs * 48000.0);
+  const std::size_t pcm_b = samples * 2 * sizeof(float);
+  if (pcm != nullptr) { *pcm = pcm_b; }
+  // The decode's own transient, and the honest answer is that it is not
+  // computable here: it runs the audio VAE, then a 108-conv vocoder,
+  // then the BWE's causal STFT, and their peak depends on channel counts
+  // that live in the checkpoint's metadata. What IS certain is that the
+  // finished waveform is part of it, so a bound below the PCM would be
+  // one nothing could justify.
+  //
+  // Declared at the PCM rather than at a made-up multiple of it:
+  // audio-vae-decode holds the real figure on the first clip, and a
+  // marker that is at least a term of the truth beats a factor invented
+  // to look conservative.
+  if (arena != nullptr) { *arena = pcm_b; }
+  return true;
 }
 
 std::unique_ptr<VideoGenerator>
@@ -250,38 +381,32 @@ Ltx25Family::load(const VideoModelCreateArgs& args)
   // rule every DiT family in this tree uses -- copying a sixth variant
   // of it is what that helper exists to prevent.
   bool stream = args.prefer_streaming;
+  // NAME ONLY WHAT THIS STAGE IS ABOUT TO HOLD. The encoder is
+  // `diffusion-conditioner`'s, and it has already declared it -- so the
+  // manager's view carries it, at the variant that was really chosen
+  // and at what it really holds after streaming its layers.
+  //
+  // Naming it here instead resolved it a SECOND time, from this
+  // family's own resolve, which has the DiT's `variant` but not the
+  // conditioner's `encoder_variant` -- so it named the bf16 pack while
+  // the conditioner had loaded w8g64. weight_footprint then added the
+  // whole of a checkpoint nobody would open, on top of the one that was
+  // already accounted. MEASURED on this box: footprint 43868 MB against
+  // a true 18821 MB, the difference being a 25 GB phantom encoder, and
+  // the DiT streamed a 14.7 GB pack that fits four times over.
   const auto plan = vpipe::model_memory::plan_streaming(
-      args.session, cfg.dit_file, cfg.enc_file,
+      args.session, cfg.dit_file, /*enc_dir=*/std::string(),
       vpipe::model_memory::kStreamHeadroom);
   stream = stream || plan.stream;
   if (const char* e = std::getenv("VPIPE_LTX25_STREAM")) {
     stream = (std::atoi(e) != 0);
   }
-  // THE PINNED-PREFIX FRACTION, from the same plan. Every built-in DiT in
-  // the host tree threads this; this port used to drop it and pass a
-  // hardcoded 0.60 down instead, which is the whole reason a 16 GB box
-  // pinned 20 of 48 blocks against a plan that had computed room for
-  // none. It is a property of the GRAPH -- what else is resident during
-  // the denoise -- so the model cannot derive it.
-  //
-  // Overridable in the same shape as VPIPE_LTX25_STREAM beside it: a
-  // forced `stream=0` makes the fraction meaningless (nothing streams, so
-  // there is no prefix), and a forced `stream=1` on a roomy box wants a
-  // way to ask for a real prefix anyway.
-  double pin_frac = plan.pin_frac;
-  if (std::getenv("VPIPE_LTX25_STREAM") != nullptr && !stream) {
-    pin_frac = 0.0;
-  }
-  if (const char* e = std::getenv("VPIPE_LTX25_PIN_FRAC")) {
-    pin_frac = std::atof(e);
-  }
   if (args.session != nullptr) {
     args.session->info(fmt(
-        "ltx-2.5: footprint {} GB (peers {} GB) + {} GB headroom -> {} "
-        "(pin_frac {:.3f})",
+        "ltx-2.5: footprint {} GB (peers {} GB) + {} GB headroom -> {}",
         plan.footprint >> 30, plan.others >> 30,
         vpipe::model_memory::kStreamHeadroom >> 30,
-        stream ? "STREAM blocks" : "PRELOAD", pin_frac));
+        stream ? "STREAM blocks" : "PRELOAD"));
   }
 
   // WHAT `stream` MEANS HERE. The blocks ARE the checkpoint, and a
@@ -302,7 +427,7 @@ Ltx25Family::load(const VideoModelCreateArgs& args)
   // the stage could not settle it, which Ltx25Dit reads as "unknown" and
   // falls back on.
   auto g = Ltx25Generator::create(cfg, std::move(ws), args.metal, stream,
-                                  pin_frac, args.width, args.height,
+                                  args.width, args.height,
                                   args.frames, args.session, &err);
   if (!g) {
     if (args.session != nullptr) {

@@ -9,6 +9,7 @@
 #include "ltx25-metal-ops.h"
 #include "ltx25-rope.h"
 
+#include "generative-models/generative-model-manager.h"
 #include "generative-models/shared/block-residency.h"
 #include "generative-models/weight-set.h"
 
@@ -51,24 +52,18 @@ public:
   // cannot hold them runs them this way and the manager sees the
   // traffic. The trunk is always cached -- it is a few hundred MB and
   // every step reads it.
-  // `pin_frac` is the HOST's answer to "how much of RAM may the pinned
-  // prefix take", from model_memory::plan_streaming. It is threaded in
-  // rather than derived here for the reason every built-in DiT in the
-  // host tree threads it: the fraction depends on what the rest of the
-  // GRAPH will be holding during the denoise -- the text encoder above
-  // all -- and a model cannot see that.
+  // THERE IS NO PINNED-PREFIX FRACTION any more. A share of TOTAL ram
+  // decided before the run is blind to another process, to this graph's
+  // peers, and to the moment a peer lets go; what replaces it measures
+  // (BlockResidency below). A streaming stack holds exactly ONE block --
+  // the one that owns the scratch arena -- and grows from there.
   //
-  // 0 means PIN NOTHING, which is what the plan returns when there is no
-  // room, and it is not a missing value to be replaced by a default. This
-  // model still pins ONE block at 0, because the block scratch is sized
-  // from a resident block and a stack with none cannot run; every
-  // built-in pins zero there, having no such constraint.
-  //
-  // Ignored when `stream_blocks` is false -- then every block is resident
-  // and there is no prefix to size.
+  // `plan_w/h/frames` is the clip the graph INTENDS to make, used to
+  // size that arena at the right order of magnitude. 0 means the stage
+  // could not settle one.
   static std::unique_ptr<Ltx25Dit>
   load(const Config& cfg, std::shared_ptr<vpipe::genai::WeightSet> ws,
-       const MetalOps& ops, bool stream_blocks, double pin_frac,
+       const MetalOps& ops, bool stream_blocks,
        int plan_w, int plan_h, int plan_frames, std::string* err,
        bool with_connectors = false);
 
@@ -82,6 +77,43 @@ public:
   bool        streaming() const noexcept { return _stream_blocks; }
   int         pinned_blocks() const noexcept { return _pinned; }
   std::size_t pinned_bytes() const noexcept;
+
+  // EVERYTHING this model holds in weights: the blocks it is keeping,
+  // the trunk, and both connectors.
+  //
+  // pinned_bytes() answers a narrower question -- the blocks alone --
+  // and the difference is not small: the trunk plus the two connectors
+  // is several GB that a peer sizing itself has no other way to see.
+  // This is what VideoGenerator::resident_bytes() must return, and
+  // docs/MODEL-MEMORY.md calls the default 0 there the single most
+  // consequential wrong answer a family can give.
+  std::size_t held_weight_bytes() const noexcept;
+
+  // ---- the WIRED POOL (mechanism 7) ---------------------------------
+  //
+  // Hand this model's pages to the manager's pool, where the OS cannot
+  // compress or swap them. Rule one is that nothing goes to swap, and
+  // wiring is the only mechanism that enforces it.
+  //
+  // ORDER IS THE POINT and it is the opposite of intuition: the trunk
+  // and the scratch go in FIRST, the blocks after. A resident block is
+  // an optimisation this model can shed and stream instead; the scratch
+  // is what a forward cannot proceed without and the trunk is read on
+  // every block of every forward. Protecting the optional half first is
+  // how a run ends up with wired blocks beside an activation buffer the
+  // compressor is free to take.
+  //
+  // Returns the bytes it managed to wire. A refusal is not an error --
+  // the pool is an UP-TO -- and it is not rolled back either: see
+  // wire_fixed_.
+  std::size_t wire_into_pool();
+
+  // GIVE THE POOL BACK. Freeing a wired buffer unwires it in the kernel,
+  // so the machine recovers either way -- but the pool's own counter
+  // would not, and a DiT destroyed after every clip (the ordinary
+  // `unload_when_idle: destroy` path) would leak its whole share of the
+  // budget per clip until nothing could wire at all.
+  ~Ltx25Dit();
 
   // ---- growing back into free RAM (mechanism 4) ---------------------
   //
@@ -331,6 +363,24 @@ private:
   bool build_block_(int i, std::shared_ptr<BlockScratch> arena,
                     std::unique_ptr<MetalBlock>& out,
                     std::string* err) const;
+
+  // The manager, or null outside a session (which every unit test is).
+  // Everything below no-ops there rather than branching at each site.
+  vpipe::genai::GenerativeModelManager* manager_() const;
+  // Wire the TRUNK, the CONNECTORS and the SCRATCH -- everything this
+  // model holds that is not a streamed block.
+  std::size_t wire_fixed_(bool on);
+  // Wire one block's weights. Called as a block is admitted and undone
+  // as it is evicted, so the pool's charge tracks what is really held.
+  std::size_t wire_block_(MetalBlock& b, bool on);
+  // Has wire_fixed_ run? The scratch is reallocated by set_geometry, so
+  // the fixed half is re-wired after every geometry change rather than
+  // once at load.
+  bool _wired_fixed = false;
+  // One report per model, so a per-geometry re-wire does not repeat it.
+  bool _wired_reported = false;
+  // Bytes the pool would not take on the last wire pass; see wire_fixed_.
+  std::size_t _unwirable = 0;
   bool _has_connector = false;
   bool _have_audio = false;
 

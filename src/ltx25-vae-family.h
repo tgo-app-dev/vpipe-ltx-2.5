@@ -46,6 +46,17 @@ public:
   declare_resources(const std::string& root,
                     const std::string& vae_dir) const override;
 
+  // WHERE each half of this family's VAE actually lives. LTX-2.5 ships
+  // two files under `vae/`, and the host cannot find either: there is no
+  // `vae/config.json`, so its resolver returns the ROOT -- and the root
+  // is the whole 142 GB repository. Every release, pool and
+  // phase-release the VAE stages perform is keyed on the name they get
+  // from here.
+  std::string vae_path(const std::string& root, Role role) const override;
+
+  std::vector<vpipe::StageHolding>
+  declare_holdings(const std::string& root, Role role) const override;
+
   std::vector<std::string> idle_peers(const std::string& root) const override;
 
   std::unique_ptr<vpipe::genai::VaeDecoder>

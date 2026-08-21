@@ -5,6 +5,8 @@
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
+#include "generative-models/generative-model-manager.h"
 
 #include <chrono>
 #include <cmath>
@@ -102,8 +104,7 @@ Ltx25Generator::pinned_weight_bytes() const noexcept
 std::unique_ptr<Ltx25Generator>
 Ltx25Generator::create(const Config& cfg, std::shared_ptr<WeightSet> ws,
                        MetalCompute* mc, bool stream_blocks,
-                       double pin_frac, int plan_w, int plan_h,
-                       int plan_frames,
+                       int plan_w, int plan_h, int plan_frames,
                        const vpipe::SessionContextIntf* session,
                        std::string* err)
 {
@@ -114,7 +115,6 @@ Ltx25Generator::create(const Config& cfg, std::shared_ptr<WeightSet> ws,
   // must unmap when the LAST holder goes away, not the first.
   g->_ws = std::move(ws);
   g->_stream_blocks = stream_blocks;
-  g->_pin_frac = pin_frac;
   g->_plan_w = plan_w;
   g->_plan_h = plan_h;
   g->_plan_frames = plan_frames;
@@ -123,9 +123,18 @@ Ltx25Generator::create(const Config& cfg, std::shared_ptr<WeightSet> ws,
   // The connectors come with the DiT: this generator takes a PRE-
   // connector caption, so it needs them.
   g->_dit = Ltx25Dit::load(cfg, g->_ws, g->_ops, stream_blocks,
-                           pin_frac, plan_w, plan_h, plan_frames, err,
+                           plan_w, plan_h, plan_frames, err,
                            /*with_connectors=*/true);
   if (!g->_dit) { return nullptr; }
+  // WHAT THIS GENERATOR HOLDS, answered rather than left at the default.
+  //
+  // resident_bytes() returned a member that was only ever assigned 0, so
+  // every peer sizing itself against this family saw a 39 GB checkpoint
+  // as costing nothing -- which docs/MODEL-MEMORY.md calls the single
+  // most consequential default a family can get wrong. It is the blocks
+  // this model kept PLUS the trunk and both connectors; the blocks alone
+  // (pinned_bytes) miss several GB that never streams.
+  g->_resident = g->_dit->held_weight_bytes();
   return g;
 }
 
@@ -136,6 +145,26 @@ Ltx25Generator::release_idle()
   // the trunk and the scratch are a rounding error against 48 blocks --
   // and the next request rebuilds from the weight set, which still has
   // the bytes mapped.
+  //
+  // TO THE POOL FIRST, and before the reset: pool_weights() finds the
+  // set through a WEAK reference, so once `_dit` and `_ws` drop their
+  // last strong one there is nothing left to pool and the call is a
+  // silent no-op. Pooled, the checkpoint stays purgeable -- a peer that
+  // genuinely needs the room takes it, one that does not leaves the next
+  // clip nothing to reload, and a RELAUNCH over the same model pays no
+  // reload at all.
+  //
+  // Recyclable, deliberately unmarked: the adaLN bake specialises this
+  // MODEL to a schedule but writes nothing into the weight set (it
+  // clears its own handles), so the bytes in the pool are generic and a
+  // launch with a different step count can use them. A set that really
+  // were schedule-specific would have to say so with
+  // WeightSet::set_not_recyclable.
+  if (_session != nullptr && _session->services() != nullptr && _ws) {
+    if (auto* mgr = _session->services()->generative_model_manager()) {
+      mgr->pool_weights(_ws->dir());
+    }
+  }
   _dit.reset();
   _lf = _lh = _lw = _at = _tt = 0;
   _v_tokens = _a_tokens = 0;
@@ -403,7 +432,7 @@ Ltx25Generator::generate(const VideoGenRequest& req, VideoGenResult* out)
     log_("the reference strengths changed, so the baked adaLN schedule no "
          "longer covers this request; rebuilding the DiT");
     std::string lerr;
-    _dit = Ltx25Dit::load(_cfg, _ws, _ops, _stream_blocks, _pin_frac,
+    _dit = Ltx25Dit::load(_cfg, _ws, _ops, _stream_blocks,
                           _plan_w, _plan_h, _plan_frames, &lerr,
                           /*with_connectors=*/true);
     if (!_dit) {

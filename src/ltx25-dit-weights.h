@@ -6,6 +6,7 @@
 
 #include "generative-models/weight-set.h"
 
+#include <functional>
 #include <string>
 
 namespace ltx25 {
@@ -65,6 +66,23 @@ struct DitTrunk {
   vpipe::metal_compute::SharedBuffer scale_shift_out, audio_scale_shift_out;
   vpipe::metal_compute::SharedBuffer keyframes_abs_pos;   // may be empty
 };
+
+// Every weight buffer the TRUNK holds -- the eight adaLN chains, the
+// patchify and output projections, the scale/shift tables, the keyframe
+// embedding.
+//
+// Two callers, and they want the same set for opposite reasons: one
+// counts the bytes so the manager can see what this model holds, the
+// other hands them to the wired pool so the OS cannot take them. The
+// trunk is read on every block of every forward, so it has a better
+// claim on the pool than any single resident block does.
+//
+// Empty buffers are passed through rather than filtered, exactly as
+// for_each_weight(GpuBlockWeights) does: an optional component leaves
+// its slots empty and every caller copes with that anyway.
+void for_each_weight(
+    const DitTrunk& t,
+    const std::function<void(const vpipe::metal_compute::SharedBuffer&)>& fn);
 
 // The tensor-name prefix every DiT weight carries in the released
 // single-file checkpoint. Recorded here rather than spelled at each call

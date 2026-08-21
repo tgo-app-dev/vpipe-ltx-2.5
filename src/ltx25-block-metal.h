@@ -194,6 +194,15 @@ struct BlockScratch {
   // Bytes held, for the log line that makes the saving visible.
   std::uint64_t bytes() const noexcept;
 
+  // Every working plane, for the WIRED POOL. A forward cannot proceed
+  // without these, so they belong in the pool AHEAD of any resident
+  // block -- a block is an optimisation the model can shed and stream
+  // instead, and protecting the optional half first is how a run ends up
+  // with wired weights beside an activation buffer the compressor is
+  // free to take. See docs/MODEL-MEMORY.md, "The wired pool".
+  void for_each_buffer(
+      const std::function<void(vpipe::metal_compute::SharedBuffer&)>& fn);
+
   // What reserve() WILL allocate at these widths, before an arena
   // exists. Pure arithmetic, and it lives HERE -- next to the allocation
   // it predicts -- because the two have to move together: a caller sizes

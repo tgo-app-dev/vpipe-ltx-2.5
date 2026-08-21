@@ -78,14 +78,10 @@ struct GenerationParams {
 // fabricating conditioning rather than declining it.
 class Ltx25Generator : public vpipe::genai::VideoGenerator {
 public:
-  // `pin_frac` comes from model_memory::plan_streaming and is passed
-  // straight to Ltx25Dit::load -- see the note there. Held as a member
-  // because the DiT is rebuilt on the reload path and the fraction has to
-  // be the same one, not a fresh guess taken against a different graph.
   static std::unique_ptr<Ltx25Generator>
   create(const Config& cfg, std::shared_ptr<vpipe::genai::WeightSet> ws,
          vpipe::metal_compute::MetalCompute* mc, bool stream_blocks,
-         double pin_frac, int plan_w, int plan_h, int plan_frames,
+         int plan_w, int plan_h, int plan_frames,
          const vpipe::SessionContextIntf* session, std::string* err);
 
   int latent_channels() const override { return _cfg.dit.in_channels; }
@@ -111,7 +107,6 @@ private:
   std::uint64_t _resident = 0;
   bool _stream_blocks = false;
   // The plan's pinned-prefix fraction, kept for the reload path.
-  double _pin_frac = 0.0;
   // The clip the graph planned, for the reload path's pin sizing.
   int _plan_w = 0, _plan_h = 0, _plan_frames = 0;
 

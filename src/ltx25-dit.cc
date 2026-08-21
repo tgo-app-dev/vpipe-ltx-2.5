@@ -3,10 +3,10 @@
 #include "ltx25-text-encoder.h"
 
 #include "apple-silicon/metal-compute/shared-buffer.h"
-#include "generative-models/shared/stream-pin.h"
 
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
+#include "interfaces/session-services-intf.h"
 
 #include <chrono>
 #include <cstdio>
@@ -217,6 +217,21 @@ Ltx25Dit::bake_adaln(const std::vector<double>& sigmas, std::string* err)
                                   &a->emb2_b, &a->out_w,  &a->out_b};
     for (const SharedBuffer* sb : bufs) { freed += sb->byte_size(); }
   }
+  // UNWIRE BEFORE CLEARING. Destroying a wired buffer unwires it in the
+  // kernel but not in the pool's counter, so these chains would be
+  // charged to the pool for the rest of the run while no longer
+  // existing -- and the pool would fill with bytes nothing holds.
+  if (_wired_fixed) {
+    if (auto* mgr = manager_()) {
+      for (const DitTrunk::AdaLN* a : all) {
+        const SharedBuffer* bufs[] = {&a->emb1_w, &a->emb1_b, &a->emb2_w,
+                                      &a->emb2_b, &a->out_w,  &a->out_b};
+        for (const SharedBuffer* sb : bufs) {
+          mgr->unwire_from_pool(const_cast<SharedBuffer&>(*sb));
+        }
+      }
+    }
+  }
   for (DitTrunk::AdaLN* a : {&_trunk.video, &_trunk.audio, &_trunk.prompt,
                              &_trunk.audio_prompt, &_trunk.av_video_ss,
                              &_trunk.av_audio_ss, &_trunk.av_a2v_gate,
@@ -274,7 +289,7 @@ block_bytes_(const MetalBlock* b)
 
 std::unique_ptr<Ltx25Dit>
 Ltx25Dit::load(const Config& cfg, std::shared_ptr<WeightSet> ws_in,
-               const MetalOps& ops, bool stream_blocks, double pin_frac,
+               const MetalOps& ops, bool stream_blocks,
                int plan_w, int plan_h, int plan_frames, std::string* err,
                bool with_connectors)
 {
@@ -327,78 +342,31 @@ Ltx25Dit::load(const Config& cfg, std::shared_ptr<WeightSet> ws_in,
   // resident block and a stack with none could not run at all.
   d->_pinned = cfg.dit.num_layers;
   if (stream_blocks) {
-    // THE HOST'S FRACTION, not a constant of this file. This used to pass
-    // a hardcoded 0.60, which is the one thing in this port that differed
-    // from every built-in DiT in the host tree -- and it is why a 16 GB
-    // box pinned 20 of 48 blocks (7850 MB) while the plan had computed
-    // that there was room for NONE. The fraction is a property of the
-    // graph, not of the model: what the prefix has to coexist with is
-    // whatever else is resident during the denoise.
+    // ONE, and it is a STRUCTURAL minimum rather than a prefix.
     //
-    // At 0 this still pins one block, unlike the built-ins -- see the
-    // note on load() in the header.
-    // Hoisted so the log below can report what the count was sized
-    // against; a pin count without those two numbers is unfalsifiable.
-    std::size_t scratch = 0, trunk = 0;
-    if (pin_frac > 0.0) {
-      std::vector<std::string> prefixes((std::size_t)cfg.dit.num_layers);
-      for (int i = 0; i < cfg.dit.num_layers; ++i) {
-        prefixes[(std::size_t)i] = std::string(kDitPrefix) +
-                                   "transformer_blocks." + std::to_string(i) +
-                                   ".";
-      }
-      // THE ARENA THIS CLIP WILL NEED, not a constant. The pinned prefix
-      // has to fit beside it, and it scales with the token count -- 1.03
-      // GB at 6630 video tokens and more at a larger canvas -- so a flat
-      // figure is wrong at every geometry but one. BlockScratch::
-      // predict_bytes is the same arithmetic reserve() allocates from,
-      // and a test holds the two together.
-      //
-      // Zero geometry means the stage could not settle one; then this
-      // falls back on stream_pin_count's own default rather than
-      // pretending to know.
-      if (plan_w > 0 && plan_h > 0 && plan_frames > 0) {
-        const int lf = (plan_frames - 1) / kTemporalCompression + 1;
-        const int lh = plan_h / kSpatialCompression;
-        const int lw = plan_w / kSpatialCompression;
-        const bool ha = cfg.dit.use_audio_video_cross_attention;
-        const std::size_t d0 =
-            (std::size_t)std::max(cfg.dit.inner_dim(),
-                                  ha ? cfg.dit.audio_inner_dim() : 0);
-        // The caption is the other candidate for the widest axis, and on
-        // a short clip it wins -- which is exactly how a 49.6 GB arena
-        // once hid behind small test geometries.
-        const std::size_t tok = (std::size_t)std::max(
-            lf * lh * lw, Ltx25TextEncoder::kMaxTokens);
-        scratch = (std::size_t)BlockScratch::predict_bytes(tok, d0, 4 * d0, 1);
-      }
-      d->_pinned = vpipe::genai::stream_pin_count(
-          ws.src(), prefixes, pin_frac,
-          scratch > 0 ? scratch : (std::size_t{1} << 30), &trunk);
-    } else {
-      d->_pinned = 0;
-    }
-    if (d->_pinned < 1) { d->_pinned = 1; }
-    if (d->_pinned > cfg.dit.num_layers) { d->_pinned = cfg.dit.num_layers; }
+    // The fraction-of-RAM prefix this used to size is retired, for the
+    // reason docs/MODEL-MEMORY.md gives: it was a share of TOTAL ram
+    // decided before the run, blind to another process, to this graph's
+    // peers, and to the moment a peer let go. What replaces it MEASURES
+    // -- BlockResidency keeps a streamed block when the box turns out to
+    // have room and gives it back the moment its pages are found outside
+    // RAM. This port's own history is the argument: a hardcoded fraction
+    // pinned 20 of 48 blocks on a 16 GB box against a plan that had
+    // computed room for none.
+    //
+    // Why one and not zero, where every built-in DiT pins zero: the
+    // block ARENA is allocated by MetalBlock::reserve() through a
+    // resident block, so set_geometry over an empty stack would leave
+    // `_scratch` null -- and with it scratch_bytes(), the residency
+    // reserve, and the wired-pool charge. One block is what owns the
+    // arena. It is not a memory decision and does not scale with the
+    // box.
+    d->_pinned = 1;
     if (ops.mc()->session() != nullptr) {
-      // At normal, not debug: when a bounded run turns out to thrash this
-      // is the first number anyone needs, and the pin count alone does
-      // not say whether the model chose it or was told it.
-      if (pin_frac > 0.0) {
-        ops.mc()->session()->log_normal(vpipe::fmt(
-            "ltx-2.5: pinning {} of {} blocks at pin_frac {:.3f} -- trunk "
-            "{} MB + {} MB arena reserved beside them",
-            d->_pinned, cfg.dit.num_layers, pin_frac, trunk >> 20,
-            (scratch > 0 ? scratch : (std::size_t{1} << 30)) >> 20));
-      } else {
-        // Reporting the trunk and arena here would be reporting numbers
-        // nothing computed: at pin_frac 0 the sizing block is skipped
-        // entirely. Say what actually happened instead.
-        ops.mc()->session()->log_normal(vpipe::fmt(
-            "ltx-2.5: pinning {} of {} blocks -- the plan sized no prefix "
-            "(pin_frac 0), so block residency grows from here by measuring",
-            d->_pinned, cfg.dit.num_layers));
-      }
+      ops.mc()->session()->log_normal(vpipe::fmt(
+          "ltx-2.5: streaming {} blocks, 1 held to own the arena -- the "
+          "resident set grows into free RAM as the denoise runs and is "
+          "given back when the box needs it", cfg.dit.num_layers));
     }
   }
 
@@ -486,6 +454,163 @@ Ltx25Dit::pinned_bytes() const noexcept
   return n;
 }
 
+Ltx25Dit::~Ltx25Dit()
+{
+  if (!_wired_fixed) { return; }
+  wire_fixed_(false);
+  for (auto& b : _blocks) {
+    if (b) { wire_block_(*b, false); }
+  }
+}
+
+std::size_t
+Ltx25Dit::held_weight_bytes() const noexcept
+{
+  std::size_t n = pinned_bytes();
+  for_each_weight(_trunk, [&](const SharedBuffer& x) { n += x.byte_size(); });
+  if (_v_conn) {
+    _v_conn->for_each_weight([&](const SharedBuffer& x) {
+      n += x.byte_size();
+    });
+  }
+  if (_a_conn) {
+    _a_conn->for_each_weight([&](const SharedBuffer& x) {
+      n += x.byte_size();
+    });
+  }
+  return n;
+}
+
+vpipe::genai::GenerativeModelManager*
+Ltx25Dit::manager_() const
+{
+  const auto* mc = _ops != nullptr ? _ops->mc() : nullptr;
+  if (mc == nullptr || mc->session() == nullptr) { return nullptr; }
+  const auto* svc = mc->session()->services();
+  return svc != nullptr ? svc->generative_model_manager() : nullptr;
+}
+
+std::size_t
+Ltx25Dit::wire_fixed_(bool on)
+{
+  auto* mgr = manager_();
+  if (mgr == nullptr) { return 0; }
+  std::size_t changed = 0;
+  bool full = false;
+  std::size_t unwirable = 0;
+  auto one = [&](SharedBuffer& b) {
+    if (b.byte_size() == 0 || b.is_wired() == on) { return; }
+    if (full) { unwirable += b.byte_size(); return; }
+    if (!on) { mgr->unwire_from_pool(b); changed += b.byte_size(); return; }
+    const std::size_t got = mgr->wire_into_pool(b);
+    if (got == 0) {
+      // STOP, and keep what is already wired rather than unwinding it.
+      // A partly wired model is partly protected, which is strictly
+      // better than none -- and handing protection back on the way out
+      // means competing for it again against a pool that just said no.
+      full = true;
+      unwirable += b.byte_size();
+      return;
+    }
+    changed += got;
+  };
+  // THE SCRATCH FIRST. A forward cannot proceed without it, where a
+  // resident block is an optimisation this model can shed -- so if the
+  // pool runs out partway, it runs out on the half that had an
+  // alternative.
+  if (_scratch) { _scratch->for_each_buffer(one); }
+  if (_v_conn) { _v_conn->for_each_scratch(one); }
+  if (_a_conn) { _a_conn->for_each_scratch(one); }
+  // Then the TRUNK and the CONNECTORS, read on every block of every
+  // forward and never shed.
+  //
+  // const_cast because the enumerations hand out const buffers -- they
+  // exist for counting as well as wiring -- and wiring is a property of
+  // the PAGES rather than of the bytes. Nothing here writes through the
+  // pointer.
+  for_each_weight(_trunk, [&](const SharedBuffer& b) {
+    one(const_cast<SharedBuffer&>(b));
+  });
+  auto conn = [&](const std::unique_ptr<Ltx25Connector>& c) {
+    if (!c) { return; }
+    c->for_each_weight([&](const SharedBuffer& b) {
+      one(const_cast<SharedBuffer&>(b));
+    });
+  };
+  conn(_v_conn);
+  conn(_a_conn);
+  _unwirable = unwirable;
+  return changed;
+}
+
+std::size_t
+Ltx25Dit::wire_block_(MetalBlock& b, bool on)
+{
+  auto* mgr = manager_();
+  if (mgr == nullptr) { return 0; }
+  std::size_t changed = 0;
+  for_each_weight(b.weights(), [&](const SharedBuffer& x) {
+    if (x.byte_size() == 0 || x.is_wired() == on) { return; }
+    SharedBuffer& m = const_cast<SharedBuffer&>(x);
+    if (!on) { mgr->unwire_from_pool(m); changed += m.byte_size(); return; }
+    changed += mgr->wire_into_pool(m);
+  });
+  return changed;
+}
+
+std::size_t
+Ltx25Dit::wire_into_pool()
+{
+  const auto* sess = _ops != nullptr && _ops->mc() != nullptr
+                         ? _ops->mc()->session() : nullptr;
+  auto* mgr = manager_();
+  if (mgr == nullptr) { return 0; }
+  const std::size_t limit = mgr->wired_pool_limit();
+  if (limit == 0) {
+    // SAID, not skipped silently. Wiring off is a legitimate setting
+    // (wired_pool_pct 0, or a box that granted nothing), and a run that
+    // then sheds its resident set looks exactly like one whose policy
+    // is broken. This is the line that tells the two apart.
+    if (sess != nullptr && !_wired_reported) {
+      _wired_reported = true;
+      sess->info(vpipe::fmt(
+          "ltx-2.5: the wired pool is off (wired_pool_pct={}), so resident "
+          "blocks stay reclaimable and the compressor may take them back "
+          "inside a forward", mgr->wired_pool_pct()));
+    }
+    return 0;
+  }
+  std::size_t n = wire_fixed_(true);
+  _wired_fixed = true;
+  // The blocks AFTER, and only the ones already held. A streamed block
+  // is wired as it is admitted (see the residency loop), not here.
+  for (auto& b : _blocks) {
+    if (b) { n += wire_block_(*b, true); }
+  }
+  // Reported at INFO and on every geometry, including a zero. A pool
+  // that silently refused reads in the log exactly like one that was
+  // never asked, and the difference is what decides whether a shed
+  // resident set is the policy working or the pool failing.
+  if (sess != nullptr && (n > 0 || !_wired_reported)) {
+    _wired_reported = true;
+    // The REFUSED bytes too. A partly wired model is partly protected,
+    // and the half outside the pool is the half the compressor may take
+    // -- so a silent partial wire reads in the log exactly like a
+    // complete one, and the difference shows up later as a shed
+    // resident set with no stated cause. Zero is the ordinary case and
+    // is said so plainly.
+    sess->info(vpipe::fmt(
+        "ltx-2.5: wired {} MB this pass{}; the pool holds {} MB of {} MB",
+        n >> 20,
+        _unwirable > 0
+            ? vpipe::fmt(" ({} MB REFUSED and left reclaimable)",
+                         _unwirable >> 20)()
+            : std::string(),
+        mgr->wired_pool_used() >> 20, limit >> 20));
+  }
+  return n;
+}
+
 void
 Ltx25Dit::set_residency_reserve(std::size_t bytes)
 {
@@ -503,6 +628,18 @@ Ltx25Dit::evict_tail_block_(bool allow_pinned)
     auto& b = _blocks[(std::size_t)i];
     if (!b) { continue; }
     const std::size_t n = block_bytes_(b.get());
+    // GIVE THE POOL BACK FIRST. Freeing a wired buffer unwires it in the
+    // kernel but not in the pool's counter, and an evict/admit cycle is
+    // exactly the loop that would turn that into a pool full of bytes
+    // nothing holds.
+    //
+    // This is only safe because set_wired(false) leaves the buffer
+    // NonVolatile. It used to mark it purgeable VOLATILE, and doing
+    // that here -- to a block the GPU may still be reading, whose
+    // weights can be subviews of a shard its neighbours share -- meant
+    // the kernel could discard those pages mid-forward. It took SIGBUS
+    // in this block's own destructor.
+    if (_wired_fixed) { wire_block_(*b, false); }
     b.reset();
     // Taking one out of the PINNED prefix un-pins it. That prefix was
     // sized at load against what the box was believed to hold, and a
@@ -524,6 +661,13 @@ Ltx25Dit::resident_pages_(std::size_t* examined, std::size_t* incore) const
     if (!b) { continue; }
     for_each_weight(b->weights(), [&](const SharedBuffer& x) {
       if (x.empty()) { return; }
+      // A WIRED BUFFER CANNOT HAVE LEFT RAM -- mlock guarantees it --
+      // so the walk would spend ~57 ms per 4.3 GB to be told that.
+      // Skipped per BUFFER because wire_block_ stops at the first
+      // refusal, leaving the rest of a block unwired and still worth
+      // measuring. With everything wired `examined` stays 0, which the
+      // caller already reads as "no evidence" rather than a shortfall.
+      if (x.is_wired()) { return; }
       const auto r = x.page_residency(64);
       if (!r.valid) { return; }
       ex += r.examined;
@@ -756,6 +900,20 @@ Ltx25Dit::set_geometry(int latent_frames, int latent_h, int latent_w,
     }
   }
   _geometry_set = true;
+
+  // INTO THE POOL, here rather than at load: the scratch does not exist
+  // until this runs, and it is reallocated whenever the geometry grows.
+  // Re-wiring is cheap and idempotent -- every site skips a buffer whose
+  // wired state already matches -- so a second clip at the same size
+  // wires nothing and one at a larger size wires only the new arena.
+  //
+  // NOT wired: this function's own per-geometry buffers (_tmp, _vctx,
+  // the modulation rows). They are ~150 MB against the block arena's
+  // ~1 GB at 960x544, and enumerating them here would be a list that
+  // rots silently as buffers are added. Said plainly rather than left to
+  // look complete.
+  wire_into_pool();
+
   return true;
 }
 
@@ -1179,6 +1337,15 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
         _blocks[(std::size_t)i] = std::move(streamed);
         _resid.note_admitted(nb);
         ++promoted_n;
+        // INTO THE POOL as it is admitted. A block that is merely kept
+        // is a block the compressor may take back inside the same
+        // forward -- it is written once and then read only by the GPU,
+        // so it carries no CPU reference bits and reads as cold. That is
+        // what a resident set costs when it is resident only in the
+        // accounting. Wiring is skipped silently when the pool is full,
+        // which leaves the block held-but-reclaimable: the old
+        // behaviour, and no worse than it.
+        if (_wired_fixed) { wire_block_(*_blocks[(std::size_t)i], true); }
       }
       streamed.reset();
     }

@@ -35,6 +35,22 @@ public:
   std::vector<vpipe::ResourceClaim>
   declare_resources(const std::string& root) const override;
 
+  // The same checkpoint in the topological plan's terms -- see
+  // docs/MODEL-MEMORY.md, "Which ledger do I use?". One holding, the
+  // DiT, with the floor its 48 streamed blocks can be reduced to.
+  std::vector<vpipe::StageHolding>
+  declare_holdings(const std::string& root) const override;
+
+  // The beat-shaped terms nothing else can size: this family's latent
+  // shape and its soundtrack. Both are LTX's own geometry, and a host
+  // that substituted a built-in's formula would report a confident
+  // number for the wrong model.
+  std::size_t latent_bytes(const std::string& root, int width, int height,
+                           int frames) const override;
+  bool audio_cost(const std::string& root, int frames, double fps,
+                  std::size_t* latent, std::size_t* pcm,
+                  std::size_t* arena) const override;
+
   std::unique_ptr<vpipe::genai::VideoGenerator>
   load(const vpipe::genai::VideoModelCreateArgs& args) override;
 };

@@ -171,6 +171,23 @@ prompt_of_(const FlexData& fd)
 constexpr unsigned kPromptPort = 0;
 constexpr unsigned kNegPort    = 1;
 constexpr unsigned kModelPort  = 2;
+// The least the text encoder can be held at while still being HELD:
+// everything outside the layer stack, plus the two in-flight slots the
+// streamer refills into.
+//
+// The stem is an LM's, because that is what this encoder is -- a Gemma
+// backbone with LTX's aggregate projection bolted on. The projection
+// itself (~2.3 GB of 4096x188160 and 2048x188160) falls OUTSIDE the
+// stem and is therefore counted as trunk, which is correct: it never
+// streams.
+std::size_t
+enc_floor_bytes(const std::string& enc)
+{
+  if (enc.empty()) { return 0; }
+  return vpipe::model_memory::streaming_floor_bytes(
+      enc, {"model.layers.", "layers."});
+}
+
 constexpr unsigned kCondOut          = 0;
 constexpr unsigned kNegCondOut       = 1;
 constexpr unsigned kAudioCondOut     = 2;
@@ -296,7 +313,72 @@ Ltx25ConditionerStage::declare_resources() const
   // The encoder file, not the root: the root also holds the 39 GB DiT,
   // and declaring that here would double-count what generate-video
   // already claims.
-  return vpipe::model_memory::weight_claims({cfg.enc_file});
+  //
+  // BOTH numbers. This encoder streams its layers when the graph has no
+  // room to hold it (see Ltx25TextEncoder::open), and the floor it
+  // reduces to is what says whether a graph that does not fit preloaded
+  // fits anyway. Declaring only the on-disk size is what makes the pool
+  // check refuse a run that works -- MEASURED on the bf16 graph, where a
+  // text encoder with no floor was the whole of the 9 GB overshoot.
+  return {vpipe::model_memory::weight_claim_streamable(
+      cfg.enc_file, enc_floor_bytes(cfg.enc_file))};
+}
+
+// The topological ledger. Same encoder, same floor, plus the thing the
+// phase claims cannot express: what LEAVES this stage.
+vpipe::StageMemory
+Ltx25ConditionerStage::declare_memory() const
+{
+  vpipe::StageMemory m;
+  if (_hf_dir.empty()) { return m; }
+  Config cfg;
+  if (!resolve(_hf_dir, cfg, nullptr, {}, _enc_variant)) { return m; }
+  if (cfg.enc_file.empty()) { return m; }
+  namespace mm = vpipe::model_memory;
+  // NAMED by the file, which is what the removable pool and every
+  // revision below are keyed on.
+  //
+  // `releases` is the same question decide_resources() asks and has to
+  // be answered the same way: only when the drop is certain from config.
+  // `park` is not a release here -- this encoder is a Gemma LM reading
+  // uncached, so park_weights() hands over 0 bytes and it stays entirely
+  // resident.
+  m.hold(cfg.enc_file, mm::dir_weights_bytes(cfg.enc_file),
+         enc_floor_bytes(cfg.enc_file),
+         _unload_cfg == mm::UnloadPolicy::kDestroy,
+         _unload_cfg == mm::UnloadPolicy::kAuto);
+
+  // The CONDITIONING, on four oports. bf16 [pad_to, dim] each, which is
+  // exactly what process() allocates -- so the plan and the allocation
+  // cannot describe different beats.
+  //
+  // Alive well past this stage: the denoise reads them on every step of
+  // an 8-step schedule, and the plan works that lifetime out from the
+  // edges rather than being told it. At the default 1024x4096 the video
+  // context is 8 MB and all four together 12 MB, which is small beside a
+  // 39 GB DiT and is still the honest entry -- an omitted payload is a
+  // hole, and holes are what make a plan read roomier than the box.
+  // From the freshly resolved `cfg`, not from the `_cfg` member: this
+  // runs BEFORE the encoder loads, so the member is still
+  // default-constructed and its widths are the header's defaults rather
+  // than this checkpoint's. They agree on everything shipped, which is
+  // exactly what would keep the mistake invisible.
+  const int vdim = cfg.dit.cross_attention_dim;
+  const int adim = cfg.dit.audio_cross_attention_dim;
+  const std::size_t vbytes = (std::size_t)_pad_to * (std::size_t)vdim * 2;
+  const std::size_t abytes = (std::size_t)_pad_to * (std::size_t)adim * 2;
+  m.outputs.resize(4, 0);
+  m.outputs[kCondOut]         = vbytes;
+  m.outputs[kAudioCondOut]    = abytes;
+  // The NEGATIVES only when one will really be emitted. A `distilled`
+  // checkpoint is guidance-distilled and never produces them, and a
+  // graph with no negative set does not either -- declaring them anyway
+  // would put 12 MB in every plan for beats that never exist.
+  if (!_negative.empty() && cfg.variant != Variant::kDistilled) {
+    m.outputs[kNegCondOut]      = vbytes;
+    m.outputs[kNegAudioCondOut] = abytes;
+  }
+  return m;
 }
 
 // Pass TWO. Everything above has been declared by every stage; nothing
@@ -685,12 +767,51 @@ void
 Ltx25ConditionerStage::destroy_encoder_()
 {
   if (!_enc && !_ws) { return; }
+  auto* mgr = this->session()->services()->generative_model_manager();
+  // THE PHASE CLAIM'S OTHER HALF. decide_resources() promised these
+  // bytes are gone before the peers that sized against them run; this is
+  // where the promise is kept, and reporting it is what stops the
+  // manager warning at the end of the launch that it was not. An
+  // unfalsifiable promise is worse than none -- a broken one shows up
+  // only as thrash, with nothing in the log connecting it to the claim.
+  if (mgr != nullptr && !_cfg.enc_file.empty()) {
+    mgr->note_phase_released(_cfg.enc_file);
+  }
+  // TO THE POOL, and BEFORE the resets. pool_weights() finds the set
+  // through a WEAK reference, so once these drop their last strong one
+  // there is nothing left to pool and the call is a silent no-op.
+  //
+  // Only under `auto`, which is the case the pool exists for: an encoder
+  // dropped because the box was tight, wanted again on the very next
+  // prompt. Pooled it stays purgeable -- a peer that genuinely needs the
+  // room takes it, one that does not leaves the next prompt nothing to
+  // reload. `destroy` is the caller asking for the bytes back now.
+  //
+  // NOT specialised to anything, so it is recyclable and a relaunch over
+  // the same checkpoint finds it. (The DiT's adaLN bake does not change
+  // this: it clears the model's own handles and writes nothing into the
+  // weight set, so no set here is schedule-specific.)
+  if (mgr != nullptr && !_cfg.enc_file.empty() &&
+      _unload_cfg == vpipe::model_memory::UnloadPolicy::kAuto) {
+    mgr->pool_weights(_cfg.enc_file);
+  }
   _enc.reset();
   _ws.reset();
   _loaded_root.clear();
-  auto* mgr = this->session()->services()->generative_model_manager();
   if (mgr != nullptr && !_cfg.enc_file.empty()) {
     mgr->revise_declaration(_cfg.enc_file, 0);
+    // The SAME correction on the topological plan. The two ledgers are
+    // computed differently and a stage that corrects only one leaves the
+    // other reporting an encoder that no longer exists.
+    {
+      vpipe::StageMemory m = declare_memory();
+      for (vpipe::StageHolding& h : m.holdings) {
+        if (h.source != _cfg.enc_file) { continue; }
+        h.preload = 0;
+        h.floor   = 0;
+      }
+      this->revise_memory(m);
+    }
     this->session()->log_debug(fmt(
         "Ltx25ConditionerStage('{}'): encoder dropped and its declaration "
         "revised to 0 -- peers sizing after this see the room back",

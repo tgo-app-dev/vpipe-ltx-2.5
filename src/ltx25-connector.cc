@@ -264,4 +264,49 @@ Ltx25Connector::forward(const SharedBuffer& in, const SharedBuffer& out,
   return true;
 }
 
+namespace {
+
+void
+qw_(const QWeight& q,
+    const std::function<void(const vpipe::metal_compute::SharedBuffer&)>& fn)
+{
+  if (q.quantized) { fn(q.codes); fn(q.scales); fn(q.qbias); }
+  else { fn(q.w); }
+}
+
+}  // namespace
+
+void
+Ltx25Connector::for_each_weight(
+    const std::function<void(const vpipe::metal_compute::SharedBuffer&)>& fn)
+    const
+{
+  if (!fn) { return; }
+  for (const Block& b : _blocks) {
+    qw_(b.q_w, fn); qw_(b.k_w, fn); qw_(b.v_w, fn); qw_(b.o_w, fn);
+    qw_(b.ff_in, fn); qw_(b.ff_out, fn);
+    fn(b.q_b); fn(b.k_b); fn(b.v_b); fn(b.o_b);
+    fn(b.q_norm); fn(b.k_norm);
+    fn(b.gate_w); fn(b.gate_b);
+    fn(b.ff_in_b); fn(b.ff_out_b);
+  }
+  // The learnable REGISTERS are weights, not scratch: they replace
+  // padded positions and are read every forward.
+  fn(_registers);
+}
+
+void
+Ltx25Connector::for_each_scratch(
+    const std::function<void(vpipe::metal_compute::SharedBuffer&)>& fn)
+{
+  if (!fn) { return; }
+  // The RoPE tables are built once per token count and read, never
+  // written during a forward -- but they are sized by reserve(), so they
+  // live and die with the scratch and are wired with it.
+  vpipe::metal_compute::SharedBuffer* all[] = {
+      &_rope_cos, &_rope_sin, &_a, &_b, &_q, &_k, &_v, &_o,
+      &_qh, &_kh, &_vh, &_oh, &_gate, &_ff};
+  for (auto* p : all) { fn(*p); }
+}
+
 }  // namespace ltx25

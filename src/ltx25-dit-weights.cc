@@ -559,4 +559,31 @@ bind_trunk(WeightSet& ws, MetalCompute* mc, const DitConfig& cfg,
   return true;
 }
 
+void
+for_each_weight(
+    const DitTrunk& t,
+    const std::function<void(const vpipe::metal_compute::SharedBuffer&)>& fn)
+{
+  if (!fn) { return; }
+  const DitTrunk::AdaLN* chains[] = {
+      &t.video, &t.audio, &t.prompt, &t.audio_prompt,
+      &t.av_video_ss, &t.av_audio_ss, &t.av_a2v_gate, &t.av_v2a_gate};
+  for (const DitTrunk::AdaLN* a : chains) {
+    // NOT gated on a->valid: after bake_adaln() the chains are cleared
+    // and marked invalid, and a caller UNWIRING what it wired must
+    // still be handed the (now empty) buffers rather than silently
+    // skipping them. The buffers are empty by then, so this costs
+    // nothing and cannot leave a stale wire behind.
+    fn(a->emb1_w); fn(a->emb1_b);
+    fn(a->emb2_w); fn(a->emb2_b);
+    fn(a->out_w);  fn(a->out_b);
+  }
+  fn(t.patchify_w); fn(t.patchify_b);
+  fn(t.audio_patchify_w); fn(t.audio_patchify_b);
+  fn(t.proj_out_w); fn(t.proj_out_b);
+  fn(t.audio_proj_out_w); fn(t.audio_proj_out_b);
+  fn(t.scale_shift_out); fn(t.audio_scale_shift_out);
+  fn(t.keyframes_abs_pos);
+}
+
 }  // namespace ltx25

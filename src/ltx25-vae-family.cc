@@ -260,6 +260,35 @@ Ltx25VaeFamily::declare_resources(const std::string& root,
   return vpipe::model_memory::weight_claims({cfg.vae_file});
 }
 
+std::string
+Ltx25VaeFamily::vae_path(const std::string& root, Role role) const
+{
+  Config cfg;
+  // resolve() rather than resolve_vae_(): this must answer for the AUDIO
+  // half too, and that file has its own config which resolve_vae_ does
+  // not read. Both are located by the same directory walk.
+  if (!resolve(root, cfg, nullptr)) { return {}; }
+  return role == Role::kAudio ? cfg.audio_vae_file : cfg.vae_file;
+}
+
+std::vector<vpipe::StageHolding>
+Ltx25VaeFamily::declare_holdings(const std::string& root, Role role) const
+{
+  const std::string p = vae_path(root, role);
+  if (p.empty()) { return {}; }
+  std::vector<vpipe::StageHolding> out;
+  vpipe::StageHolding h;
+  h.source  = p;
+  // A VAE has no streaming form here -- it holds what it weighs -- so
+  // `floor` stays 0 and the plan reads it as `preload`. `releases` and
+  // `reclaimable` are the stage's `unload_when_idle` and are stamped on
+  // by whichever stage asked.
+  h.preload = vpipe::model_memory::dir_weights_bytes(p);
+  if (h.preload == 0) { return {}; }
+  out.push_back(std::move(h));
+  return out;
+}
+
 std::vector<std::string>
 Ltx25VaeFamily::idle_peers(const std::string& root) const
 {

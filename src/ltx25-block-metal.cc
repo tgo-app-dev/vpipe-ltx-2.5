@@ -222,6 +222,21 @@ BlockScratch::bytes() const noexcept
   return n;
 }
 
+void
+BlockScratch::for_each_buffer(
+    const std::function<void(vpipe::metal_compute::SharedBuffer&)>& fn)
+{
+  if (!fn) { return; }
+  // The SAME list bytes() sums, and deliberately so: a buffer counted
+  // but not wired is one the accounting believes is protected and the
+  // kernel is free to take.
+  vpipe::metal_compute::SharedBuffer* all[] = {
+      &a, &b, &c, &d, &e, &q, &k, &v, &o, &qh, &kh, &vh, &oh,
+      &gate_logits, &ff, &mod_scale, &mod_shift, &mod_gate,
+      &kv_scale, &kv_shift, &snap_v, &snap_a};
+  for (auto* p : all) { fn(*p); }
+}
+
 const MetalOps::SteelAttn*
 BlockScratch::steel_for(const MetalOps& ops, int heads, int tq, int tkv,
                         int head_dim)
