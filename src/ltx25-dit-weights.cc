@@ -139,10 +139,43 @@ need_f32_as_bf16_(WeightSet& ws, MetalCompute* mc, const std::string& name,
 // Bind, or record the first name that was missing. A block assembled
 // from a partial map runs at full cost and produces noise, so the first
 // miss stops the walk.
+// Refill a destination that ALREADY EXISTS, in place.
+//
+// This is the half get_() above says it does not do: it removes the
+// allocation as well as the fault. It only applies to a caller that
+// hands in a live buffer -- a SLOT, kept across blocks and across
+// forwards -- and it refuses on any doubt, because the fallback
+// (allocate a fresh one) is always correct.
+//
+// The size test is what makes a slot safe on a checkpoint whose blocks
+// are not uniform: a tensor that no longer fits its slot falls through
+// and REPLACES it, sized from the checkpoint. kFailed leaves the
+// destination partly written, so it is a refusal here too -- the caller
+// then overwrites the whole buffer rather than running on half of one.
+bool
+refill_into_(WeightSet& ws, const std::string& name, SharedBuffer& dst)
+{
+  if (dst.empty()) { return false; }
+  const auto* ti = ws.src().info(name);
+  if (ti == nullptr || ti->nbytes == 0) { return false; }
+  if (dst.byte_size() != (std::size_t)ti->nbytes) { return false; }
+  if (!vpipe::genai::refill_serves(ws, name, vpipe::genai::RefillDst::kRaw)) {
+    return false;
+  }
+  return vpipe::genai::refill_streamed_tensor(
+             ws, name, dst, vpipe::genai::RefillDst::kRaw) ==
+         vpipe::genai::Refill::kFilled;
+}
+
 bool
 need_(WeightSet& ws, MetalCompute* mc, const std::string& name, bool stream,
       SharedBuffer& out, std::string* miss, WeightSet::Residency kept)
 {
+  // A live destination is a slot being reused. Only when STREAMING: a
+  // preloaded block's buffers are the weight set's own cached tensors,
+  // and writing into one would corrupt every other holder of it (the
+  // WeightSet contract -- cached tensors are shared and immutable).
+  if (stream && refill_into_(ws, name, out)) { return true; }
   out = get_(ws, mc, name, stream, kept);
   if (out.empty()) {
     if (miss != nullptr && miss->empty()) { *miss = name; }
@@ -234,11 +267,70 @@ get_as_bf16_(WeightSet& ws, MetalCompute* mc, const std::string& name,
   return ws.derived("ltx25/bf16/" + info->dtype + "/" + name, build);
 }
 
+// The same, into a destination that ALREADY EXISTS.
+//
+// get_as_bf16_ above allocates TWICE per call -- the source read and the
+// converted result -- and when streaming neither is cached, so a slot
+// refill still churned ~25 MB per block through the allocator on the
+// scales and biases alone. This is the other 6% the slot change left
+// behind.
+//
+// IN PLACE, which is possible only because the widths match: F16 and
+// BF16 are both two bytes, so the raw bytes are read into the
+// destination and rewritten there. WeightSet::stream_into says the same
+// thing from the other side ("only possible in place when the widths
+// match (F16 -> BF16 does, F32 -> BF16 does not)").
+//
+// The loop reads element i and writes element i before touching i+1, so
+// a single forward pass over one buffer is safe. It goes through
+// std::memcpy rather than a second pointer type because reading the
+// same memory as _Float16 and writing it as uint16_t is exactly the
+// aliasing a compiler is entitled to reorder.
+//
+// F32 falls through to the allocating path deliberately: it HALVES, so
+// there is no in-place form, and it is not the case that matters --
+// model-quantize writes scales and biases as F16, and the F32 tensors
+// in this checkpoint are the scale/shift tables, which are cached
+// rather than streamed.
+bool
+refill_as_bf16_(WeightSet& ws, const std::string& name, SharedBuffer& dst)
+{
+  if (dst.empty()) { return false; }
+  const auto* info = ws.src().info(name);
+  if (info == nullptr || info->shape.empty()) { return false; }
+  std::size_t n = 1;
+  for (auto d : info->shape) { n *= (std::size_t)d; }
+  if (n == 0 || dst.byte_size() != n * 2) { return false; }
+  const bool f16 = info->dtype == "F16";
+  if (!f16 && info->dtype != "BF16") { return false; }
+  // A false here may have written part of `dst`, which is why the caller
+  // must REPLACE the buffer rather than retry into it.
+  if (!ws.stream_into(name, dst.contents(), dst.byte_size())) {
+    return false;
+  }
+  if (!f16) { return true; }            // already the compute dtype
+  auto* p = static_cast<std::uint16_t*>(dst.contents());
+  for (std::size_t i = 0; i < n; ++i) {
+    const std::uint16_t bits = p[i];
+    _Float16 h;
+    std::memcpy(&h, &bits, sizeof(h));
+    const float v = (float)h;
+    std::uint32_t u;
+    std::memcpy(&u, &v, 4);
+    const std::uint32_t r = ((u >> 16) & 1u) + 0x7fffu;   // RNE
+    p[i] = (std::uint16_t)((u + r) >> 16);
+  }
+  return true;
+}
+
 bool
 need_as_bf16_(WeightSet& ws, MetalCompute* mc, const std::string& name,
               bool stream, SharedBuffer& out, std::string* miss,
               WeightSet::Residency kept)
 {
+  // A live destination is a slot being reused; see need_() for why this
+  // is gated on STREAMING.
+  if (stream && refill_as_bf16_(ws, name, out)) { return true; }
   out = get_as_bf16_(ws, mc, name, stream, kept);
   if (out.empty()) {
     if (miss != nullptr && miss->empty()) { *miss = name; }

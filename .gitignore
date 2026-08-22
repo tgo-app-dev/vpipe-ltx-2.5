@@ -5,3 +5,7 @@ cmake-build-*/
 
 .DS_Store
 compile_commands.json
+
+# Generated clips from a local run, not source.
+*.mp4
+*.mdb

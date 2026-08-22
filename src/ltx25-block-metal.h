@@ -253,6 +253,22 @@ public:
   // the block's mapped byte ranges rather than its behaviour.
   const GpuBlockWeights& weights() const noexcept { return _w; }
 
+  // The same, writable, for a SLOT being refilled with another layer's
+  // weights.
+  //
+  // Narrow on purpose. This block caches nothing derived from `_w` --
+  // the dims and the quant flags it runs from live IN `_w`, and the
+  // scratch arena is sized from the token counts rather than from the
+  // weights -- so replacing the contents is a complete update. That is
+  // what makes a slot possible at all; a block that memoised anything
+  // about its weights would need this to invalidate it too.
+  //
+  // The CALLER guarantees the incoming layer has the same shape. LTX's
+  // blocks are uniform by construction (one config, one quant group
+  // checked across the whole checkpoint), and bind_block replaces any
+  // buffer whose size does not match rather than writing into it.
+  GpuBlockWeights& weights_mut() noexcept { return _w; }
+
   // The arena this block is using, so a caller can report its size.
   const std::shared_ptr<BlockScratch>& scratch() const noexcept
   {

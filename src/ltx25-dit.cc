@@ -490,6 +490,49 @@ Ltx25Dit::manager_() const
   return svc != nullptr ? svc->generative_model_manager() : nullptr;
 }
 
+// Every SCRATCH buffer this model holds -- the shared block arena and
+// both connectors' working planes. Separated from wire_fixed_ because
+// the scratch has a shorter life than everything else in it: a geometry
+// change replaces it, and the replacement has to give the pool back what
+// the old one was charged.
+void
+Ltx25Dit::each_scratch_(
+    const std::function<void(SharedBuffer&)>& fn)
+{
+  if (!fn) { return; }
+  if (_scratch) { _scratch->for_each_buffer(fn); }
+  if (_v_conn) { _v_conn->for_each_scratch(fn); }
+  if (_a_conn) { _a_conn->for_each_scratch(fn); }
+}
+
+// Give the pool back what the current scratch is charged, before that
+// scratch is replaced.
+//
+// Destroying a wired buffer unwires it in the KERNEL but does not
+// decrement the pool's counter -- only unwire_from_pool does -- so a
+// geometry change used to leak a scratch's worth of budget. A pool that
+// has lost budget to bytes nothing holds wires less of what comes next,
+// and the resident set then shrinks for a reason nothing in the log
+// names.
+void
+Ltx25Dit::unwire_scratch_()
+{
+  auto* mgr = manager_();
+  if (mgr == nullptr || !_wired_fixed) { return; }
+  std::size_t given = 0;
+  each_scratch_([&](SharedBuffer& b) {
+    if (b.byte_size() == 0 || !b.is_wired()) { return; }
+    given += b.byte_size();
+    mgr->unwire_from_pool(b);
+  });
+  if (given > 0 && _ops != nullptr && _ops->mc() != nullptr &&
+      _ops->mc()->session() != nullptr) {
+    _ops->mc()->session()->log_debug(vpipe::fmt(
+        "ltx-2.5: released {} MB of wired scratch before resizing it",
+        given >> 20));
+  }
+}
+
 std::size_t
 Ltx25Dit::wire_fixed_(bool on)
 {
@@ -518,9 +561,7 @@ Ltx25Dit::wire_fixed_(bool on)
   // resident block is an optimisation this model can shed -- so if the
   // pool runs out partway, it runs out on the half that had an
   // alternative.
-  if (_scratch) { _scratch->for_each_buffer(one); }
-  if (_v_conn) { _v_conn->for_each_scratch(one); }
-  if (_a_conn) { _a_conn->for_each_scratch(one); }
+  each_scratch_(one);
   // Then the TRUNK and the CONNECTORS, read on every block of every
   // forward and never shed.
   //
@@ -705,6 +746,35 @@ Ltx25Dit::build_block_(int i, std::shared_ptr<BlockScratch> arena,
 }
 
 bool
+Ltx25Dit::refill_slot_(int layer, MetalBlock& dst, std::string* err) const
+{
+  // bind_block with a LIVE destination refills where it can and replaces
+  // where it cannot -- see refill_into_ in ltx25-dit-weights.cc. Every
+  // scalar it sets (dims, quant group, have_audio) is re-derived from
+  // the checkpoint, so the block's metadata cannot end up describing the
+  // previous layer's buffers.
+  return bind_block(*_ws, _ops->mc(), _cfg, layer, /*stream=*/true,
+                    dst.weights_mut(), err);
+}
+
+bool
+Ltx25Dit::fill_slot_(int layer, int idx, std::shared_ptr<BlockScratch> arena,
+                     std::string* err)
+{
+  auto& sl = _slot[(std::size_t)idx];
+  if (sl) {
+    if (refill_slot_(layer, *sl, err)) { return true; }
+    // A refusal here is structural rather than per-tensor (bind_block
+    // handles those itself), so the slot is suspect: drop it and build a
+    // clean one. Self-healing rather than a sticky off-switch -- a slot
+    // that failed once on a checkpoint quirk should not cost the run its
+    // whole streaming path.
+    sl.reset();
+  }
+  return build_block_(layer, std::move(arena), sl, err);
+}
+
+bool
 Ltx25Dit::set_geometry(int latent_frames, int latent_h, int latent_w,
                        int audio_tokens, int text_tokens,
                        const RopeGeometry& geo, std::string* err,
@@ -828,7 +898,17 @@ Ltx25Dit::set_geometry(int latent_frames, int latent_h, int latent_w,
   // -- a command stream each, committed and waited on before the next --
   // and nothing in the scratch survives a forward, so 48 private arenas
   // were 47 copies of dead memory. See BlockScratch.
+  // THE POOL FIRST, while the buffers still exist to be given back.
+  unwire_scratch_();
   _scratch.reset();
+  // THE SLOTS GO WITH IT. They hold the old arena and were reserved for
+  // the old token counts, and nothing below re-reserves them -- the loop
+  // walks `_blocks`, which slots are deliberately not part of. Dropped
+  // rather than re-reserved: the next streamed block rebuilds one, which
+  // is a read that was going to happen.
+  _slot[0].reset();
+  _slot[1].reset();
+  _slot_cur = 0;
   // Remembered for the blocks that do not exist yet: a streamed one is
   // built inside the forward and has to be given the same geometry.
   _geo_levels = levels;
@@ -1184,7 +1264,10 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
   const bool pf_on = _stream_blocks &&
                      std::getenv("VPIPE_LTX25_NO_PREFETCH") == nullptr;
   struct PrefetchSlot {
-    std::unique_ptr<MetalBlock> blk;
+    // WHICH SLOT it is filling, not a block of its own. The prefetch
+    // and the main path alternate between the two, so the reader always
+    // writes the one the GPU is not reading.
+    int                         slot  = -1;
     int                         block = -1;
     std::future<bool>           fut;
   } pf;
@@ -1198,7 +1281,6 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
     return -1;
   };
   // The block the forward is running when the slot is not resident.
-  std::unique_ptr<MetalBlock> streamed;
 
   // ---- growing back into free RAM (mechanism 4) ---------------------
   //
@@ -1242,6 +1324,12 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
     }
   }
   if (!resid_short) { _resid.note_healthy_forward(); }
+  // WHAT THIS FORWARD ALLOCATES, cumulatively, so "steady state does not
+  // reallocate" is a number rather than a claim. total_count never
+  // decrements, so the delta across a forward is exactly the buffers
+  // minted during it -- and once the slots are built and the resident
+  // set has stopped growing, the honest value is zero.
+  const auto alloc0 = vpipe::metal_compute::shared_buffer_memory_stats();
   int promoted_n = 0;
   for (int i = 0; i < (int)_blocks.size(); ++i) {
     if (in.progress && !in.progress(i, (int)_blocks.size())) {
@@ -1252,6 +1340,10 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
 
     // ---- the block: resident, prefetched, or read now ---------------
     MetalBlock* blk = _blocks[(std::size_t)i].get();
+    // Which slot this block is in, so the promotion below can move it
+    // out and the next fill can take the other one. -1 when the block
+    // was already resident.
+    int use = -1;
     if (blk == nullptr) {
       ++streamed_n;
       if (pf.block == i && pf.fut.valid()) {
@@ -1260,13 +1352,20 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
         const bool ok = pf.fut.get();
         pf.block = -1;
         if (!ok) { return fail("streaming block " + std::to_string(i)); }
-        streamed = std::move(pf.blk);
-        pf.blk.reset();
+        use = pf.slot;
+        pf.slot = -1;
         ++pf_hit;
-      } else if (!build_block_(i, _scratch, streamed, err)) {
-        return false;
+      } else {
+        use = _slot_cur;
+        if (!fill_slot_(i, use, _scratch, err)) { return false; }
       }
-      blk = streamed.get();
+      // The OTHER one is free from here: this block's GPU work is
+      // committed and waited before the next iteration reuses a slot,
+      // and the prefetch below writes the one this is not reading.
+      _slot_cur = 1 - use;
+      blk = _slot[(std::size_t)use].get();
+      if (blk == nullptr) { return fail("streaming block " +
+                                        std::to_string(i)); }
     }
 
     if (kBlkProf) {
@@ -1306,11 +1405,18 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
       if (nxt >= 0 && mb.recommended != 0 &&
           mb.fits_growth(block_bytes_(blk))) {
         pf.block = nxt;
+        pf.slot  = _slot_cur;       // the one the main path is not on
         ++pf_started;
+        // The arena is COPIED for the thread rather than read from the
+        // member: `_scratch` is a shared_ptr the main thread reassigns
+        // on a geometry change, and a worker reading it then would race.
+        // Same reason build_block_ takes it by value.
         auto arena = _scratch;
-        pf.fut = std::async(std::launch::async, [this, &pf, nxt, arena]() {
+        const int slot = pf.slot;
+        pf.fut = std::async(std::launch::async,
+                            [this, nxt, slot, arena]() {
           std::string perr;
-          return build_block_(nxt, arena, pf.blk, &perr);
+          return fill_slot_(nxt, slot, arena, &perr);
         });
       }
     }
@@ -1331,10 +1437,14 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
     // finds it resident and reads one block fewer. Asked after the wait
     // so the budget reflects a settled forward rather than one with a
     // command buffer still in flight.
-    if (_blocks[(std::size_t)i] == nullptr) {
-      const std::size_t nb = block_bytes_(streamed.get());
+    if (_blocks[(std::size_t)i] == nullptr && use >= 0) {
+      const std::size_t nb = block_bytes_(_slot[(std::size_t)use].get());
       if (nb > 0 && _resid.admit(o.mc(), nb)) {
-        _blocks[(std::size_t)i] = std::move(streamed);
+        // MOVED out of the slot, which leaves it empty. The next block
+        // to be streamed rebuilds it -- the read it was going to do
+        // anyway -- so a promotion costs no copy and no extra read, and
+        // allocations stop once the resident set stops growing.
+        _blocks[(std::size_t)i] = std::move(_slot[(std::size_t)use]);
         _resid.note_admitted(nb);
         ++promoted_n;
         // INTO THE POOL as it is admitted. A block that is merely kept
@@ -1347,7 +1457,6 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
         // behaviour, and no worse than it.
         if (_wired_fixed) { wire_block_(*_blocks[(std::size_t)i], true); }
       }
-      streamed.reset();
     }
     if (kBlkProf && (i % 12 == 0 || i + 1 == (int)_blocks.size())) {
       // WHERE the memory goes, per block. A streaming DiT that ends a
@@ -1368,6 +1477,7 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
   }
   if (kBlkProf && o.mc()->session() != nullptr) {
     const auto mb = o.mc()->memory_budget();
+    const auto alloc1 = vpipe::metal_compute::shared_buffer_memory_stats();
     o.mc()->session()->log_normal(vpipe::fmt(
         "ltx-2.5: {} blocks in {:.0f} ms ({:.1f} ms/block); weight pages "
         "{:.1f}% resident on arrival ({} of {} sampled), {} block(s) below "
@@ -1379,9 +1489,12 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
         mb.compressed >> 20, mb.swap_used >> 20));
     o.mc()->session()->log_normal(vpipe::fmt(
         "ltx-2.5: {} of {} blocks streamed, prefetch {}/{} hit; resident "
-        "set {} blocks / {} MB (+{} this forward)",
+        "set {} blocks / {} MB (+{} this forward); {} buffer(s) / {} MB "
+        "allocated this forward",
         streamed_n, _blocks.size(), pf_hit, pf_started,
-        _pinned + _resid.count(), _resid.bytes() >> 20, promoted_n));
+        _pinned + _resid.count(), _resid.bytes() >> 20, promoted_n,
+        alloc1.total_count - alloc0.total_count,
+        (alloc1.total_bytes - alloc0.total_bytes) >> 20));
   }
 
   // ---- the output head ------------------------------------------------

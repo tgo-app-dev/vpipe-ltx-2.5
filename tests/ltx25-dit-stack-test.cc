@@ -88,10 +88,18 @@ main()
 
   ltx25::Config cfg;
   std::string err;
-  if (!ltx25::resolve(root, cfg, &err, {})) {
+  // WHICH PACK, from the same env the family reads. The default resolves
+  // to the bf16 file, and that is a DENSE checkpoint -- so the quantized
+  // read paths (need_q_, and the F16 scales and biases it converts) are
+  // not exercised at all unless this points somewhere else. The
+  // streamed-vs-preloaded comparison below is the only test of those
+  // paths, so being able to aim it is the point.
+  const char* want = std::getenv("VPIPE_LTX25_VARIANT");
+  if (!ltx25::resolve(root, cfg, &err, want != nullptr ? want : "")) {
     std::printf("SKIPPED: %s\n", err.c_str());
     return 0;
   }
+  std::printf("  pack: %s\n", cfg.dit_file.c_str());
   std::shared_ptr<WeightSet> ws = WeightSet::open(cfg.dit_file, nullptr);
   if (!ws) { std::printf("SKIPPED: cannot open the DiT\n"); return 0; }
 
@@ -194,6 +202,64 @@ main()
         "the video velocity is within an order of magnitude of the latent");
   check(ra > 0.02 * rl && ra < 50.0 * rl,
         "the audio velocity is within an order of magnitude of the latent");
+
+  // ---- THE STREAMED ARM MUST BE THE SAME FUNCTION ------------------
+  //
+  // Streaming reads each block into a SLOT -- two destinations kept for
+  // the whole run and refilled in place -- instead of building a block's
+  // worth of buffers per block per forward. That is a change to WHICH
+  // memory the weights are in and must be no change at all to the
+  // arithmetic, so the two arms are compared EXACTLY: same weights, same
+  // kernels, same order, so anything but bit-identical is a bug rather
+  // than round-off.
+  //
+  // TWO forwards on the streamed model, not one. The first fills the
+  // slots from empty; the second runs with them being refilled and, on a
+  // box with room, partly on blocks promoted out of a slot by the first.
+  // A slot that was correct once and stale on reuse only shows on the
+  // second.
+  {
+    auto sdit = ltx25::Ltx25Dit::load(cfg, ws, ops, /*stream_blocks=*/true,
+                                      0, 0, 0, &err);
+    if (!sdit) {
+      check(false, "streamed load: " + err);
+    } else if (!sdit->set_geometry(F, LH, LW, A_TOK, T_TOK, kGeo, &err)) {
+      check(false, "streamed set_geometry: " + err);
+    } else {
+      ltx25::Ltx25Dit::Output s1, s2;
+      const bool ok1 = sdit->forward(in, &s1, &err);
+      check(ok1, "streamed forward 1: " + err);
+      const bool ok2 = ok1 && sdit->forward(in, &s2, &err);
+      check(ok2, "streamed forward 2 (slots being reused): " + err);
+      if (ok2) {
+        auto identical = [](const std::vector<float>& a,
+                            const std::vector<float>& b) {
+          if (a.size() != b.size()) { return (std::size_t)~0ull; }
+          std::size_t n = 0;
+          for (std::size_t i = 0; i < a.size(); ++i) {
+            if (a[i] != b[i]) { ++n; }
+          }
+          return n;
+        };
+        const std::size_t dv = identical(out.video, s1.video);
+        const std::size_t da = identical(out.audio, s1.audio);
+        check(dv == 0, "streamed video == preloaded (" +
+              std::to_string(dv) + " differing)");
+        check(da == 0, "streamed audio == preloaded (" +
+              std::to_string(da) + " differing)");
+        // And the second forward equals the first -- a slot refilled
+        // with the wrong layer, or refilled only partly, shows here even
+        // when forward 1 was clean.
+        check(identical(s1.video, s2.video) == 0,
+              "streamed forward 2 == forward 1 (video)");
+        check(identical(s1.audio, s2.audio) == 0,
+              "streamed forward 2 == forward 1 (audio)");
+        std::printf("  streamed: %d of %d blocks pinned after 2 "
+                    "forwards\n", sdit->pinned_blocks(),
+                    cfg.dit.num_layers);
+      }
+    }
+  }
 
   // Two different sigmas must give DIFFERENT velocities: if they do not,
   // the timestep is not reaching the blocks at all -- which is exactly

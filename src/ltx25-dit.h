@@ -364,12 +364,60 @@ private:
                     std::unique_ptr<MetalBlock>& out,
                     std::string* err) const;
 
+  // ---- STREAMING SLOTS ------------------------------------------------
+  //
+  // Two destinations for the whole run, refilled in place, rather than a
+  // block's worth of fresh buffers per block per forward.
+  //
+  // What the per-block allocation cost is not throughput -- the pread
+  // that replaced the mapped memcpy already took that -- it is CHURN. A
+  // streamed LTX block is ~140 tensors and ~400 MB, allocated and freed
+  // 48 times a forward, and on a box with no room to spare each of those
+  // allocations has to come from somewhere: the compressor, or swap. A
+  // fixed pair asks for the memory once and never gives it back, so the
+  // demand curve is flat instead of a sawtooth. MiniMax-H3 made the same
+  // change for the same reason.
+  //
+  // NULLABLE, and that is what makes promotion free. A block admitted to
+  // the resident set is MOVED out of its slot, leaving it empty, and the
+  // next block to be streamed rebuilds it -- which is the read that was
+  // going to happen anyway. So allocations converge to zero once the
+  // resident set stops growing, without promotion needing a copy.
+  //
+  // Not wired: a slot is written on every block, so it is the hottest
+  // memory in the model and the compressor has no reason to take it.
+  // What is wired is the resident set, which is written once and then
+  // only read.
+  std::unique_ptr<MetalBlock> _slot[2];
+  // The slot the MAIN path will fill next; the prefetch takes the other.
+  int _slot_cur = 0;
+
+  // Refill `dst` with `layer`'s weights, reusing its buffers. Falls back
+  // per TENSOR inside bind_block: one whose size or dtype a raw read
+  // cannot place is replaced rather than written into, and the rest of
+  // the block still refills.
+  bool refill_slot_(int layer, MetalBlock& dst, std::string* err) const;
+
+  // Get `layer` into slot `idx`, refilling it when it exists and
+  // building it when it does not (the first block, and the one after a
+  // promotion).
+  bool fill_slot_(int layer, int idx, std::shared_ptr<BlockScratch> arena,
+                  std::string* err);
+
   // The manager, or null outside a session (which every unit test is).
   // Everything below no-ops there rather than branching at each site.
   vpipe::genai::GenerativeModelManager* manager_() const;
   // Wire the TRUNK, the CONNECTORS and the SCRATCH -- everything this
   // model holds that is not a streamed block.
   std::size_t wire_fixed_(bool on);
+  // Every scratch buffer this model holds -- the shared block arena and
+  // both connectors' planes. Its own walk because the scratch has a
+  // shorter life than the rest of what wire_fixed_ covers.
+  void each_scratch_(
+      const std::function<void(vpipe::metal_compute::SharedBuffer&)>& fn);
+  // Give the pool back what the current scratch is charged, BEFORE it is
+  // replaced. Destroying a wired buffer does not decrement the pool.
+  void unwire_scratch_();
   // Wire one block's weights. Called as a block is admitted and undone
   // as it is evicted, so the pool's charge tracks what is really held.
   std::size_t wire_block_(MetalBlock& b, bool on);
