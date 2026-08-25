@@ -290,17 +290,24 @@ Ltx25ConditionerStage::~Ltx25ConditionerStage() = default;
 // DiT then sized its irreversible streaming decision against an on-disk
 // guess for a component nobody had claimed.
 //
-// Resolved to a DIRECTORY here, as process() does, because everything
-// downstream of `_hf_dir` walks it on disk. resolve_model_dir returns a
-// path unchanged, so a beat naming a path still works.
+// The beat carries a REFERENCE (a registry key or a path). It is stored
+// as one; model_root_() is what turns it into a directory, at each of
+// the places that actually walk the filesystem.
+std::string
+Ltx25ConditionerStage::model_root_() const
+{
+  return vpipe::resolve_model_dir(this->session(), _hf_dir);
+}
+
 void
 Ltx25ConditionerStage::apply_constant(unsigned iport, const FlexData& beat)
 {
   if (iport != kModelPort) { return; }
   std::string ref;
   if (!vpipe::apply_model_select_beat(beat, ref) || ref.empty()) { return; }
-  const std::string d = vpipe::resolve_model_dir(this->session(), ref);
-  if (!d.empty()) { _hf_dir = d; }
+  // Latch the REFERENCE, the way the config path holds one, and let
+  // model_root_() resolve it at each use.
+  _hf_dir = ref;
 }
 
 std::vector<ResourceClaim>
@@ -308,7 +315,7 @@ Ltx25ConditionerStage::declare_resources() const
 {
   if (_hf_dir.empty()) { return {}; }
   Config cfg;
-  if (!resolve(_hf_dir, cfg, nullptr, {}, _enc_variant)) { return {}; }
+  if (!resolve(model_root_(), cfg, nullptr, {}, _enc_variant)) { return {}; }
   if (cfg.enc_file.empty()) { return {}; }
   // The encoder file, not the root: the root also holds the 39 GB DiT,
   // and declaring that here would double-count what generate-video
@@ -332,7 +339,7 @@ Ltx25ConditionerStage::declare_memory() const
   vpipe::StageMemory m;
   if (_hf_dir.empty()) { return m; }
   Config cfg;
-  if (!resolve(_hf_dir, cfg, nullptr, {}, _enc_variant)) { return m; }
+  if (!resolve(model_root_(), cfg, nullptr, {}, _enc_variant)) { return m; }
   if (cfg.enc_file.empty()) { return m; }
   namespace mm = vpipe::model_memory;
   // NAMED by the file, which is what the removable pool and every
@@ -408,7 +415,7 @@ Ltx25ConditionerStage::decide_resources() const
 {
   if (_hf_dir.empty()) { return {}; }
   Config cfg;
-  if (!resolve(_hf_dir, cfg, nullptr, {}, _enc_variant)) { return {}; }
+  if (!resolve(model_root_(), cfg, nullptr, {}, _enc_variant)) { return {}; }
   if (cfg.enc_file.empty()) { return {}; }
   namespace mm = vpipe::model_memory;
   // The same question resolve_idle_policy_() will answer at the first
@@ -499,12 +506,10 @@ Ltx25ConditionerStage::process(RuntimeContext& ctx)
       // this reads both shapes the beat is allowed to take.
       std::string ref;
       if (vpipe::apply_model_select_beat(mp->data, ref) && !ref.empty()) {
-        // The beat carries a REFERENCE (a registry key or a path); the
-        // rest of this stage wants a checkpoint ROOT, since `resolve`
-        // walks it on disk. resolve_model_dir returns the ref unchanged
-        // when it is not a registry key, so a path beat still works.
-        const std::string d = vpipe::resolve_model_dir(this->session(), ref);
-        if (!d.empty()) { _hf_dir = d; }
+        // Stored as the REFERENCE, matching apply_constant() above --
+        // the pre-launch latch and this one have to agree, or the
+        // directory declared is not the one loaded.
+        _hf_dir = ref;
       }
     }
   }
@@ -544,7 +549,7 @@ Ltx25ConditionerStage::process(RuntimeContext& ctx)
                               "iport2; emitting nothing", this->id()));
     co_return;
   }
-  if (!ensure_loaded_(_hf_dir)) { co_return; }
+  if (!ensure_loaded_(model_root_())) { co_return; }
 
   // A negative is INERT on the distilled checkpoint -- it is
   // guidance-distilled, so there is no unconditional pass to blend with

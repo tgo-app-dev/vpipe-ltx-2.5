@@ -114,6 +114,20 @@ public:
   void reset_run_state() override;
 
 private:
+  // `_hf_dir` as a checkpoint ROOT on disk.
+  //
+  // What arrives -- from config or from a model-select beat -- is a
+  // model REFERENCE, which may be a registry key as easily as a path,
+  // while everything below (`resolve`, the encoder load, every claim
+  // keyed on a directory) walks the filesystem. resolve_model_dir()
+  // returns a plain path unchanged, so this is safe on both.
+  //
+  // The reference is KEPT rather than overwritten: resolving only where
+  // the beat arrived left the CONFIGURED spelling going straight to the
+  // filesystem as if it were a path, which is a registry key that
+  // silently is not a directory.
+  std::string model_root_() const;
+
   bool ensure_loaded_(const std::string& root);
 
   // Resolve _idle_action from the post-barrier picture. Idempotent.
