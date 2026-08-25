@@ -646,12 +646,7 @@ directly instead of inferred from pixels.
 Stated plainly, because everything above invites the assumption that it is
 finished:
 
-- **The audio reference has no PCM source in a graph.** `audio-vae-encode` and
-  the LTX audio encoder behind it are done and verified, but nothing in vpipe
-  turns an audio FILE into PCM beats: the stage's input comes from live
-  capture (`rtsp-capture -> audio-to-pcm`) or from another model's
-  `audio-vae-decode`. A file loader is a small stage that does not exist yet.
-- **A multi-frame video reference has no producer either.** `ref_latent0`
+- **A multi-frame video reference has no producer.** `ref_latent0`
   takes any number of latent frames and treats them as a prefix the clip
   continues from; `vae-encode` supplies exactly one image per beat, for every
   family. Single-image anchoring is what runs today.
@@ -662,8 +657,6 @@ finished:
   was structural — shape, all-finite, the schedule moves it, two seeds differ,
   it decodes to non-silent audio. A real golden means the whole 22B stack in
   PyTorch.
-- **Only short clips have been run**: 9 frames, at 256² and 768×448. The model
-  targets 121 frames, where both time and memory scale.
 - The **diffusion** VAE decoder is not ported (only the conv one); audio VAE
   `attn` blocks and any `rope_type` other than `split` are refused rather than
   approximated.

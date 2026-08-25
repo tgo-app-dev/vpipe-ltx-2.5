@@ -8,6 +8,13 @@ It is a plugin because the weights are under the **LTX-2.x Community
 License**, which is not vpipe's Apache-2.0. Keeping the model out of the
 vpipe tree keeps each under its own terms.
 
+## Start here
+
+**[docs/LTX-2.5.md](docs/LTX-2.5.md)** — what the model is, how to fetch it,
+and how to generate a clip with sound or from a picture, with the four
+ready-to-run pipelines in [docs/pipelines/](docs/pipelines/). Read that
+first; the rest of this file is how the port is built and what it is made of.
+
 ## Status
 
 **It generates.** Prompt to frames and a soundtrack, end to end, through the
@@ -88,21 +95,12 @@ is finished. It is not:
   appends a keyframe at the clip's last pixel frame, sharing every line of
   machinery with the first-frame path and pinned by the same golden, but no
   end-to-end run has wired two encoded images.
-- **Only short clips have been run**: 9 frames, at 256x256, 512x320 and
-  768x448. The model targets 121 frames, where both time and memory scale.
 - **The diffusion VAE decoder is not ported** — only the conv one. It is a
   second sampling loop.
 - Refused rather than approximated, and so also "not done": audio VAE `attn`
   blocks, and any `rope_type` other than `split`.
 - `duration_head` is a config passthrough, not an implementation.
 - Perf lever untried: the `bm128` qmm arm at LTX's token counts.
-
-## Start here
-
-**[docs/LTX-2.5.md](docs/LTX-2.5.md)** — what the model is, how to fetch it,
-and how to generate a clip with sound or from a picture, with the four
-ready-to-run pipelines in [docs/pipelines/](docs/pipelines/). Read that
-first; the rest of this file is how the port is built and what it is made of.
 
 ## Building
 
@@ -151,25 +149,6 @@ Both are **reported, not silent** — the clip that comes back is a different
 shape from the one asked for, and a graph downstream would otherwise discover
 that as a surprise. Rounding up rather than rejecting is deliberate too: a
 graph can be pointed at a different model family without being re-authored.
-
-## Getting the weights
-
-The repo is **gated**: accept the licence on HuggingFace first, then
-
-```sh
-hf download Lightricks/LTX-2.5 \
-  diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors \
-  text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors \
-  vae/ltx-2.5-video-vae-conv-bf16.safetensors \
-  vae/ltx-2.5-audio-vae-bf16.safetensors \
-  model_patches/ltx-2.5-duration-head-bf16.safetensors \
-  --local-dir <models>/Lightricks/LTX-2.5
-```
-
-That is ~65 GB. Fetching the whole repo pulls 174 GB, most of it packings
-(`int8-convrot`, `nvfp4`) that are ComfyUI-only and deliberately not read
-here. The catalogue entries pin exactly the files above, so
-`model-fetch` gets this right without being told.
 
 ## Shrinking the DiT
 
@@ -291,8 +270,9 @@ libraries.
 
 ## Licence
 
-This plugin's source is Apache-2.0. The **LTX-2.5 weights are not** — they
-are under the [LTX-2.x Community
-License](https://github.com/Lightricks/LTX-2/blob/main/LICENSE.md) (free for
-commercial use under $10M annual revenue; a paid agreement above that).
-Loading the plugin logs both.
+This plugin's source is Apache-2.0 — see [`LICENSE`](LICENSE), and
+[`NOTICE`](NOTICE) for the attribution a redistribution carries with it.
+The **LTX-2.5 weights are not** — they are under the
+[LTX-2.x Community License](https://github.com/Lightricks/LTX-2/blob/main/LICENSE.md)
+(free for commercial use under $10M annual revenue; a paid agreement
+above that). Loading the plugin logs both.

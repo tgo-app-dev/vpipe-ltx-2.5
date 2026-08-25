@@ -1,0 +1,25 @@
+vpipe-ltx-2.5
+Copyright 2026 T-Go LLC
+
+vpipe-ltx-2.5 is developed by T-Go LLC.
+https://github.com/tgo-app-dev/vpipe-ltx-2.5
+
+This product includes software developed at T-Go LLC.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may
+not use this file except in compliance with the License. You may obtain
+a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+This is a plugin for Vpipe (https://github.com/tgo-app-dev/vpipe), which
+is separately licensed under the Apache License, Version 2.0 and carries
+its own NOTICE.
+
+THE LTX-2.5 MODEL WEIGHTS ARE NOT COVERED BY THIS LICENSE. This
+repository contains source code only; it downloads no weights and
+redistributes none. The LTX-2.5 weights are published by Lightricks Ltd.
+under the LTX-2.x Community License
+(https://github.com/Lightricks/LTX-2/blob/main/LICENSE.md), and anyone
+obtaining or using them does so under those terms, which are not
+Apache-2.0 and carry their own conditions.
