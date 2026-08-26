@@ -91,7 +91,15 @@ const ConfigKey kAttrs[] = {
    .doc = "the LTX-2.5 checkpoint root. The text encoder is resolved out "
           "of it the same way the DiT is, so both stages take the same "
           "path. A model-select source on the `model` iport (2) overrides this",
-   .def_str = ""},
+   .def_str = "",
+   // A picker of its own, and membership of the shared-model channel so
+   // a model-select source offers this family. The video/VAE family
+   // registrations already put "ltx-2.5" on the channel for the HOST's
+   // generate-video and vae-decode; this is what gives THIS stage's own
+   // field the same list.
+   .suggest_db = vpipe::kModelRegistryDb,
+   .suggest_db_type = "ltx-2.5",
+   .model_channel = "diffusion-model"},
   {.key = "pad_to", .type = ConfigType::Int, .required = false,
    .doc = "the padded context width. The reference's "
           "TOKENIZER_MAX_LENGTH is 1024, which is also a whole number of "
