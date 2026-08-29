@@ -110,9 +110,36 @@ struct VideoAnchor {
     // Append tokens carrying PIXEL frame `index`'s positions. A closing
     // keyframe is this.
     kKeyframe,
+    // Append a WHOLE reference clip, at 1/`downscale` of the target's
+    // spatial resolution, with its positions stretched back over the
+    // target's extent. What an IC-LoRA reads.
+    //
+    // WHAT MAKES THIS A THIRD PLACEMENT rather than a keyframe with a
+    // smaller grid: the other two carry a latent on the target's own
+    // h x w, so a token's position is the target's. Here the reference
+    // is coarser, and each of its tokens stands for `downscale` x
+    // `downscale` of the target's cells -- so its spatial spans are
+    // multiplied by the factor and it is the SPAN, not the count, that
+    // has to line up. Leave the spans unscaled and the whole reference
+    // piles into the top-left corner of the frame; the run is clean and
+    // the output ignores most of the input.
+    //
+    // The tokens themselves are the reference's, unchanged. An
+    // implementation that dilates the latent into the target's grid and
+    // then drops the filler tokens (which is how the ComfyUI node
+    // states it) arrives at exactly the same spans; see the note in
+    // ltx25-conditioning.cc.
+    kIcLoraReference,
   };
   Placement placement = Placement::kLatentIndex;
   int index = 0;
+
+  // kIcLoraReference only: the target-over-reference SPATIAL ratio, from
+  // the adapter's `reference_downscale_factor` metadata. It must be the
+  // factor the adapter was TRAINED at -- it is what preserves the
+  // positional relationship the adapter learned, so a wrong value is
+  // not a resolution mismatch but a different model.
+  int downscale = 1;
 };
 
 // A reference soundtrack, ALREADY PATCHIFIED: [rows][channels * mel_bins]

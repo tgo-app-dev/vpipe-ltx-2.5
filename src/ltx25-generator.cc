@@ -7,6 +7,7 @@
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
 #include "generative-models/generative-model-manager.h"
+#include "stages/model-registry.h"
 
 #include <chrono>
 #include <cmath>
@@ -51,6 +52,7 @@ GenerationParams::from_flex(const FlexData& fd, std::string* err)
   real("ref_audio_strength", p.ref_audio_strength);
   boolean("audio", p.audio);
   boolean("duration_head", p.duration_head);
+  boolean("i8_gemm", p.i8_gemm);
   if (o.contains("lora")) {
     p.lora = std::string(o.at("lora").as_string(""));
     real("lora_scale", p.lora_scale);
@@ -165,6 +167,17 @@ Ltx25Generator::release_idle()
       mgr->pool_weights(_ws->dir());
     }
   }
+  // The adapter goes with the stack it adapts. Pooled the same way: the
+  // distilled-450 file is 8.9 GB, which is not a rounding error against
+  // anything, and a relaunch over the same adapter then pays no reload.
+  if (_lora_ws && _session != nullptr && _session->services() != nullptr) {
+    if (auto* mgr = _session->services()->generative_model_manager()) {
+      mgr->pool_weights(_lora_ws->dir());
+    }
+  }
+  _lora_adapter.reset();
+  _lora_ws.reset();
+  _lora_ref.clear();
   _dit.reset();
   _lf = _lh = _lw = _at = _tt = 0;
   _v_tokens = _a_tokens = 0;
@@ -173,6 +186,64 @@ Ltx25Generator::release_idle()
   _v_baked.clear();
   _a_baked.clear();
   _resident = 0;
+}
+
+bool
+Ltx25Generator::ensure_lora_(const std::string& ref, double scale,
+                             std::string* err)
+{
+  auto fail = [&](const std::string& m) {
+    if (err != nullptr) { *err = m; }
+    return false;
+  };
+  if (_lora_adapter && ref == _lora_ref && scale == _lora_scale) {
+    return true;
+  }
+  // An adapter is a FILE where every other model reference in this tree
+  // is a directory, and the registry record is what disambiguates two
+  // of them published from one repo. resolve_adapter_file handles all
+  // three shapes and refuses an ambiguous directory rather than picking.
+  std::string rerr;
+  const std::string file = vpipe::resolve_adapter_file(_session, ref, &rerr);
+  if (file.empty()) { return fail(rerr.empty() ? ("cannot resolve '" + ref +
+                                                  "'") : rerr); }
+  // Through the MANAGER, like every other checkpoint here: two graphs
+  // over one adapter then share it, and the bytes are visible to the
+  // accounting. Note the adapter is a peer of the 39 GB DiT, not part
+  // of it -- the distilled-450 file alone is 8.9 GB.
+  auto ws = vpipe::genai::open_weight_set(file, _session);
+  if (!ws) { return fail("cannot open the adapter at " + file); }
+  std::vector<std::string> unmapped;
+  std::string lerr;
+  auto a = LoraAdapter::load(*ws, _ops.mc(), _cfg.dit, scale, file,
+                             &unmapped, &lerr);
+  if (!a) {
+    std::string m = "loading " + file + ": " + lerr;
+    for (std::size_t i = 0; i < unmapped.size() && i < 4; ++i) {
+      m += "\n    unmapped: " + unmapped[i];
+    }
+    return fail(m);
+  }
+  log_(fmt("LoRA {}: {} adapted linears, rank up to {}, {:.1f} MB. Applied "
+           "at RUNTIME -- the base weights are untouched, so a streamed or "
+           "quantized DiT takes it unchanged", file, a->modules(),
+           a->max_rank(), (double)a->bytes() / 1e6)());
+  // The WEIGHT SET has to outlive the adapter: its pairs are buffers the
+  // set owns. Kept alive by the manager for as long as any tensor taken
+  // from it is in use -- which here is the adapter's whole lifetime, so
+  // the handle is held beside it.
+  // Whatever was held before is being replaced, not added to.
+  if (_lora_adapter) { _resident -= _lora_adapter->bytes(); }
+  _lora_ws = std::move(ws);
+  _lora_adapter = std::move(a);
+  _lora_ref = ref;
+  _lora_scale = scale;
+  // The adapter is weights this generator HOLDS, so the manager has to
+  // see them. 8.9 GB for the distilled file -- reporting only the DiT
+  // would put a fifth of this graph's footprint outside the accounting,
+  // which is the same class of error a model opening its own mmap makes.
+  _resident += _lora_adapter->bytes();
+  return true;
 }
 
 bool
@@ -192,6 +263,43 @@ Ltx25Generator::generate(const VideoGenRequest& req, VideoGenResult* out)
                                       ? *req.model_config : FlexData{},
                                   &perr);
   if (!perr.empty()) { warn_("model_config: " + perr); }
+
+  // ---- the adapter ----------------------------------------------------
+  //
+  // Resolved HERE, before the geometry: the rank and the widest adapted
+  // output size the two scratch planes the delta is computed in, and
+  // those are allocated by set_geometry.
+  // The int8 tier, before anything is encoded. Per-graph rather than
+  // per-load: it costs no memory and holds no weights, so a second
+  // generation can ask for it and a third can drop it.
+  _ops.set_i8_gemm(p.i8_gemm);
+
+  std::shared_ptr<const LoraAdapter> lora;
+  if (!p.lora.empty()) {
+    std::string lerr;
+    if (!ensure_lora_(p.lora, p.lora_scale, &lerr)) {
+      warn_("lora: " + lerr);
+      return false;
+    }
+    lora = _lora_adapter;
+    // A reference trained at a LOWER frame rate than the target needs
+    // its time spans re-spaced and shifted, which this port does not do.
+    // Refused rather than run at the target's spacing: that places every
+    // reference token at the wrong second and the result is a clean clip
+    // that ignored its reference. Nothing published carries this key --
+    // the pixel spatial upscaler has only the spatial factor.
+    if (lora->reference_temporal_scale_factor() != 1) {
+      warn_(fmt("this adapter declares reference_temporal_scale_factor {}, "
+                "meaning its reference runs at 1/{} of the target's frame "
+                "rate. This port places reference tokens at the target's "
+                "own spacing and does not implement the temporal "
+                "re-spacing, so it would put every reference frame at the "
+                "wrong time",
+                lora->reference_temporal_scale_factor(),
+                lora->reference_temporal_scale_factor())());
+      return false;
+    }
+  }
 
   // ---- the conditioning ----------------------------------------------
   const DitConfig& d = _cfg.dit;
@@ -291,8 +399,29 @@ Ltx25Generator::generate(const VideoGenRequest& req, VideoGenResult* out)
   std::vector<AudioAnchor> arefs;
   const int zc_in = d.in_channels;
 
+  // An IC-LoRA reads its reference at 1/factor of the target's grid, so
+  // ref_latent0 changes meaning when one is loaded -- it stops being a
+  // first-frame anchor that OVERWRITES the clip and becomes a whole
+  // reference clip APPENDED beside it. Nothing else on the request says
+  // which, and getting it from the adapter is what makes the two
+  // impossible to confuse.
+  const int ic_factor = (lora && lora->wants_reference())
+                            ? lora->reference_downscale_factor()
+                            : 1;
+  const int ref_h = (ic_factor > 1) ? lh / ic_factor : lh;
+  const int ref_w = (ic_factor > 1) ? lw / ic_factor : lw;
+  if (ic_factor > 1 && (lh % ic_factor != 0 || lw % ic_factor != 0)) {
+    warn_(fmt("this IC-LoRA downscales its reference by {}, but the clip's "
+              "latent grid is {}x{} and does not divide by it. Choose an "
+              "output size that does -- {}x{} pixels is a multiple of {}",
+              ic_factor, lh, lw, kSpatialCompression * ic_factor,
+              kSpatialCompression * ic_factor, kSpatialCompression *
+              ic_factor)());
+    return false;
+  }
+
   auto latent_ok = [&](const std::vector<int>& shape, const char* what,
-                       int* frames) {
+                       int* frames, int want_h, int want_w) {
     if (shape.size() != 4) {
       warn_(fmt("{} is {}-dimensional; this family wants a vae-encode's "
                 "[z, T, h, w]. Ignoring it", what, shape.size())());
@@ -304,10 +433,15 @@ Ltx25Generator::generate(const VideoGenRequest& req, VideoGenResult* out)
                 zc_in)());
       return false;
     }
-    if (shape[2] != lh || shape[3] != lw) {
-      warn_(fmt("{} is {}x{} in latent space but this clip is {}x{}. Encode "
-                "the reference at the SAME resolution as the output; "
-                "ignoring it", what, shape[2], shape[3], lh, lw)());
+    if (shape[2] != want_h || shape[3] != want_w) {
+      warn_(fmt("{} is {}x{} in latent space but this run wants {}x{}. {}; "
+                "ignoring it", what, shape[2], shape[3], want_h, want_w,
+                (want_h == lh)
+                    ? std::string("Encode the reference at the SAME "
+                                  "resolution as the output")
+                    : fmt("This IC-LoRA downscales its reference by {}, so "
+                          "encode the source clip at 1/{} of the output's "
+                          "resolution", ic_factor, ic_factor)())());
       return false;
     }
     *frames = shape[1];
@@ -316,10 +450,31 @@ Ltx25Generator::generate(const VideoGenRequest& req, VideoGenResult* out)
 
   if (req.ref != nullptr) {
     int rf = 0;
-    if (latent_ok(req.ref_shape, "the reference on ref_latent0", &rf)) {
+    if (latent_ok(req.ref_shape, "the reference on ref_latent0", &rf, ref_h,
+                  ref_w)) {
       if (rf > lf) {
         warn_(fmt("the reference on ref_latent0 is {} latent frames but the "
                   "clip is only {}; ignoring it", rf, lf)());
+      } else if (ic_factor > 1) {
+        VideoAnchor a;
+        a.latent = req.ref;
+        a.channels = zc_in;
+        a.frames = rf; a.h = ref_h; a.w = ref_w;
+        a.strength = p.ref_strength;
+        // APPENDED, not written into the grid. The adapter was trained
+        // with the reference and the target side by side in one
+        // sequence, attending across both; overwriting the target with
+        // it would instead hand the model its own answer.
+        a.placement = VideoAnchor::Placement::kIcLoraReference;
+        a.downscale = ic_factor;
+        vrefs.push_back(a);
+        log_(fmt("an IC-LoRA REFERENCE CLIP on ref_latent0: {} latent "
+                 "frame(s) at {}x{} (1/{} of the {}x{} output), appended "
+                 "beside the clip at strength {:.2f}. Its spatial "
+                 "positions are stretched by {} so it covers the whole "
+                 "frame",
+                 rf, ref_h, ref_w, ic_factor, lh, lw, p.ref_strength,
+                 ic_factor)());
       } else {
         VideoAnchor a;
         a.latent = req.ref;
@@ -342,7 +497,10 @@ Ltx25Generator::generate(const VideoGenRequest& req, VideoGenResult* out)
   }
   if (req.ref_last != nullptr) {
     int rf = 0;
-    if (latent_ok(req.ref_last_shape, "the anchor on ref_latent1", &rf)) {
+    // ALWAYS the target's own grid: a closing keyframe is ordinary
+    // conditioning and is not downscaled by the adapter.
+    if (latent_ok(req.ref_last_shape, "the anchor on ref_latent1", &rf, lh,
+                  lw)) {
       VideoAnchor a;
       a.latent = req.ref_last;
       a.channels = zc_in;
@@ -394,16 +552,38 @@ Ltx25Generator::generate(const VideoGenRequest& req, VideoGenResult* out)
     }
   }
   if (req.ref_video_rows != nullptr && req.n_ref_video_rows > 0) {
-    // Deliberately not read. That port carries MiniMax-H3's Ref2VA rows
-    // from a video-ref-encoder; LTX's own reference-video conditioning
-    // is IC-LoRA, which needs a LoRA this family does not load and a
-    // latent no stage in this tree emits. Wiring it would be untested
-    // code claiming a feature. A VIDEO reference here goes on
-    // ref_latent0 instead, as a multi-frame latent.
+    // Deliberately not read. That port carries MiniMax-H3's Ref2VA ROWS
+    // from a video-ref-encoder -- a different representation, not a VAE
+    // latent -- and nothing in this tree emits one for LTX. LTX's own
+    // reference-video conditioning is the IC-LoRA path, and it takes an
+    // ordinary vae-encode latent on ref_latent0.
     warn_(fmt("ref_video_rows is wired ({} rows) but LTX-2.5 does not read "
               "it: that port carries another family's reference rows. For a "
-              "video reference, encode the clip and wire it to ref_latent0",
-              req.n_ref_video_rows)());
+              "video reference, encode the clip and wire it to ref_latent0 "
+              "-- with an IC-LoRA loaded that port becomes the reference "
+              "clip", req.n_ref_video_rows)());
+  }
+
+  // AN IC-LORA WITH NO REFERENCE IS THE SILENT FAILURE this whole
+  // adapter path has to guard. The upscaler is trained with the source
+  // clip in context; without one it does not error, it renders a
+  // plausible video that ignored the input it was asked to upscale, and
+  // nothing downstream -- not a shape, not a norm, not a golden -- can
+  // say so. Refused with the port named.
+  bool have_ic_ref = false;
+  for (const VideoAnchor& a : vrefs) {
+    if (a.placement == VideoAnchor::Placement::kIcLoraReference) {
+      have_ic_ref = true;
+    }
+  }
+  if (lora && lora->wants_reference() && !have_ic_ref) {
+    warn_(fmt("this adapter is an IC-LoRA (it expects the reference at "
+              "1/{} of the target's resolution) but no video reference is "
+              "wired. Encode the source clip and wire it to "
+              "generate-video's ref_latent0; running without one would "
+              "generate an unrelated clip rather than upscale anything",
+              lora->reference_downscale_factor())());
+    return false;
   }
 
   BuiltConditioning bc;
@@ -427,10 +607,21 @@ Ltx25Generator::generate(const VideoGenRequest& req, VideoGenResult* out)
   // remodulated -- the bake released the projections. Rebuilding is the
   // honest answer and is cheap: the weight set still holds the bytes, so
   // this rebinds rather than re-reads.
+  // A CHANGED ADAPTER forces the same rebuild, and for the same reason:
+  // the bake released the adaLN projections, so an adapter arriving
+  // after it would reach the blocks and not the modulation. set_lora
+  // refuses that rather than half-applying, so the rebuild is what makes
+  // switching adapters mid-graph work at all.
+  const bool lora_changed = (_dit->lora() != lora.get());
   if (_dit->adaln_baked() &&
-      (bc.cond.v_levels != _v_baked || bc.cond.a_levels != _a_baked)) {
-    log_("the reference strengths changed, so the baked adaLN schedule no "
-         "longer covers this request; rebuilding the DiT");
+      (lora_changed || bc.cond.v_levels != _v_baked ||
+       bc.cond.a_levels != _a_baked)) {
+    log_(lora_changed
+             ? std::string("the LoRA changed, so the baked adaLN schedule "
+                           "was modulated without it; rebuilding the DiT")
+             : std::string("the reference strengths changed, so the baked "
+                           "adaLN schedule no longer covers this request; "
+                           "rebuilding the DiT"));
     std::string lerr;
     _dit = Ltx25Dit::load(_cfg, _ws, _ops, _stream_blocks,
                           _plan_w, _plan_h, _plan_frames, &lerr,
@@ -442,6 +633,18 @@ Ltx25Generator::generate(const VideoGenRequest& req, VideoGenResult* out)
     _lf = _lh = _lw = _at = _tt = 0;
     _v_baked.clear();
     _a_baked.clear();
+  }
+
+  // BEFORE set_geometry, which allocates the arena the delta is computed
+  // in -- and before bake_adaln, which releases the eight chains this
+  // also adapts. Both orderings are enforced inside set_lora; this is
+  // just the one place that satisfies them.
+  {
+    std::string serr;
+    if (!_dit->set_lora(lora, &serr)) {
+      warn_("lora: " + serr);
+      return false;
+    }
   }
 
   if (lf != _lf || lh != _lh || lw != _lw || at != _at ||

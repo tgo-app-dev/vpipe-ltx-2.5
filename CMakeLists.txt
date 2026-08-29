@@ -39,6 +39,7 @@ add_library(ltx25_dit_obj OBJECT
     src/ltx25-metal-ops.cc
     src/ltx25-block-ref.cc
     src/ltx25-config.cc
+    src/ltx25-lora.cc
     src/ltx25-rope.cc)
 target_include_directories(ltx25_dit_obj PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(ltx25_dit_obj PRIVATE vpipe::vpipe)
@@ -96,6 +97,7 @@ enable_testing()
 add_executable(ltx25-config-test
     tests/ltx25-config-test.cc
     src/ltx25-config.cc
+    src/ltx25-lora.cc
     src/ltx25-quant-family.cc)
 target_include_directories(ltx25-config-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(ltx25-config-test PRIVATE vpipe::vpipe)
@@ -104,6 +106,21 @@ if(NOT MSVC)
     target_compile_options(ltx25-config-test PRIVATE -Wall -Werror)
 endif()
 add_test(NAME ltx25-config COMMAND ltx25-config-test)
+
+# The adapter loader, against the REAL published adapters. Both paths
+# are optional and the test says which half it skipped.
+add_executable(ltx25-lora-test
+    tests/ltx25-lora-test.cc
+    src/ltx25-config.cc
+    src/ltx25-lora.cc
+    src/ltx25-quant-family.cc)
+target_include_directories(ltx25-lora-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(ltx25-lora-test PRIVATE vpipe::vpipe)
+target_compile_features(ltx25-lora-test PRIVATE cxx_std_20)
+if(NOT MSVC)
+    target_compile_options(ltx25-lora-test PRIVATE -Wall -Werror)
+endif()
+add_test(NAME ltx25-lora COMMAND ltx25-lora-test)
 
 add_executable(ltx25-rope-test
     tests/ltx25-rope-test.cc
@@ -206,6 +223,47 @@ if(NOT MSVC)
 endif()
 add_test(NAME ltx25-block-metal COMMAND ltx25-block-metal-test)
 
+# The adapter APPLY path: runtime `y += (x@A^T)@B^T` against the CPU
+# reference with `W + B@A` folded in. Needs no checkpoint and no
+# goldens -- the weights are drawn from a fixed PRNG -- so unlike
+# ltx25-lora-test it never skips.
+add_executable(ltx25-lora-apply-test
+    tests/ltx25-lora-apply-test.cc
+    src/ltx25-block-metal.cc
+    src/ltx25-metal-ops.cc
+    src/ltx25-block-ref.cc
+    src/ltx25-lora.cc
+    src/ltx25-config.cc
+    src/ltx25-quant-family.cc
+    src/ltx25-rope.cc
+    $<TARGET_OBJECTS:ltx25_kernels_bf16_obj>)
+target_include_directories(ltx25-lora-apply-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(ltx25-lora-apply-test PRIVATE vpipe::vpipe)
+target_compile_features(ltx25-lora-apply-test PRIVATE cxx_std_20)
+if(NOT MSVC)
+    target_compile_options(ltx25-lora-apply-test PRIVATE -Wall -Werror)
+endif()
+add_test(NAME ltx25-lora-apply COMMAND ltx25-lora-apply-test)
+
+# The accelerated int8 tier against the bf16 tiles it sits on. Needs
+# matrix cores and skips loudly without them; no checkpoint, so it never
+# skips vacuously on a box that has them.
+add_executable(ltx25-i8-gemm-test
+    tests/ltx25-i8-gemm-test.cc
+    src/ltx25-metal-ops.cc
+    src/ltx25-config.cc
+    src/ltx25-quant-family.cc
+    $<TARGET_OBJECTS:ltx25_kernels_bf16_obj>)
+target_include_directories(ltx25-i8-gemm-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(ltx25-i8-gemm-test PRIVATE vpipe::vpipe)
+target_compile_features(ltx25-i8-gemm-test PRIVATE cxx_std_20)
+if(NOT MSVC)
+    target_compile_options(ltx25-i8-gemm-test PRIVATE -Wall -Werror)
+endif()
+add_test(NAME ltx25-i8-gemm COMMAND ltx25-i8-gemm-test)
+
 add_executable(ltx25-dit-block0-test
     tests/ltx25-dit-block0-test.cc
     src/ltx25-dit-weights.cc
@@ -213,6 +271,7 @@ add_executable(ltx25-dit-block0-test
     src/ltx25-metal-ops.cc
     src/ltx25-block-ref.cc
     src/ltx25-config.cc
+    src/ltx25-lora.cc
     src/ltx25-rope.cc
     $<TARGET_OBJECTS:ltx25_kernels_bf16_obj>)
 target_include_directories(ltx25-dit-block0-test PRIVATE
@@ -238,6 +297,23 @@ if(NOT MSVC)
     target_compile_options(ltx25-trunk-test PRIVATE -Wall -Werror)
 endif()
 add_test(NAME ltx25-trunk COMMAND ltx25-trunk-test)
+
+# The adapter on the TRUNK: the host adaLN chain (a SECOND implementation
+# of the delta, not the GPU op) plus the naming of the projections.
+# Writes its own synthetic adapter, and loads only the trunk, so it costs
+# ~0.85 GB rather than the 39 GB stack.
+add_executable(ltx25-lora-trunk-test
+    tests/ltx25-lora-trunk-test.cc
+    $<TARGET_OBJECTS:ltx25_dit_obj>
+    $<TARGET_OBJECTS:ltx25_kernels_bf16_obj>)
+target_include_directories(ltx25-lora-trunk-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(ltx25-lora-trunk-test PRIVATE vpipe::vpipe)
+target_compile_features(ltx25-lora-trunk-test PRIVATE cxx_std_20)
+if(NOT MSVC)
+    target_compile_options(ltx25-lora-trunk-test PRIVATE -Wall -Werror)
+endif()
+add_test(NAME ltx25-lora-trunk COMMAND ltx25-lora-trunk-test)
 
 add_executable(ltx25-dit-stack-test
     tests/ltx25-dit-stack-test.cc

@@ -4,9 +4,11 @@
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/compute-library.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
+#include "generative-models/shared/i8-gemm.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -99,6 +101,58 @@ public:
               const vpipe::metal_compute::SharedBuffer* bias,
               const vpipe::metal_compute::SharedBuffer& y,
               int M, int K, int N) const;
+
+  // y[M][N] += (x[M][K] @ A[rank][K]^T) @ B[N][rank]^T -- a low-rank
+  // adapter's contribution to a linear that has ALREADY been computed
+  // into `y`.
+  //
+  // Two ordinary GEMMs and an add, because that is all it is: `a` and
+  // `b` sit in the same [out][in] order every other weight here does,
+  // so the existing dense path serves both halves and nothing new is
+  // dispatched. It is applied to the OUTPUT rather than folded into the
+  // weight so a streamed or quantized base is untouched -- see
+  // ltx25-lora.h for why that is not negotiable.
+  //
+  // `r` and `d` are CALLER scratch, [M][rank] and [M][N]. They are
+  // passed in rather than owned here because the whole 48-block stack
+  // shares one arena: an op that allocated its own would put a
+  // 267 MB buffer behind every block.
+  //
+  // The cost is 2*rank/K of the linear it rides on -- 1.6% at rank 32,
+  // ~22% at the distilled adapter's rank 450.
+  void lora_add(vpipe::metal_compute::ComputeEncoder& enc,
+                const vpipe::metal_compute::SharedBuffer& x,
+                const vpipe::metal_compute::SharedBuffer& a,
+                const vpipe::metal_compute::SharedBuffer& b,
+                const vpipe::metal_compute::SharedBuffer& y,
+                const vpipe::metal_compute::SharedBuffer& r,
+                const vpipe::metal_compute::SharedBuffer& d,
+                int M, int K, int N, int rank) const;
+
+  // Will lora_add take the matrix-core pair for this shape, or its
+  // portable linear+linear+add? Exposed because the two paths differ
+  // only in speed, so a correctness test that did not ASSERT this would
+  // pass while measuring the fallback -- which is what the shipped
+  // shape table did: every rank in it is under the 16-column floor.
+  bool lora_on_matrix_cores(int M, int K, int N, int rank) const noexcept;
+
+  // Force the adapter onto one path or the other. The A/B hook for the
+  // pair above, and the only way to measure it: VPIPE_LTX25_NO_LORA_MMA
+  // is read once at init, so a process that wants both arms interleaved
+  // -- which is the only ordering that measures anything, see
+  // dense_mma_'s note -- has to toggle it per round.
+  void set_lora_matrix_cores(bool on) noexcept { _lora_mma_off = !on; }
+
+  // Turn the accelerated int8 tier on for this model. Rebuilds the
+  // context, because whether it is wanted is a per-graph decision and
+  // the env override is read in the constructor.
+  void set_i8_gemm(bool on);
+
+  // Will `linear` take the int8 tier for this shape? Same reason
+  // lora_on_matrix_cores exists: the tiers compute the same product to
+  // within their tolerance, so a test that did not ASSERT the path would
+  // pass while measuring another one.
+  bool i8_takes(int M, int K, int N) const noexcept;
 
   // Did the affine qmm kernels resolve at init? They are libvpipe's,
   // embedded in the host binary and reached by name, so this is only
@@ -558,9 +612,61 @@ private:
   // so Metal's hazard tracking orders each dequant against the matmul
   // that reads it; a concurrent encoder would need one scratch per
   // in-flight GEMM.
+  // ACCELERATED INT8, one tier below the dense matmul2d and taking the
+  // SAME weight -- the dense one for an f16/bf16 checkpoint, `_w_deq`
+  // for a quantized one, so it composes with dequant-once rather than
+  // replacing it. The activation is quantized per (row, 512-group) on
+  // the fly and the weight per (out-channel, 512-group) per call, so the
+  // mode has no persistent memory cost.
+  //
+  // LOSSY -- int8, rel-L2 ~1e-2 per GEMM -- so it is OPT-IN and off by
+  // default, exactly as in the in-tree DiTs. `i8_gemm` in the graph's
+  // config turns it on; VPIPE_I8_GEMM=0|1 overrides either way, which is
+  // how it was A/B'd.
+  //
+  // mutable because I8GemmContext::gemm grows its own scratches, and
+  // every dispatch helper here is const.
+  mutable std::unique_ptr<vpipe::genai::I8GemmContext> _i8;
+
   vpipe::metal_compute::ComputeLibrary  _lib_dequant;
   vpipe::metal_compute::ComputeFunction _fn_dequant[2][2];  // [w4|w8][g32|g64]
   mutable vpipe::metal_compute::SharedBuffer _w_deq;
+
+  // The adapter's two halves on the matrix cores, folding the accumulate
+  // into the second tile instead of materializing the delta.
+  //
+  // lora_add's portable form is linear + linear + add, and the add is
+  // what costs: the second GEMM writes [M][N] to `d`, then the add reads
+  // `d`, reads `y` and writes `y` -- 4 passes over the projection's full
+  // output for a delta whose arithmetic is 2*rank/K of the linear it
+  // rides on. At the feed-forward's N=16384 that scratch is as large as
+  // `ff` itself.
+  //
+  // The `_acc` tile seeds its cooperative tensor FROM y and stores once,
+  // so the delta lands in the register file and `d` is never written.
+  // The `_scaled` tile is the A half, and at 64 wide it is the one that
+  // fits the x2 upscaler's rank 32 without three quarters of the tile
+  // hanging past N -- the plain 128-region tile computes four times the
+  // columns that exist.
+  //
+  // The scale rides on A at LOAD here (see ltx25-lora.h), so the scaled
+  // tile is dispatched at 1.0 and is being used for its SHAPE, not its
+  // coefficient.
+  //
+  // Returns false for a shape it will not take -- a rank under the
+  // 16-column floor, a missing entry point, or an operand past the 2 GB
+  // line -- and lora_add then runs the portable form. VPIPE_LTX25_NO_LORA_MMA
+  // forces that, which is how the pair was A/B'd.
+  vpipe::metal_compute::ComputeFunction _fn_lora_a64, _fn_lora_a128;
+  vpipe::metal_compute::ComputeFunction _fn_lora_b128, _fn_lora_b256;
+  bool _lora_mma_off = false;
+  bool lora_mma_(vpipe::metal_compute::ComputeEncoder& enc,
+                 const vpipe::metal_compute::SharedBuffer& x,
+                 const vpipe::metal_compute::SharedBuffer& a,
+                 const vpipe::metal_compute::SharedBuffer& b,
+                 const vpipe::metal_compute::SharedBuffer& y,
+                 const vpipe::metal_compute::SharedBuffer& r,
+                 int M, int K, int N, int rank) const;
 
   // Is this shape safe and worth running on the matrix cores? Checks the
   // tile threshold AND the 2 GB operand limit below.

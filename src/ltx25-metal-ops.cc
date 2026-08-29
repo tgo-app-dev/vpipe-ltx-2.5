@@ -205,6 +205,16 @@ MetalOps::init(MetalCompute* mc, std::string* err)
           _lib_dense_mma.function("dense_gemm_mma_t_n128x256_f16");
       _fn_dense_mma_tn2 =
           _lib_dense_mma.function("dense_gemm_mma_t_n128x256_tn2_f16");
+      // The adapter pair. OPTIONAL on the same terms as the tiles above:
+      // absent, lora_add runs its portable linear+linear+add.
+      _fn_lora_a64  = _lib_dense_mma.function("dense_gemm_mma_t_scaled_f16");
+      _fn_lora_a128 =
+          _lib_dense_mma.function("dense_gemm_mma_t_n128_scaled_f16");
+      _fn_lora_b128 =
+          _lib_dense_mma.function("dense_gemm_mma_t_n128_acc_f16");
+      _fn_lora_b256 =
+          _lib_dense_mma.function("dense_gemm_mma_t_n128x256_acc_f16");
+      _lora_mma_off = std::getenv("VPIPE_LTX25_NO_LORA_MMA") != nullptr;
     }
     if (const char* e = std::getenv("VPIPE_LTX25_MMA_MIN_M")) {
       const int v = std::atoi(e);
@@ -364,6 +374,17 @@ MetalOps::dense_mma_(ComputeEncoder& enc, const SharedBuffer& x,
                      const SharedBuffer& w, const SharedBuffer* bias,
                      const SharedBuffer& y, int M, int K, int N) const
 {
+  // The int8 tier first, over the SAME dense weight the tiles below
+  // would have read -- so it composes with dequant-once instead of
+  // replacing it, and a shape it declines falls through with nothing
+  // encoded. Its own accepts() carries the gates: M >= 1024, K >= 1024
+  // and a K that is a whole number of 512-groups or nearly so.
+  if (_i8 && _i8->gemm(enc, x, 0, w, y, 0, M, N, K)) {
+    // The int8 kernel has no bias epilogue either, so the bias is the
+    // same second pass the tiles below take.
+    if (bias != nullptr) { bias_add(enc, y, *bias, M, N); }
+    return;
+  }
   // Which N-region a threadgroup owns: 128, 256, or the TN=2 tile's 512.
   //
   // The sibling DiTs pick this from K alone, and that rule is WRONG here
@@ -718,6 +739,114 @@ MetalOps::rms_norm_out(ComputeEncoder& enc, const SharedBuffer& x,
   enc.set_constant(2, N);
   enc.set_constant(3, 1.0e-6f);
   enc.dispatch({(unsigned)(rows * 256), 1, 1}, {256, 1, 1});
+}
+
+void
+MetalOps::set_i8_gemm(bool on)
+{
+  // Rebuilt rather than flagged: the env override is read in the
+  // constructor, so VPIPE_I8_GEMM=1 has to be able to turn the tier on
+  // for a graph whose config left it off, and =0 to take it away from
+  // one that asked. That is the A/B.
+  if (_mc == nullptr) { return; }
+  _i8 = std::make_unique<vpipe::genai::I8GemmContext>(_mc, on, /*bf16=*/true);
+  if (!_i8->enabled()) { _i8.reset(); }
+}
+
+bool
+MetalOps::i8_takes(int M, int K, int N) const noexcept
+{
+  // The int8 tier sits UNDER mma_eligible_, not beside it: it is reached
+  // only from dense_mma_, which the callers gate on that already. Asking
+  // it here too keeps the predicate honest for a test that calls it
+  // directly with a shape the tiles would have refused.
+  return _i8 && mma_eligible_(M, K, N) && _i8->accepts(M, N, K);
+}
+
+bool
+MetalOps::lora_on_matrix_cores(int M, int K, int N, int rank) const noexcept
+{
+  if (_lora_mma_off || !_fn_lora_b128.valid()) { return false; }
+  if (rank <= 64 ? !_fn_lora_a64.valid() && !_fn_lora_a128.valid()
+                 : !_fn_lora_a128.valid()) {
+    return false;
+  }
+  // BOTH halves, because both are matmul2d and both address through a
+  // 32-bit byte offset. Waiving this for the delta on the grounds that
+  // it is small is exactly the mistake that put the MiniMax-H3 DiT's
+  // adapter past the line while its base projection stayed under: the A
+  // half reads the SAME [M][K] activation the base linear just read, and
+  // its own N -- the rank -- is far too small to bound anything. The
+  // A half's N being the rank is also what declines a rank under
+  // mma_eligible_'s 16-column floor.
+  return mma_eligible_(M, K, rank) && mma_eligible_(M, rank, N);
+}
+
+bool
+MetalOps::lora_mma_(ComputeEncoder& enc, const SharedBuffer& x,
+                    const SharedBuffer& a, const SharedBuffer& b,
+                    const SharedBuffer& y, const SharedBuffer& r,
+                    int M, int K, int N, int rank) const
+{
+  if (!lora_on_matrix_cores(M, K, N, rank)) { return false; }
+  const vpipe::metal_compute::ComputeFunction* fa =
+      (rank <= 64 && _fn_lora_a64.valid()) ? &_fn_lora_a64 : &_fn_lora_a128;
+  // r = x A^T. Scale 1: ltx25-lora.h folds `lora_scale` into A at load,
+  // so this tile is here for its 64-wide shape, not its coefficient.
+  const int BA = (fa == &_fn_lora_a64) ? 64 : 128;
+  const unsigned twa = (BA == 128) ? 256u : 128u;
+  enc.set_function(*fa);
+  enc.set_buffer(0, x);
+  enc.set_buffer(1, a);
+  enc.set_buffer(2, a);          // bias slot, unread
+  enc.set_buffer(3, r);
+  enc.set_constant(4, K);
+  enc.set_constant(5, rank);
+  enc.set_constant(6, M);
+  enc.set_constant(7, 0);
+  enc.set_constant(8, 1.0f);
+  enc.dispatch({(unsigned)(((rank + BA - 1) / BA) * twa),
+                (unsigned)((M + BA - 1) / BA), 1}, {twa, 1, 1});
+  // y += r B^T, folded in the register file. Its K is the rank -- a very
+  // shallow contraction -- so the wider N-region has more to amortize
+  // the weight loads against; the narrow one is kept for a rank deep
+  // enough to pay for itself, which is the sibling DiT's rule and is NOT
+  // measured here. dense_mma_'s note explains why a rule fitted to
+  // another model is not evidence for this one: it is a fallback that
+  // computes the same answer either way, and VPIPE_LTX25_MMA_TILE does
+  // not reach it, so a future measurement can move it freely.
+  const bool wide = (rank < 256) && _fn_lora_b256.valid();
+  const int BB = wide ? 256 : 128;
+  enc.set_function(wide ? _fn_lora_b256 : _fn_lora_b128);
+  enc.set_buffer(0, r);
+  enc.set_buffer(1, b);
+  enc.set_buffer(2, b);          // bias slot, unread
+  enc.set_buffer(3, y);
+  enc.set_constant(4, rank);
+  enc.set_constant(5, N);
+  enc.set_constant(6, M);
+  enc.set_constant(7, 0);
+  enc.set_constant(8, 1.0f);     // the accumulate has nowhere for a scale
+  enc.dispatch({(unsigned)(((N + BB - 1) / BB) * 256),
+                (unsigned)((M + 127) / 128), 1}, {256, 1, 1});
+  return true;
+}
+
+void
+MetalOps::lora_add(ComputeEncoder& enc, const SharedBuffer& x,
+                   const SharedBuffer& a, const SharedBuffer& b,
+                   const SharedBuffer& y, const SharedBuffer& r,
+                   const SharedBuffer& d, int M, int K, int N,
+                   int rank) const
+{
+  if (M <= 0 || K <= 0 || N <= 0 || rank <= 0) { return; }
+  // The matrix-core pair writes y once and never touches `d`.
+  if (lora_mma_(enc, x, a, b, y, r, M, K, N, rank)) { return; }
+  // Down, then up, then accumulate. No bias on either half: a LoRA is a
+  // pure delta and the base linear already applied the bias.
+  linear(enc, x, a, nullptr, r, M, K, rank);
+  linear(enc, r, b, nullptr, d, M, rank, N);
+  add(enc, y, 0, d, 0, y, M * N, 0);
 }
 
 void

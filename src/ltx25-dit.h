@@ -6,6 +6,7 @@
 #include "ltx25-config.h"
 #include "ltx25-connector.h"
 #include "ltx25-dit-weights.h"
+#include "ltx25-lora.h"
 #include "ltx25-metal-ops.h"
 #include "ltx25-rope.h"
 
@@ -196,6 +197,25 @@ public:
   bool bake_adaln(const std::vector<double>& sigmas, std::string* err);
   bool adaln_baked() const noexcept { return _baked; }
 
+  // Adopt a runtime LoRA, or drop one (null).
+  //
+  // ORDER MATTERS TWICE, and both are enforced here rather than left to
+  // the caller:
+  //
+  //   * BEFORE set_geometry(). The adapter's rank and widest output size
+  //     the two scratch planes the delta is computed in, and the arena
+  //     is allocated there.
+  //   * BEFORE bake_adaln(). The bake precomputes every modulation the
+  //     schedule will ask for and then RELEASES the adaLN projections;
+  //     an adapter arriving after that would adapt eight chains nothing
+  //     reads again, silently leaving the model's own modulation in
+  //     place.
+  //
+  // Refused rather than reordered: adapting half a model is a run that
+  // finishes and a result no downstream check can question.
+  bool set_lora(std::shared_ptr<const LoraAdapter> lora, std::string* err);
+  const LoraAdapter* lora() const noexcept { return _lora.get(); }
+
   // 0 when the blocks are dense bf16; 32 or 64 for a quantized pack.
   int quant_group() const noexcept { return _quant_group; }
 
@@ -296,7 +316,12 @@ public:
   std::vector<float> adaln_public(const DitTrunk::AdaLN& a, double timestep,
                                   std::vector<float>* embedded) const
   {
-    return adaln_(a, timestep, embedded);
+    // Through lora_for_, so this is the WHOLE path the forward takes and
+    // not a shortcut around the adapter. It went in as
+    // `adaln_(a, timestep, embedded)`, which silently ran every chain
+    // unadapted -- a test hook that skips the thing under test looks
+    // exactly like a passing test.
+    return adaln_(a, timestep, embedded, lora_for_(a));
   }
 
   const DitConfig& config() const { return _cfg; }
@@ -318,12 +343,46 @@ private:
   // Returns the k*dim driver, and (through `embedded`) the dim-wide
   // embedder output the OUTPUT HEAD needs -- the reference returns both
   // from one call for exactly that reason.
+  //
+  // `la` is the adapter's matching chain, or null. Applied on the HOST
+  // too -- two mat-vecs per linear against a vector, which is why the
+  // cheapest of the three apply sites is the one that reads like the
+  // hardest.
   std::vector<float> adaln_(const DitTrunk::AdaLN& a, double timestep,
-                            std::vector<float>* embedded) const;
+                            std::vector<float>* embedded,
+                            const LoraAdaLN* la = nullptr) const;
+
+  // Which of the adapter's eight chains adapts THIS one, by identity
+  // against the trunk's own members. One lookup rather than eight
+  // spelled-out pairs at the call site, so the public hook and the
+  // forward cannot route differently -- which is the bug this replaced.
+  const LoraAdaLN* lora_for_(const DitTrunk::AdaLN& a) const;
+
+  // One adapted TRUNK linear on the GPU, through the block stack's
+  // shared arena. A no-op on a null or empty pair, so the four call
+  // sites read as one line beside the projection they ride on.
+  void trunk_lora_(vpipe::metal_compute::ComputeEncoder& enc,
+                   const LoraPair* p,
+                   const vpipe::metal_compute::SharedBuffer& x,
+                   const vpipe::metal_compute::SharedBuffer& y,
+                   int M) const;
+
+  // What the adapter planes must be sized for, 0 with no adapter.
+  int lora_rank_() const noexcept
+  {
+    return _lora != nullptr ? _lora->max_rank() : 0;
+  }
+  int lora_out_() const noexcept
+  {
+    return _lora != nullptr ? _lora->max_out() : 0;
+  }
 
   const MetalOps* _ops = nullptr;
   DitConfig _cfg;
   DitTrunk  _trunk;
+  // SHARED, not owned: one adapter serves every DiT over the same
+  // checkpoint, and the generator caches it across requests.
+  std::shared_ptr<const LoraAdapter> _lora;
   // Held for this model's lifetime, per the WeightSet contract -- and
   // here it is load-bearing rather than bookkeeping: a streamed block is
   // read from this set inside the forward.

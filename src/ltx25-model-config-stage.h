@@ -92,8 +92,10 @@ private:
   // count, the model picks the clip length from the prompt.
   bool   _duration_head = false;
 
-  // A runtime LoRA (the shipped distilled-450 adapter, or a trained
-  // one). Load-time, like every adapter in this tree.
+  // A runtime LoRA (the shipped distilled-450 adapter, the IC-LoRA
+  // upscaler, or a trained one). Applied to each adapted linear's
+  // OUTPUT, so the base checkpoint is never rewritten -- which is what
+  // lets a streamed or quantized DiT take an adapter at all.
   std::string _lora;
   double      _lora_scale = 1.0;
 

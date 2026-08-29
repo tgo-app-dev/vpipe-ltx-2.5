@@ -95,11 +95,12 @@ const ConfigKey kAttrs[] = {
    .def_bool = false},
 
   {.key = "lora", .type = ConfigType::String, .required = false,
-   .doc = "a LoRA applied at LOAD time. A registered model key (what a "
+   .doc = "a LoRA, applied at RUNTIME. A registered model key (what a "
           "`model-fetch` of the shipped distilled-450 adapter writes), a "
-          "directory holding one .safetensors, or a path to one. Read "
-          "before the DiT is built, so a beat that changes it afterwards "
-          "is reported and ignored",
+          "directory holding one .safetensors, or a path to one. The "
+          "delta rides on each linear's output rather than being folded "
+          "into the weight, so a streamed or quantized DiT takes it "
+          "unchanged; changing it between beats reloads the adapter",
    .suggest_db = vpipe::kModelRegistryDb,
    // Without a type the picker shows nothing: every LoRA is catalogued
    // as a `supplement`, and a field with no type offers plain models
@@ -107,7 +108,8 @@ const ConfigKey kAttrs[] = {
    // field.
    .suggest_db_type = "ltx-2.5-lora"},
   {.key = "lora_scale", .type = ConfigType::Real, .required = false,
-   .doc = "adapter strength, folded into A at load. 1.0 is as trained",
+   .doc = "adapter strength, folded into the adapter's own A matrix at "
+          "load (never into the model). 1.0 is as trained",
    .def_real = 1.0},
 };
 

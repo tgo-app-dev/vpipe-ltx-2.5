@@ -222,13 +222,60 @@ The family logs which pack it loaded on every run.
 |---|---|
 | `register_video_family` | the `ltx-2.5` family for `generate-video` — detection, the frame rule, the resource declaration, and (eventually) the denoise loop |
 | `register_stage` | `ltx-2.5-model-config`, this family's own knobs |
-| `register_catalog_entries` | four entries: distilled, dev, the distilled LoRA, the x2 latent upscalers |
+| `register_catalog_entries` | five entries: distilled, dev, the distilled LoRA, the x2 pixel-spatial IC-LoRA, the x2 latent upscalers |
 
 The knobs are a **stage** rather than keys on `generate-video` for the
 reason `stages/model-config-source.h` gives: a stage serving several
 families accumulates the union of their knobs, and each is inert —
 *silently* — on whichever family is not resident. Nothing in
 `ltx-2.5-model-config` means anything to Wan or MiniMax-H3.
+
+## Adapters
+
+`ltx-2.5-model-config`'s `lora` key takes a registered model key, a
+directory holding one `.safetensors`, or a path to one. Both published
+adapters load: the **distilled-450** (1660 modules, mixed rank -- 450
+for the projections and 32 for every gate in one file) and the **x2
+pixel spatial upscaler** (480 modules, rank 32).
+
+**Applied at RUNTIME, never fused.** The delta rides on each adapted
+linear's output as `y += (x @ A^T) @ B^T`, so the base weights are
+untouched. That is not a preference:
+
+* the DiT **streams** its 48 blocks, and a fused weight is a new tensor
+  that must be cached to be worth anything -- caching the fused set is
+  ~25.8 GB, which would turn a model that runs on a 16 GB box into one
+  that does not;
+* a **quantized** pack holds u32 codes, so there is no bf16 weight to
+  add a delta to at all.
+
+The cost is `2 * rank / K` of the linear it rides on: about 1.6% at rank
+32, ~22% at the distilled adapter's rank 450.
+
+### IC-LoRA: the reference clip
+
+An **in-context** LoRA is conditioned on a reference clip carried in the
+sequence beside the target. With one loaded, `generate-video`'s
+`ref_latent0` changes meaning -- it stops being a first-frame anchor that
+overwrites the clip and becomes a whole reference clip appended next to
+it, encoded at `1/reference_downscale_factor` of the output's
+resolution. The factor comes from the adapter's own metadata, which is
+what makes the two impossible to confuse.
+
+Each reference token then stands for `factor x factor` of the target's
+cells, so its spatial position spans are multiplied by the factor. Get
+that wrong and the run is clean and the whole reference sits in the
+top-left corner of the frame.
+
+Three things are refused rather than warned about, because each of them
+otherwise finishes and returns a plausible clip that ignored its input:
+
+* an IC-LoRA with **no reference wired**;
+* a reference at the **wrong resolution** for its factor, or an output
+  whose latent grid the factor does not divide;
+* an adapter declaring `reference_temporal_scale_factor > 1`, whose
+  reference runs at a lower frame rate than the target -- the temporal
+  re-spacing that needs is not implemented here.
 
 ## Layout
 
@@ -242,6 +289,7 @@ src/ltx25-block-metal.{h,cc}         one AV block on the GPU
 src/ltx25-dit-weights.{h,cc}         bind the checkpoint's bf16 straight to the GPU
 src/ltx25-dit.{h,cc}                 the 48-block stack, adaLN chains, head
 src/ltx25-connector.{h,cc}           the two 8-layer caption resamplers
+src/ltx25-lora.{h,cc}                adapters, bound at load and applied at RUN
 src/ltx25-sampler.{h,cc}             the ancestral Euler step + distilled sigmas
 src/ltx25-text-features.{h,cc}       49 hidden states -> the two contexts
 src/ltx25-family.{h,cc}              VideoModelFamily: claims / align / declare / load

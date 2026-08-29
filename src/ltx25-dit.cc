@@ -66,6 +66,41 @@ gemv_host_(const std::vector<float>& x, const SharedBuffer& w,
   }
 }
 
+// y += B @ (A @ x) -- one adapted host GEMV, in the same f32 the chain
+// it rides on runs in.
+//
+// A and B are bf16 in UMA memory exactly as the base weight is, so this
+// reads them in place rather than converting a copy. `rank` mat-vecs
+// down and `n` up: at rank 450 against a 4096x36864 base that is ~2.4%
+// of the chain, and the chain is 0.2 GFLOP.
+void
+lora_gemv_host_(const std::vector<float>& x, const LoraPair& p,
+                std::vector<float>& y)
+{
+  if (!p.valid()) { return; }
+  if ((int)x.size() != p.k || (int)y.size() != p.n) { return; }
+  const auto* ap = static_cast<const std::uint16_t*>(p.a.contents());
+  const auto* bp = static_cast<const std::uint16_t*>(p.b.contents());
+  if (ap == nullptr || bp == nullptr) { return; }
+  std::vector<float> r((std::size_t)p.rank, 0.0f);
+  for (int j = 0; j < p.rank; ++j) {
+    const std::uint16_t* row = ap + (std::size_t)j * p.k;
+    double acc = 0.0;
+    for (int i = 0; i < p.k; ++i) {
+      acc += (double)x[(std::size_t)i] * bf16_to_f32_(row[i]);
+    }
+    r[(std::size_t)j] = (float)acc;
+  }
+  for (int o = 0; o < p.n; ++o) {
+    const std::uint16_t* row = bp + (std::size_t)o * p.rank;
+    double acc = 0.0;
+    for (int j = 0; j < p.rank; ++j) {
+      acc += (double)r[(std::size_t)j] * bf16_to_f32_(row[j]);
+    }
+    y[(std::size_t)o] += (float)acc;
+  }
+}
+
 void
 silu_(std::vector<float>& v)
 {
@@ -101,13 +136,17 @@ timestep_sinusoid_(double t, int channels = 256)
 
 std::vector<float>
 Ltx25Dit::adaln_(const DitTrunk::AdaLN& a, double timestep,
-                 std::vector<float>* embedded) const
+                 std::vector<float>* embedded, const LoraAdaLN* la) const
 {
   std::vector<float> proj = timestep_sinusoid_(timestep, 256);
   std::vector<float> h1, h2, out;
   gemv_host_(proj, a.emb1_w, a.emb1_b, 256, a.dim, h1);
+  // Each delta goes in BEFORE the activation that follows it, which is
+  // where a fused weight would have put it.
+  if (la != nullptr) { lora_gemv_host_(proj, la->emb1, h1); }
   silu_(h1);
   gemv_host_(h1, a.emb2_w, a.emb2_b, a.dim, a.dim, h2);
+  if (la != nullptr) { lora_gemv_host_(h1, la->emb2, h2); }
   // h2 IS `embedded_timestep`: the embedder's output, before the SiLU
   // and the final projection. The output head wants this one, not the
   // k*dim driver -- they are different tensors and the same call
@@ -116,7 +155,24 @@ Ltx25Dit::adaln_(const DitTrunk::AdaLN& a, double timestep,
   std::vector<float> act = h2;
   silu_(act);
   gemv_host_(act, a.out_w, a.out_b, a.dim, a.out_dim, out);
+  if (la != nullptr) { lora_gemv_host_(act, la->out, out); }
   return out;
+}
+
+const LoraAdaLN*
+Ltx25Dit::lora_for_(const DitTrunk::AdaLN& a) const
+{
+  const LoraTrunk* lt = (_lora != nullptr) ? _lora->trunk() : nullptr;
+  if (lt == nullptr) { return nullptr; }
+  if (&a == &_trunk.video) { return &lt->video; }
+  if (&a == &_trunk.audio) { return &lt->audio; }
+  if (&a == &_trunk.prompt) { return &lt->prompt; }
+  if (&a == &_trunk.audio_prompt) { return &lt->audio_prompt; }
+  if (&a == &_trunk.av_video_ss) { return &lt->av_video_ss; }
+  if (&a == &_trunk.av_audio_ss) { return &lt->av_audio_ss; }
+  if (&a == &_trunk.av_a2v_gate) { return &lt->av_a2v_gate; }
+  if (&a == &_trunk.av_v2a_gate) { return &lt->av_v2a_gate; }
+  return nullptr;
 }
 
 void
@@ -129,6 +185,9 @@ Ltx25Dit::compute_adaln_step_(double sigma, double audio_sigma,
   // collapses to one modulation.
   const DitConfig& c = _cfg;
   const double m = (double)c.timestep_scale_multiplier;
+  // Every chain below takes its own adapter through lora_for_, which is
+  // also what adaln_public uses -- so the test hook and the forward can
+  // never route differently.
 
   // ONE CHAIN PER DENOISE LEVEL. The reference runs the timestep MLP on
   // `denoise_mask * sigma` flattened over every token; the mask takes
@@ -140,7 +199,7 @@ Ltx25Dit::compute_adaln_step_(double sigma, double audio_sigma,
   b->v_embedded.resize(_v_levels.size());
   for (std::size_t g = 0; g < _v_levels.size(); ++g) {
     b->v_ts[g] = adaln_(_trunk.video, sigma * _v_levels[g] * m,
-                        &b->v_embedded[g]);
+                        &b->v_embedded[g], lora_for_(_trunk.video));
   }
   // The PROMPT driver, per stream: prompt_adaln(sigma * multiplier). It
   // is what makes the text cross-attention's K/V modulation depend on
@@ -149,7 +208,8 @@ Ltx25Dit::compute_adaln_step_(double sigma, double audio_sigma,
   // The SCALAR sigma, not the per-token timesteps: the reference feeds
   // `modality.sigma` here, so the caption is modulated once for the
   // whole stream however the tokens are conditioned.
-  b->v_pts = adaln_(_trunk.prompt, sigma * m, nullptr);
+  b->v_pts = adaln_(_trunk.prompt, sigma * m, nullptr,
+                    lora_for_(_trunk.prompt));
 
   if (!_have_audio) { return; }
 
@@ -157,9 +217,10 @@ Ltx25Dit::compute_adaln_step_(double sigma, double audio_sigma,
   b->a_embedded.resize(_a_levels.size());
   for (std::size_t g = 0; g < _a_levels.size(); ++g) {
     b->a_ts[g] = adaln_(_trunk.audio, audio_sigma * _a_levels[g] * m,
-                        &b->a_embedded[g]);
+                        &b->a_embedded[g], lora_for_(_trunk.audio));
   }
-  b->a_pts = adaln_(_trunk.audio_prompt, audio_sigma * m, nullptr);
+  b->a_pts = adaln_(_trunk.audio_prompt, audio_sigma * m, nullptr,
+                    lora_for_(_trunk.audio_prompt));
 
   // The a2v/v2a drivers. Note WHICH sigma feeds which: the scale/shift
   // comes from the stream's OWN noise level, the GATE from the OTHER
@@ -167,10 +228,70 @@ Ltx25Dit::compute_adaln_step_(double sigma, double audio_sigma,
   // noisy that modality currently is. Swapping them is a forward that
   // runs and a coupling that means nothing.
   const double f = c.av_ca_timestep_scale_multiplier / m;
-  b->v_css = adaln_(_trunk.av_video_ss,  sigma * m, nullptr);
-  b->a_css = adaln_(_trunk.av_audio_ss,  audio_sigma * m, nullptr);
-  b->v_cg  = adaln_(_trunk.av_a2v_gate,  audio_sigma * m * f, nullptr);
-  b->a_cg  = adaln_(_trunk.av_v2a_gate,  sigma * m * f, nullptr);
+  b->v_css = adaln_(_trunk.av_video_ss, sigma * m, nullptr,
+                    lora_for_(_trunk.av_video_ss));
+  b->a_css = adaln_(_trunk.av_audio_ss, audio_sigma * m, nullptr,
+                    lora_for_(_trunk.av_audio_ss));
+  b->v_cg  = adaln_(_trunk.av_a2v_gate, audio_sigma * m * f, nullptr,
+                    lora_for_(_trunk.av_a2v_gate));
+  b->a_cg  = adaln_(_trunk.av_v2a_gate, sigma * m * f, nullptr,
+                    lora_for_(_trunk.av_v2a_gate));
+}
+
+void
+Ltx25Dit::trunk_lora_(vpipe::metal_compute::ComputeEncoder& enc,
+                      const LoraPair* p, const SharedBuffer& x,
+                      const SharedBuffer& y, int M) const
+{
+  if (p == nullptr || !p->valid() || M <= 0 || !_scratch) { return; }
+  _ops->lora_add(enc, x, p->a, p->b, y, _scratch->lora_r, _scratch->lora_d,
+                 M, p->k, p->n, p->rank);
+}
+
+bool
+Ltx25Dit::set_lora(std::shared_ptr<const LoraAdapter> lora, std::string* err)
+{
+  auto fail = [&](const std::string& msg) {
+    if (err != nullptr) { *err = msg; }
+    return false;
+  };
+  if (lora == _lora) { return true; }
+  // The bake has already released the adaLN projections, so eight of
+  // this adapter's chains would have nothing to adapt. Refused rather
+  // than partly applied -- see the note on set_lora in the header.
+  if (_baked) {
+    return fail("set_lora: the adaLN bake has already run and released "
+                "the projections; the adapter would be applied to the "
+                "blocks and not to the modulation");
+  }
+  if (lora != nullptr && lora->layers() != num_layers()) {
+    return fail("set_lora: the adapter was built for " +
+                std::to_string(lora->layers()) + " blocks but this DiT has " +
+                std::to_string(num_layers()));
+  }
+  _lora = std::move(lora);
+  // GROW THE ARENA IF ONE ALREADY EXISTS. A caller that set the geometry
+  // first is not refused -- the planes are appended to the shared arena
+  // and every block already holding it sees them, because it is one
+  // object. Blocks that do not exist yet (the streamed ones) are built
+  // inside the forward and reserve with lora_rank_() themselves.
+  if (_scratch) {
+    for (auto& b : _blocks) {
+      if (!b) { continue; }
+      if (!b->reserve(_video_tokens, _audio_tokens, _text_tokens, err,
+                      _geo_levels, &_scratch, lora_rank_(), lora_out_())) {
+        return false;
+      }
+    }
+    for (auto& b : _slot) {
+      if (!b) { continue; }
+      if (!b->reserve(_video_tokens, _audio_tokens, _text_tokens, err,
+                      _geo_levels, &_scratch, lora_rank_(), lora_out_())) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 bool
@@ -738,7 +859,7 @@ Ltx25Dit::build_block_(int i, std::shared_ptr<BlockScratch> arena,
               _have_audio ? &_v_cross : nullptr,
               _have_audio ? &_a_cross : nullptr);
   if (!b->reserve(_video_tokens, _audio_tokens, _text_tokens, err,
-                  _geo_levels, &arena)) {
+                  _geo_levels, &arena, lora_rank_(), lora_out_())) {
     return false;
   }
   out = std::move(b);
@@ -918,7 +1039,7 @@ Ltx25Dit::set_geometry(int latent_frames, int latent_h, int latent_w,
                 _have_audio ? &_v_cross : nullptr,
                 _have_audio ? &_a_cross : nullptr);
     if (!b->reserve(_video_tokens, _audio_tokens, _text_tokens, err,
-                    levels, &_scratch)) {
+                    levels, &_scratch, lora_rank_(), lora_out_())) {
       return false;
     }
   }
@@ -1160,11 +1281,17 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
   }
 
   const MetalOps& o = *_ops;
+  // The adapter's trunk, hoisted once: it is read at the patchify above
+  // and again at the output head 350 lines down.
+  const LoraTrunk* ltr = (_lora != nullptr) ? _lora->trunk() : nullptr;
   auto stream = o.mc()->make_command_stream();
   {
     auto enc = stream.begin_compute();
     o.linear(enc, _vlat, _trunk.patchify_w, &_trunk.patchify_b, _vx,
              _video_tokens, zc, vd);
+    if (ltr != nullptr) {
+      trunk_lora_(enc, &ltr->patchify, _vlat, _vx, _video_tokens);
+    }
     // The KEYFRAME absolute-position embedding, immediately after
     // patchify_proj and nowhere else. It marks the tokens whose latent
     // encodes ONE standalone pixel frame -- and because the video VAE is
@@ -1184,6 +1311,9 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
     if (ra) {
       o.linear(enc, _alat, _trunk.audio_patchify_w, &_trunk.audio_patchify_b,
                _ax, _audio_tokens, zc, ad);
+      if (ltr != nullptr) {
+        trunk_lora_(enc, &ltr->audio_patchify, _alat, _ax, _audio_tokens);
+      }
     }
   }
   {
@@ -1388,7 +1518,10 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
     auto s = o.mc()->make_command_stream();
     {
       auto enc = s.begin_compute();
-      if (!blk->forward(enc, gv, ga, err)) { return false; }
+      if (!blk->forward(enc, gv, ga, err,
+                        _lora != nullptr ? _lora->block(i) : nullptr)) {
+        return false;
+      }
     }
     // BETWEEN THE COMMIT AND THE WAIT is the whole opportunity: the GPU
     // is busy with block i and this thread has nothing to do.
@@ -1522,6 +1655,9 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
       }
       o.linear(enc, _tmp, _trunk.proj_out_w, &_trunk.proj_out_b, _v_out,
                _video_tokens, vd, c.out_channels);
+      if (ltr != nullptr) {
+        trunk_lora_(enc, &ltr->proj_out, _tmp, _v_out, _video_tokens);
+      }
       if (ra) {
         o.layer_norm_plain(enc, _ax, _tmp, ad, _audio_tokens);
         if (ga.level != nullptr && ga.n_levels > 1) {
@@ -1535,6 +1671,10 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
         o.linear(enc, _tmp, _trunk.audio_proj_out_w,
                  &_trunk.audio_proj_out_b, _a_out, _audio_tokens, ad,
                  c.audio_out_channels);
+        if (ltr != nullptr) {
+          trunk_lora_(enc, &ltr->audio_proj_out, _tmp, _a_out,
+                      _audio_tokens);
+        }
       }
     }
     std::string herr;

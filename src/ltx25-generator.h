@@ -3,6 +3,7 @@
 
 #include "ltx25-config.h"
 #include "ltx25-dit.h"
+#include "ltx25-lora.h"
 #include "ltx25-metal-ops.h"
 
 #include "generative-models/video-model-registry.h"
@@ -46,6 +47,13 @@ struct GenerationParams {
   bool   duration_head = false;
   std::string lora;
   double lora_scale = 1.0;
+
+  // Accelerated int8 for the block GEMMs. LOSSY -- int8 quantization,
+  // rel-L2 ~1e-2 per GEMM -- so it is off unless asked for, the same
+  // default the in-tree DiTs carry. Composes with the quantized
+  // checkpoint rather than competing with it: the tier takes the
+  // dequant-once expansion as its weight.
+  bool i8_gemm = false;
 
   // Never throws and never half-applies: a malformed value leaves its
   // field at the default and is named in `err`.
@@ -99,6 +107,14 @@ private:
   void log_(const std::string& m) const;
   void warn_(const std::string& m) const;
 
+  // Resolve `ref` to a .safetensors, load it, and cache it.
+  //
+  // CACHED ON (ref, scale) because the scale is folded into A at load:
+  // the same file at a different strength is a different adapter, and
+  // returning the cached one would silently ignore the change. A
+  // continuous graph that never varies either pays this once.
+  bool ensure_lora_(const std::string& ref, double scale, std::string* err);
+
   Config _cfg;
   std::shared_ptr<vpipe::genai::WeightSet> _ws;
   MetalOps _ops;
@@ -109,6 +125,16 @@ private:
   // The plan's pinned-prefix fraction, kept for the reload path.
   // The clip the graph planned, for the reload path's pin sizing.
   int _plan_w = 0, _plan_h = 0, _plan_frames = 0;
+  // The adapter currently loaded, and what it was loaded FROM. Held by
+  // the generator rather than the DiT so a rebuild (the baked-schedule
+  // path) re-adopts it instead of re-reading 8.9 GB.
+  std::shared_ptr<const LoraAdapter> _lora_adapter;
+  // The adapter's OWN weight set, held for as long as the adapter is:
+  // its pairs are buffers this set owns, so dropping it first would
+  // leave the pairs pointing into an unmapped checkpoint.
+  std::shared_ptr<vpipe::genai::WeightSet> _lora_ws;
+  std::string _lora_ref;
+  double      _lora_scale = 1.0;
 
 public:
   // Streaming state, for the family's log line and its declaration.

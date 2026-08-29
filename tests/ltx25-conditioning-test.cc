@@ -386,6 +386,239 @@ test_unconditioned()
 
 }  // namespace
 
+
+// ---- the IC-LoRA reference clip ---------------------------------------
+//
+// An in-context LoRA is conditioned on a WHOLE reference clip, encoded at
+// 1/factor of the target's resolution and appended to the sequence. What
+// makes it a third placement rather than a bigger keyframe is the
+// POSITIONS: a reference token stands for factor x factor of the
+// target's cells, so its spatial span is stretched by the factor. Leave
+// that out and the whole reference sits in the top-left corner of the
+// frame -- a run that finishes cleanly and ignores most of its input,
+// which is the exact failure this file exists to catch.
+//
+// Goldens from `VideoConditionByReferenceLatent`, the model author's own
+// class (gen_goldens.py `iclora`).
+void
+test_iclora(const std::string& dir)
+{
+  std::printf("\nIC-LoRA reference conditioning\n");
+  npy::Array ref = npy::load(dir + "/iclora_ref.npy");
+  npy::Array w_mask = npy::load(dir + "/iclora_v_denoise_mask.npy");
+  npy::Array w_clean = npy::load(dir + "/iclora_v_clean.npy");
+  npy::Array w_pos = npy::load(dir + "/iclora_v_positions.npy");
+  npy::Array ref1 = npy::load(dir + "/iclora_ref_f1.npy");
+  npy::Array w_pos1 = npy::load(dir + "/iclora_f1_positions.npy");
+  npy::Array w_mixed = npy::load(dir + "/iclora_mixed_denoise_mask.npy");
+  for (const npy::Array* a : {&ref, &w_mask, &w_clean, &w_pos, &ref1,
+                              &w_pos1, &w_mixed}) {
+    if (!a->ok) { check(false, "load goldens: " + a->err); return; }
+  }
+
+  constexpr int kFactor = 2;
+  constexpr int kRH = kH / kFactor, kRW = kW / kFactor;   // 2 x 2
+  constexpr int kRefTokens = kF * kRH * kRW;              // 12
+
+  std::vector<ltx25::VideoAnchor> va(1);
+  va[0].latent = ref.data.data();
+  va[0].channels = kC;
+  va[0].frames = kF;
+  va[0].h = kRH;
+  va[0].w = kRW;
+  va[0].strength = 1.0;
+  va[0].placement = ltx25::VideoAnchor::Placement::kIcLoraReference;
+  va[0].downscale = kFactor;
+
+  ltx25::BuiltConditioning b;
+  std::string err;
+  if (!ltx25::build_conditioning(kF, kH, kW, kC, 0, 0, geo_(), va, {}, &b,
+                                 &err)) {
+    check(false, "build_conditioning: " + err);
+    return;
+  }
+  const int total = (int)w_mask.shape[0];
+  check(b.v_tokens == total && b.v_tokens == kTarget + kRefTokens,
+        "token count " + std::to_string(b.v_tokens) + " = " +
+        std::to_string(kTarget) + " target + " +
+        std::to_string(kRefTokens) + " reference (the reference is "
+        "COARSER, so it is not one block per target frame)");
+  if (b.v_tokens != total) { return; }
+
+  std::size_t bad = 0;
+  for (int t = 0; t < total; ++t) {
+    if (b.v_mask[(std::size_t)t] != w_mask.data[(std::size_t)t]) { ++bad; }
+  }
+  check(bad == 0, "the denoise mask matches token for token (" +
+        std::to_string(bad) + " differ)");
+  check(b.v_mask[0] == 1.0f && b.v_mask[kTarget - 1] == 1.0f,
+        "the whole target grid is still being generated -- a reference "
+        "clip conditions, it does not overwrite");
+
+  double worst = 0.0;
+  for (int t = 0; t < total; ++t) {
+    for (int c = 0; c < kC; ++c) {
+      const float got = b.v_clean[(std::size_t)c * total + t];
+      const float want = w_clean.data[(std::size_t)t * kC + c];
+      worst = std::max(worst, (double)std::fabs(got - want));
+    }
+  }
+  check(worst == 0.0, "the reference's tokens land where the golden puts "
+        "them (worst |diff| " + std::to_string(worst) + ")");
+
+  // ---- the positions, which are the whole point ------------------------
+  auto full_spans = [&](const ltx25::BuiltConditioning& bc,
+                        std::vector<std::vector<double>>* s,
+                        std::vector<std::vector<double>>* e) {
+    ltx25::video_spans(kF, kH, kW, geo_(), 0, false, true, s, e);
+    for (int a = 0; a < 3; ++a) {
+      (*s)[(std::size_t)a].insert(
+          (*s)[(std::size_t)a].end(),
+          bc.cond.v_extra_starts[(std::size_t)a].begin(),
+          bc.cond.v_extra_starts[(std::size_t)a].end());
+      (*e)[(std::size_t)a].insert(
+          (*e)[(std::size_t)a].end(),
+          bc.cond.v_extra_ends[(std::size_t)a].begin(),
+          bc.cond.v_extra_ends[(std::size_t)a].end());
+    }
+  };
+  std::vector<std::vector<double>> s, e;
+  full_spans(b, &s, &e);
+  double pos_worst = 0.0;
+  for (int a = 0; a < 3; ++a) {
+    for (int t = 0; t < total; ++t) {
+      const float* w = w_pos.data.data() + ((std::size_t)a * total + t) * 2;
+      pos_worst = std::max(pos_worst,
+                           std::fabs(s[(std::size_t)a][(std::size_t)t] - w[0]));
+      pos_worst = std::max(pos_worst,
+                           std::fabs(e[(std::size_t)a][(std::size_t)t] - w[1]));
+    }
+  }
+  check(pos_worst < 1e-6, "every position span matches (worst |diff| " +
+        std::to_string(pos_worst) + ")");
+
+  // Said again in the concrete, because "matches" is exactly what an
+  // unstretched reference would also report if the golden were wrong.
+  // The reference's two columns must cover the full 128-pixel frame.
+  const double h0s = b.cond.v_extra_starts[1][0];
+  const double h0e = b.cond.v_extra_ends[1][0];
+  const double w1s = b.cond.v_extra_starts[2][1];
+  const double w1e = b.cond.v_extra_ends[2][1];
+  check(h0s == 0.0 && h0e == kFactor * 32.0,
+        "a reference token spans " + std::to_string(kFactor * 32) +
+        " pixels, not 32 -- it stands for " + std::to_string(kFactor) +
+        "x" + std::to_string(kFactor) + " target cells");
+  check(w1s == kFactor * 32.0 && w1e == (double)kW * 32.0,
+        "and the LAST column ends at the frame's edge (" +
+        std::to_string(kW * 32) + "), so the reference covers the whole "
+        "frame rather than its top-left corner");
+  // The time axis is NOT stretched: the reference runs at the target's
+  // frame rate. Scaling it too is the symmetric mistake and it is not
+  // caught by anything spatial.
+  check(b.cond.v_extra_starts[0][0] == 0.0 &&
+        std::fabs(b.cond.v_extra_ends[0][0] - 1.0 / 24.0) < 1e-9,
+        "the TIME span is untouched -- the first reference frame is the "
+        "clip's first frame, one pixel frame long");
+
+  // ---- factor 1, the same code path ------------------------------------
+  {
+    std::vector<ltx25::VideoAnchor> v1(1);
+    v1[0].latent = ref1.data.data();
+    v1[0].channels = kC;
+    v1[0].frames = kF;
+    v1[0].h = kH;
+    v1[0].w = kW;
+    v1[0].strength = 1.0;
+    v1[0].placement = ltx25::VideoAnchor::Placement::kIcLoraReference;
+    v1[0].downscale = 1;
+    ltx25::BuiltConditioning b1;
+    std::string e1;
+    if (!ltx25::build_conditioning(kF, kH, kW, kC, 0, 0, geo_(), v1, {}, &b1,
+                                   &e1)) {
+      check(false, "factor 1: " + e1);
+    } else {
+      std::vector<std::vector<double>> s1, e1v;
+      full_spans(b1, &s1, &e1v);
+      const int n1 = (int)w_pos1.shape[1];
+      double d1 = 0.0;
+      for (int a = 0; a < 3; ++a) {
+        for (int t = 0; t < n1; ++t) {
+          const float* w = w_pos1.data.data() + ((std::size_t)a * n1 + t) * 2;
+          d1 = std::max(d1, std::fabs(s1[(std::size_t)a][(std::size_t)t] - w[0]));
+          d1 = std::max(d1, std::fabs(e1v[(std::size_t)a][(std::size_t)t] - w[1]));
+        }
+      }
+      check(d1 < 1e-6, "factor 1 appends at the target's own resolution "
+            "(worst |diff| " + std::to_string(d1) + ") -- the stretch is "
+            "the factor's doing, not the placement's");
+    }
+  }
+
+  // ---- a strength the mask has to carry --------------------------------
+  {
+    std::vector<ltx25::VideoAnchor> v2(2);
+    // The golden's first item is an anchor over latent frame 0; its
+    // latent is not saved, and nothing here reads its VALUES -- only the
+    // mask, which depends on strength alone.
+    std::vector<float> dummy((std::size_t)kC * kPerFrame, 0.0f);
+    v2[0].latent = dummy.data();
+    v2[0].channels = kC;
+    v2[0].frames = 1;
+    v2[0].h = kH;
+    v2[0].w = kW;
+    v2[0].strength = 1.0;
+    v2[0].placement = ltx25::VideoAnchor::Placement::kLatentIndex;
+    v2[0].index = 0;
+    v2[1] = va[0];
+    v2[1].strength = 0.75;
+    ltx25::BuiltConditioning b2;
+    std::string e2;
+    if (!ltx25::build_conditioning(kF, kH, kW, kC, 0, 0, geo_(), v2, {}, &b2,
+                                   &e2)) {
+      check(false, "mixed strengths: " + e2);
+    } else {
+      std::size_t bad2 = 0;
+      const int n2 = (int)w_mixed.shape[0];
+      for (int t = 0; t < n2 && t < b2.v_tokens; ++t) {
+        if (std::fabs(b2.v_mask[(std::size_t)t]
+                      - w_mixed.data[(std::size_t)t]) > 1e-7) { ++bad2; }
+      }
+      check(b2.v_tokens == n2 && bad2 == 0,
+            "a reference at strength 0.75 beside an anchor at 1.0 gives "
+            "the golden's mask (" + std::to_string(bad2) + " differ)");
+      check(b2.cond.v_levels.size() == 3,
+            "and three denoise LEVELS -- generated, the anchor, the "
+            "reference (got " + std::to_string(b2.cond.v_levels.size()) +
+            ")");
+    }
+  }
+
+  // ---- the refusals ----------------------------------------------------
+  //
+  // Both of these are wrong in a way that still RUNS if it is let
+  // through, so they are errors rather than warnings.
+  {
+    std::vector<ltx25::VideoAnchor> v3 = va;
+    v3[0].h = kH;                 // the target's grid, not 1/factor of it
+    v3[0].w = kW;
+    ltx25::BuiltConditioning b3;
+    std::string e3;
+    check(!ltx25::build_conditioning(kF, kH, kW, kC, 0, 0, geo_(), v3, {},
+                                     &b3, &e3),
+          "a reference at the WRONG resolution for its factor is refused");
+  }
+  {
+    // A target grid the factor does not divide. 5 is odd, so a factor-2
+    // reference cannot tile it.
+    std::vector<ltx25::VideoAnchor> v4 = va;
+    ltx25::BuiltConditioning b4;
+    std::string e4;
+    check(!ltx25::build_conditioning(kF, 5, kW, kC, 0, 0, geo_(), v4, {},
+                                     &b4, &e4),
+          "a target grid the factor does not divide is refused");
+  }
+}
+
 int
 main()
 {
@@ -398,6 +631,7 @@ main()
   } else {
     test_video(dir);
     test_audio(dir);
+    test_iclora(dir);
     test_keyframe_marker(dir);
   }
   std::printf("\n%s\n", g_fail == 0 ? "ALL PASS" : "FAILURES");

@@ -1,5 +1,7 @@
 #include "ltx25-block-metal.h"
 
+#include "ltx25-lora.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <utility>
@@ -197,7 +199,8 @@ MetalBlock::set_rope(const RopeTable* v_self, const RopeTable* a_self,
 
 std::uint64_t
 BlockScratch::predict_bytes(std::size_t t, std::size_t d, std::size_t f,
-                            std::size_t l) noexcept
+                            std::size_t l, std::size_t r,
+                            std::size_t o) noexcept
 {
   if (d == 0 || t == 0) { return 0; }
   if (l < 1) { l = 1; }
@@ -205,8 +208,11 @@ BlockScratch::predict_bytes(std::size_t t, std::size_t d, std::size_t f,
   // wide feed-forward buffer, the [tokens][64] gate logits, three
   // per-level modulation rows and the two cross-attention K/V rows --
   // reserve()'s allocation list, in its order.
-  const std::uint64_t elems = 15ull * t * d + (std::uint64_t)t * std::max(d, f)
-                            + 64ull * t + 3ull * d * l + 2ull * d;
+  std::uint64_t elems = 15ull * t * d + (std::uint64_t)t * std::max(d, f)
+                      + 64ull * t + 3ull * d * l + 2ull * d;
+  // The adapter planes, allocated only when there IS an adapter -- so a
+  // run without one predicts exactly what it predicted before.
+  if (r > 0 && o > 0) { elems += (std::uint64_t)t * (r + o); }
   return elems * 2;               // MetalOps::alloc is bf16
 }
 
@@ -216,7 +222,7 @@ BlockScratch::bytes() const noexcept
   const vpipe::metal_compute::SharedBuffer* all[] = {
       &a, &b, &c, &d, &e, &q, &k, &v, &o, &qh, &kh, &vh, &oh,
       &gate_logits, &ff, &mod_scale, &mod_shift, &mod_gate,
-      &kv_scale, &kv_shift, &snap_v, &snap_a};
+      &kv_scale, &kv_shift, &snap_v, &snap_a, &lora_r, &lora_d};
   std::uint64_t n = 0;
   for (const auto* b : all) { n += b->byte_size(); }
   return n;
@@ -233,7 +239,7 @@ BlockScratch::for_each_buffer(
   vpipe::metal_compute::SharedBuffer* all[] = {
       &a, &b, &c, &d, &e, &q, &k, &v, &o, &qh, &kh, &vh, &oh,
       &gate_logits, &ff, &mod_scale, &mod_shift, &mod_gate,
-      &kv_scale, &kv_shift, &snap_v, &snap_a};
+      &kv_scale, &kv_shift, &snap_v, &snap_a, &lora_r, &lora_d};
   for (auto* p : all) { fn(*p); }
 }
 
@@ -264,7 +270,8 @@ BlockScratch::steel_for(const MetalOps& ops, int heads, int tq, int tkv,
 bool
 MetalBlock::reserve(int max_video_tokens, int max_audio_tokens, int max_text,
                     std::string* err, int max_levels,
-                    std::shared_ptr<BlockScratch>* arena)
+                    std::shared_ptr<BlockScratch>* arena,
+                    int max_lora_rank, int max_lora_out)
 {
   const int vd = _w.video.dim;
   const int ad = _w.have_audio ? _w.audio.dim : 0;
@@ -282,6 +289,14 @@ MetalBlock::reserve(int max_video_tokens, int max_audio_tokens, int max_text,
       (std::size_t)std::max(_w.video.ff_hidden,
                             _w.have_audio ? _w.audio.ff_hidden : 0);
   const std::size_t lv = (std::size_t)std::max(1, max_levels);
+  // BOTH or neither: a rank with no output width (or the reverse) would
+  // allocate one half of a pair and dispatch the other into an empty
+  // buffer, which is a GPU fault rather than a wrong number -- but only
+  // on the run that happens to load an adapter.
+  const std::size_t lr =
+      (max_lora_rank > 0 && max_lora_out > 0) ? (std::size_t)max_lora_rank : 0;
+  const std::size_t lo =
+      (max_lora_rank > 0 && max_lora_out > 0) ? (std::size_t)max_lora_out : 0;
 
   // Adopt the stack's arena, or a private one when driven alone.
   if (arena != nullptr) {
@@ -297,13 +312,16 @@ MetalBlock::reserve(int max_video_tokens, int max_audio_tokens, int max_text,
   // genuinely needs more (a wider FF, say) grows it, and the blocks
   // already holding it see the growth, because it is one object.
   const bool grow = tok > _s->tokens || dim > _s->dim ||
-                    lv > _s->levels || ffh > _s->ffh;
+                    lv > _s->levels || ffh > _s->ffh ||
+                    lr > _s->lora_rank || lo > _s->lora_out;
   if (!grow) { return true; }
 
   const std::size_t t = std::max(tok, _s->tokens);
   const std::size_t d = std::max(dim, _s->dim);
   const std::size_t f = std::max(ffh, _s->ffh);
   const std::size_t l = std::max(lv, _s->levels);
+  const std::size_t rk = std::max(lr, _s->lora_rank);
+  const std::size_t ow = std::max(lo, _s->lora_out);
   const std::size_t plane = t * d;
   const std::size_t wide  = t * std::max(d, f);
 
@@ -336,10 +354,19 @@ MetalBlock::reserve(int max_video_tokens, int max_audio_tokens, int max_text,
   _s->kv_shift  = _ops->alloc(d);
   _s->snap_v = _ops->alloc(plane);
   _s->snap_a = _ops->alloc(plane);
+  // Only when an adapter asked for them. `lora_d` is as wide as `ff`,
+  // so allocating it unconditionally would put a second 267 MB plane in
+  // every run at the geometry this model is built for.
+  if (rk > 0 && ow > 0) {
+    _s->lora_r = _ops->alloc(t * rk);
+    _s->lora_d = _ops->alloc(t * ow);
+  }
   _s->tokens = t;
   _s->dim = d;
   _s->levels = l;
   _s->ffh = f;
+  _s->lora_rank = rk;
+  _s->lora_out = ow;
   return true;
 }
 
@@ -373,17 +400,40 @@ MetalBlock::ada3_(ComputeEncoder& enc, const SharedBuffer& table,
   }
 }
 
+// One adapted linear's contribution, added into the output the base
+// linear just wrote. Null and empty pairs are no-ops, so a call site
+// reads as one line beside its linear whether or not an adapter is
+// loaded.
+//
+// THE PLACEMENT IS THE WHOLE POINT: this lands between the linear and
+// whatever consumes it, so q/k are adapted BEFORE their RMSNorm and
+// their RoPE, exactly as a fused weight would have been. Applying it
+// after the norm would be a different function that still runs.
+void
+MetalBlock::lora_(ComputeEncoder& enc, const LoraPair* p,
+                  const SharedBuffer& x, const SharedBuffer& y, int M) const
+{
+  if (p == nullptr || !p->valid() || M <= 0) { return; }
+  _ops->lora_add(enc, x, p->a, p->b, y, _s->lora_r, _s->lora_d, M, p->k,
+                 p->n, p->rank);
+}
+
 void
 MetalBlock::run_attention_(ComputeEncoder& enc, const GpuAttn& a,
                            const SharedBuffer& xq, int tq,
                            const SharedBuffer& xkv, int tkv,
                            const RopeGpu* q_pe, const RopeGpu* k_pe,
-                           const SharedBuffer& out)
+                           const SharedBuffer& out, const LoraAttn* lora)
 {
   const int inner = a.heads * a.head_dim;
   _ops->linear(enc, xq,  a.q_w, &a.q_b, _s->q, tq,  a.query_dim, inner);
   _ops->linear(enc, xkv, a.k_w, &a.k_b, _s->k, tkv, a.ctx_dim,   inner);
   _ops->linear(enc, xkv, a.v_w, &a.v_b, _s->v, tkv, a.ctx_dim,   inner);
+  if (lora != nullptr) {
+    lora_(enc, &lora->q, xq,  _s->q, tq);
+    lora_(enc, &lora->k, xkv, _s->k, tkv);
+    lora_(enc, &lora->v, xkv, _s->v, tkv);
+  }
 
   // q/k RMSNorm spans the WHOLE projection width, not the head dim.
   _ops->rms_norm_gain(enc, _s->q, a.q_norm, inner, tq);
@@ -417,16 +467,25 @@ MetalBlock::run_attention_(ComputeEncoder& enc, const GpuAttn& a,
   if (a.has_gate) {
     _ops->linear(enc, xq, a.gate_w, &a.gate_b, _s->gate_logits, tq,
                  a.query_dim, a.heads);
+    // The gate writes ONE LOGIT PER HEAD, not `inner`. An adapter bound
+    // against the wrong width here is a valid GEMM over the wrong
+    // columns; the loader checks it, and this is the consumer that
+    // depends on the check.
+    if (lora != nullptr) {
+      lora_(enc, &lora->gate, xq, _s->gate_logits, tq);
+    }
     _ops->gate_heads(enc, _s->o, _s->gate_logits, a.heads, tq, a.head_dim);
   }
   _ops->linear(enc, _s->o, a.o_w, &a.o_b, out, tq, inner, a.query_dim);
+  if (lora != nullptr) { lora_(enc, &lora->o, _s->o, out, tq); }
 }
 
 // Self-attention + text cross-attention, i.e. everything before the
 // audio<->video pair. `x` is updated in place.
 void
 MetalBlock::stream_first_half_(ComputeEncoder& enc, const GpuStream& w,
-                               GpuStreamInput& s, const RopeGpu* pe)
+                               GpuStreamInput& s, const RopeGpu* pe,
+                               const LoraAttn* l1, const LoraAttn* l2)
 {
   const int d = w.dim, n = s.tokens, tt = s.text_tokens;
 
@@ -441,7 +500,7 @@ MetalBlock::stream_first_half_(ComputeEncoder& enc, const GpuStream& w,
   } else {
     _ops->ada_zero(enc, (*s.x), _s->mod_scale, _s->mod_shift, _s->a, d, n);
   }
-  run_attention_(enc, w.attn1, _s->a, n, _s->a, n, pe, nullptr, _s->b);
+  run_attention_(enc, w.attn1, _s->a, n, _s->a, n, pe, nullptr, _s->b, l1);
   // x = x + out * gate, THEN x_normed = rms_norm(x). The second
   // normalisation feeds the cross-attention and is NOT re-derived from
   // the pre-residual x -- keeping both is why rms_norm_out exists.
@@ -483,7 +542,8 @@ MetalBlock::stream_first_half_(ComputeEncoder& enc, const GpuStream& w,
                        w.prompt_scale_shift, 0, _s->e, d, tt);
   }
 
-  run_attention_(enc, w.attn2, _s->d, n, _s->e, tt, nullptr, nullptr, _s->b);
+  run_attention_(enc, w.attn2, _s->d, n, _s->e, tt, nullptr, nullptr, _s->b,
+                 l2);
   if (pt) {
     _ops->gated_residual_g(enc, (*s.x), _s->mod_gate, _s->b, *s.level, d, n);
   } else {
@@ -494,7 +554,8 @@ MetalBlock::stream_first_half_(ComputeEncoder& enc, const GpuStream& w,
 // The feed-forward tail: rows 3..6.
 void
 MetalBlock::stream_ff_(ComputeEncoder& enc, const GpuStream& w,
-                       GpuStreamInput& s)
+                       GpuStreamInput& s, const LoraPair* l_in,
+                       const LoraPair* l_out)
 {
   const int d = w.dim, n = s.tokens, h = w.ff_hidden;
   const int g = s.n_levels;
@@ -508,9 +569,14 @@ MetalBlock::stream_ff_(ComputeEncoder& enc, const GpuStream& w,
   }
   _ops->linear(enc, _s->a, w.ff_in, w.ff_has_bias ? &w.ff_in_b : nullptr,
                _s->ff, n, d, h);
+  // BEFORE the GELU. `ff.net.0.proj` is the widest adapted linear in
+  // the model and the only reason the arena's `lora_d` is 4x a stream
+  // plane.
+  lora_(enc, l_in, _s->a, _s->ff, n);
   _ops->gelu(enc, _s->ff, _s->ff, n * h);
   _ops->linear(enc, _s->ff, w.ff_out, w.ff_has_bias ? &w.ff_out_b : nullptr,
                _s->b, n, h, d);
+  lora_(enc, l_out, _s->ff, _s->b, n);
   if (pt) {
     _ops->gated_residual_g(enc, (*s.x), _s->mod_gate, _s->b, *s.level, d, n);
   } else {
@@ -530,7 +596,8 @@ MetalBlock::av_cross_(ComputeEncoder& enc, const GpuAttn& attn,
                       const SharedBuffer& q_snap,
                       const GpuStream& kv_w, GpuStreamInput& kv_in,
                       const SharedBuffer& kv_snap, int lo,
-                      const RopeGpu* q_pe, const RopeGpu* kv_pe)
+                      const RopeGpu* q_pe, const RopeGpu* kv_pe,
+                      const LoraAttn* lora)
 {
   const int qd = q_w.dim, kd = kv_w.dim;
   const std::size_t qrow = (std::size_t)qd * 2, krow = (std::size_t)kd * 2;
@@ -558,13 +625,14 @@ MetalBlock::av_cross_(ComputeEncoder& enc, const GpuAttn& attn,
                  kv_in.tokens);
 
   run_attention_(enc, attn, _s->d, q_in.tokens, _s->e, kv_in.tokens, q_pe,
-                 kv_pe, _s->b);
+                 kv_pe, _s->b, lora);
   _ops->gated_residual(enc, (*q_in.x), _s->mod_gate, _s->b, qd, q_in.tokens);
 }
 
 bool
 MetalBlock::forward(ComputeEncoder& enc, GpuStreamInput& video,
-                    GpuStreamInput& audio, std::string* err)
+                    GpuStreamInput& audio, std::string* err,
+                    const LoraBlock* lora)
 {
   auto fail = [&](const std::string& m) {
     if (err != nullptr) { *err = m; }
@@ -581,9 +649,26 @@ MetalBlock::forward(ComputeEncoder& enc, GpuStreamInput& video,
                 " tokens but reserve() sized for " +
                 std::to_string(_s->tokens));
   }
+  // A LoRA with no planes to work in would dispatch two GEMMs into
+  // empty buffers. REFUSED rather than skipped: an adapter the caller
+  // asked for and did not get renders a plausible clip that ignored it,
+  // and nothing downstream can tell.
+  if (lora != nullptr && (_s->lora_rank == 0 || _s->lora_out == 0)) {
+    return fail("a LoRA was passed to forward() but reserve() was not "
+                "told its rank -- the adapter planes were never "
+                "allocated");
+  }
 
-  if (rv) { stream_first_half_(enc, _w.video, video, &_v_self); }
-  if (ra) { stream_first_half_(enc, _w.audio, audio, &_a_self); }
+  if (rv) {
+    stream_first_half_(enc, _w.video, video, &_v_self,
+                       lora != nullptr ? &lora->video_attn1 : nullptr,
+                       lora != nullptr ? &lora->video_attn2 : nullptr);
+  }
+  if (ra) {
+    stream_first_half_(enc, _w.audio, audio, &_a_self,
+                       lora != nullptr ? &lora->audio_attn1 : nullptr,
+                       lora != nullptr ? &lora->audio_attn2 : nullptr);
+  }
 
   if (rv && ra) {
     // BOTH DIRECTIONS READ THE PRE-CROSS SNAPSHOT. a2v updates the video
@@ -593,14 +678,24 @@ MetalBlock::forward(ComputeEncoder& enc, GpuStreamInput& video,
     // one direction than the other.
     _ops->copy(enc, (*video.x), _s->snap_v, video.tokens * _w.video.dim);
     _ops->copy(enc, (*audio.x), _s->snap_a, audio.tokens * _w.audio.dim);
-    av_cross_(enc, _w.a2v, _w.video, video, _s->snap_v, _w.audio, audio, _s->snap_a,
-              0, &_v_cross, &_a_cross);
-    av_cross_(enc, _w.v2a, _w.audio, audio, _s->snap_a, _w.video, video, _s->snap_v,
-              2, &_a_cross, &_v_cross);
+    av_cross_(enc, _w.a2v, _w.video, video, _s->snap_v, _w.audio, audio,
+              _s->snap_a, 0, &_v_cross, &_a_cross,
+              lora != nullptr ? &lora->a2v : nullptr);
+    av_cross_(enc, _w.v2a, _w.audio, audio, _s->snap_a, _w.video, video,
+              _s->snap_v, 2, &_a_cross, &_v_cross,
+              lora != nullptr ? &lora->v2a : nullptr);
   }
 
-  if (rv) { stream_ff_(enc, _w.video, video); }
-  if (ra) { stream_ff_(enc, _w.audio, audio); }
+  if (rv) {
+    stream_ff_(enc, _w.video, video,
+               lora != nullptr ? &lora->video_ff_in : nullptr,
+               lora != nullptr ? &lora->video_ff_out : nullptr);
+  }
+  if (ra) {
+    stream_ff_(enc, _w.audio, audio,
+               lora != nullptr ? &lora->audio_ff_in : nullptr,
+               lora != nullptr ? &lora->audio_ff_out : nullptr);
+  }
   return true;
 }
 

@@ -13,6 +13,15 @@
 
 namespace ltx25 {
 
+// A runtime low-rank adapter over this block's linears. Declared rather
+// than included: the block consumes the pairs, it does not load them,
+// and ltx25-lora.h pulls in the weight set a block has no business
+// knowing about. See ltx25-lora.h for why the delta is applied to the
+// OUTPUT instead of folded into the weight.
+struct LoraPair;
+struct LoraAttn;
+struct LoraBlock;
+
 // One `BasicAVTransformerBlock` on the GPU.
 //
 // The forward is a transcription of ltx25-block-ref's -- same order,
@@ -168,11 +177,19 @@ struct BlockScratch {
   // those still hold the query side's when the attention runs.
   vpipe::metal_compute::SharedBuffer kv_scale, kv_shift;
   vpipe::metal_compute::SharedBuffer snap_v, snap_a;
+  // A runtime LoRA's two intermediates: [tokens][rank] for the down
+  // projection and [tokens][out] for the up, before it is added into
+  // the linear's own output. EMPTY on every run that loads no adapter,
+  // which is why they are sized from the adapter rather than from the
+  // block -- `lora_d` at the feed-forward's 16384 is as large as `ff`,
+  // and a run with no LoRA should not pay for it.
+  vpipe::metal_compute::SharedBuffer lora_r, lora_d;
 
   // What it is currently sized FOR. A block whose shape exceeds any of
   // these grows the arena in place; every block already holding it sees
   // the grown buffers, because they hold the same object.
   std::size_t tokens = 0, dim = 0, levels = 0, ffh = 0;
+  std::size_t lora_rank = 0, lora_out = 0;
 
   // The steel-attention plans this stack has met, one per distinct
   // (heads, tq, tkv, head_dim). A forward meets at most four -- video
@@ -213,8 +230,13 @@ struct BlockScratch {
   // `t` is the widest of video / audio / caption tokens, `d` the widest
   // stream, `f` the widest feed-forward hidden, `l` the denoise levels
   // -- the same four reserve() reduces its arguments to.
+  // `r` / `o` are the adapter's widest rank and widest output, 0 for a
+  // run with no LoRA -- which is what every caller that cannot know one
+  // yet passes, and what makes those two planes cost nothing there.
   static std::uint64_t predict_bytes(std::size_t t, std::size_t d,
-                                     std::size_t f, std::size_t l) noexcept;
+                                     std::size_t f, std::size_t l,
+                                     std::size_t r = 0,
+                                     std::size_t o = 0) noexcept;
 };
 
 class MetalBlock {
@@ -244,9 +266,14 @@ public:
   // first call sizes it, the rest adopt it, and one that is too small
   // for a later block grows in place. Null allocates a private arena,
   // which is what a test driving a single block wants.
+  //
+  // `max_lora_rank` / `max_lora_out` size the adapter planes. 0 leaves
+  // them unallocated, so a stack that never sees a LoRA is byte-for-byte
+  // the arena it was before adapters existed.
   bool reserve(int max_video_tokens, int max_audio_tokens, int max_text,
                std::string* err, int max_levels = 1,
-               std::shared_ptr<BlockScratch>* arena = nullptr);
+               std::shared_ptr<BlockScratch>* arena = nullptr,
+               int max_lora_rank = 0, int max_lora_out = 0);
 
   // The weights this block adopted. Read-only, and only two callers
   // want it: the residency probe and the prefetch, both of which need
@@ -278,9 +305,14 @@ public:
   // Run the block, updating `video.x` / `audio.x` in place. Encodes into
   // `enc`; the caller commits. False (with `err`) on a shape
   // disagreement.
+  // `lora` is THIS LAYER's adapted linears, or null. Passed per call
+  // rather than held in GpuBlockWeights on purpose: a streaming slot is
+  // refilled with a DIFFERENT layer's weights between forwards, and a
+  // cached pointer would then adapt block 12 with block 5's delta --
+  // which renders, slightly wrong, and nothing in the shapes says so.
   bool forward(vpipe::metal_compute::ComputeEncoder& enc,
                GpuStreamInput& video, GpuStreamInput& audio,
-               std::string* err);
+               std::string* err, const LoraBlock* lora = nullptr);
 
   // The RoPE tables this forward will use, uploaded. Held here rather
   // than passed per call because a 48-block stack shares one set and
@@ -308,13 +340,16 @@ private:
                       const vpipe::metal_compute::SharedBuffer& xkv,
                       int tkv,
                       const RopeGpu* q_pe, const RopeGpu* k_pe,
-                      const vpipe::metal_compute::SharedBuffer& out);
+                      const vpipe::metal_compute::SharedBuffer& out,
+                      const LoraAttn* lora);
 
   void stream_first_half_(vpipe::metal_compute::ComputeEncoder& enc,
                           const GpuStream& w, GpuStreamInput& s,
-                          const RopeGpu* pe);
+                          const RopeGpu* pe, const LoraAttn* l1,
+                          const LoraAttn* l2);
   void stream_ff_(vpipe::metal_compute::ComputeEncoder& enc,
-                  const GpuStream& w, GpuStreamInput& s);
+                  const GpuStream& w, GpuStreamInput& s,
+                  const LoraPair* l_in, const LoraPair* l_out);
   // One direction of the audio<->video cross-attention. `lo` is 0 for
   // a2v and 2 for v2a.
   void av_cross_(vpipe::metal_compute::ComputeEncoder& enc,
@@ -323,7 +358,16 @@ private:
                  const vpipe::metal_compute::SharedBuffer& q_snap,
                  const GpuStream& kv_w, GpuStreamInput& kv_in,
                  const vpipe::metal_compute::SharedBuffer& kv_snap, int lo,
-                 const RopeGpu* q_pe, const RopeGpu* kv_pe);
+                 const RopeGpu* q_pe, const RopeGpu* kv_pe,
+                 const LoraAttn* lora);
+
+  // `y[M][N] += (x @ A^T) @ B^T` through the shared arena, skipping
+  // silently when `p` is null or empty so every call site reads as one
+  // line beside the linear it rides on.
+  void lora_(vpipe::metal_compute::ComputeEncoder& enc,
+             const LoraPair* p,
+             const vpipe::metal_compute::SharedBuffer& x,
+             const vpipe::metal_compute::SharedBuffer& y, int M) const;
 
   // shift/scale/gate for rows [lo, lo+3) of a 9-row table, written into
   // the scratch modulation buffers. `rows` is the table's row count, so

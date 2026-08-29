@@ -89,7 +89,37 @@ build_conditioning(int latent_frames, int latent_h, int latent_w,
                       "{} -- it was encoded by a different VAE",
                       a.channels, channels)());
     }
-    if (a.h != latent_h || a.w != latent_w) {
+    if (a.placement == VideoAnchor::Placement::kIcLoraReference) {
+      const int f = a.downscale;
+      if (f < 1) {
+        return fail(fmt("an IC-LoRA reference has downscale {}; it must be "
+                        "at least 1", f)());
+      }
+      // Checked against the TARGET, not against the reference, because
+      // this is the constraint the adapter was trained under and the
+      // one the user can act on -- the reference is whatever the source
+      // clip encoded to.
+      if (latent_h % f != 0 || latent_w % f != 0) {
+        return fail(fmt("the clip is {}x{} in latent space, which is not "
+                        "divisible by this IC-LoRA's reference downscale "
+                        "factor {}. Choose an output size whose latent "
+                        "grid divides by {}",
+                        latent_h, latent_w, f, f)());
+      }
+      if (a.h != latent_h / f || a.w != latent_w / f) {
+        return fail(fmt("an IC-LoRA reference is {}x{} in latent space but "
+                        "this adapter downscales by {}, so it must be "
+                        "{}x{}. Encode the source clip at 1/{} of the "
+                        "output's resolution",
+                        a.h, a.w, f, latent_h / f, latent_w / f, f)());
+      }
+      if (a.frames > latent_frames) {
+        return fail(fmt("an IC-LoRA reference is {} latent frames but the "
+                        "clip is {}; the reference may not be longer than "
+                        "what is being generated", a.frames,
+                        latent_frames)());
+      }
+    } else if (a.h != latent_h || a.w != latent_w) {
       return fail(fmt("a video reference is {}x{} in latent space but the "
                       "clip is {}x{}. Encode the reference at the SAME "
                       "resolution as the output",
@@ -106,7 +136,9 @@ build_conditioning(int latent_frames, int latent_h, int latent_w,
                         latent_frames)());
       }
     } else {
-      v_extra += a.frames * per_frame;
+      // Sized from the ANCHOR's own grid, which is the target's for the
+      // first two placements and coarser for an IC-LoRA reference.
+      v_extra += a.frames * a.h * a.w;
     }
   }
   int a_extra = 0;
@@ -152,7 +184,7 @@ build_conditioning(int latent_frames, int latent_h, int latent_w,
   for (const VideoAnchor& a : video) {
     const std::uint8_t g = level_for_(&out->cond.v_levels, a.strength);
     const double m = 1.0 - a.strength;
-    const int n = a.frames * per_frame;
+    const int n = a.frames * a.h * a.w;
     const int base = (a.placement == VideoAnchor::Placement::kLatentIndex)
                          ? a.index * per_frame
                          : append_at;
@@ -177,6 +209,38 @@ build_conditioning(int latent_frames, int latent_h, int latent_w,
       video_spans(a.frames, latent_h, latent_w, geo, a.index,
                   /*single_pixel_frame=*/a.frames == 1,
                   /*causal_fix=*/a.index == 0,
+                  &out->cond.v_extra_starts, &out->cond.v_extra_ends);
+      append_at += n;
+    } else if (a.placement == VideoAnchor::Placement::kIcLoraReference) {
+      // THE WHOLE OF THE IC-LORA MECHANISM, and it is one line: the
+      // reference's own grid, with the SPATIAL scale factors multiplied
+      // by the downscale factor.
+      //
+      // A reference token then spans `downscale * scale_h` pixels
+      // instead of `scale_h`, so token (t, h, w) covers
+      // [h*f*32, (h+1)*f*32) -- the target pixels it actually stands
+      // for, and a midpoint RoPE reads as the centre of that patch.
+      // Time is NOT scaled: the reference runs at the target's frame
+      // rate, and its first latent frame is the clip's first frame, so
+      // causal_fix is on and there is no offset.
+      //
+      // TWO REFERENCE IMPLEMENTATIONS AGREE ON THIS, which is worth
+      // recording because they look nothing alike. Lightricks'
+      // `VideoConditionByReferenceLatent` multiplies the height and
+      // width positions -- start AND end -- by the factor, which is
+      // this. ComfyUI's `LTXVAddGuide` instead scatters the reference
+      // into a full-size zero grid at every f-th cell, patchifies THAT,
+      // adds `(f-1)*32` to the spatial END only, and drops the filler
+      // tokens later (the model removes any token whose denoise mask
+      // went negative). Its surviving token at (t, h*f, w*f) gets
+      // start = h*f*32 and end = (h*f + 1 + f - 1)*32 = (h+1)*f*32 --
+      // the same span. Neither the dilation nor the negative-mask drop
+      // is needed here; they are how that node expresses it.
+      RopeGeometry g2 = geo;
+      g2.scale_h *= a.downscale;
+      g2.scale_w *= a.downscale;
+      video_spans(a.frames, a.h, a.w, g2, /*pixel_frame_offset=*/0,
+                  /*single_pixel_frame=*/false, /*causal_fix=*/true,
                   &out->cond.v_extra_starts, &out->cond.v_extra_ends);
       append_at += n;
     }
