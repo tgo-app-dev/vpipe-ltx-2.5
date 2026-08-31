@@ -30,6 +30,9 @@ add_library(ltx25_dit_obj OBJECT
   src/ltx25-quant-family.cc
   src/ltx25-vae-ref.cc
   src/ltx25-vae.cc
+  src/ltx25-upscaler-ref.cc
+  src/ltx25-upscaler.cc
+  src/ltx25-upscale-stage.cc
     src/ltx25-generator.cc
     src/ltx25-conditioning.cc
     src/ltx25-sampler.cc
@@ -314,6 +317,33 @@ if(NOT MSVC)
     target_compile_options(ltx25-lora-trunk-test PRIVATE -Wall -Werror)
 endif()
 add_test(NAME ltx25-lora-trunk COMMAND ltx25-lora-trunk-test)
+
+# The latent upscalers' CPU reference, against the released checkpoints.
+add_executable(ltx25-upscaler-ref-test
+    tests/ltx25-upscaler-ref-test.cc
+    src/ltx25-upscaler-ref.cc)
+target_include_directories(ltx25-upscaler-ref-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(ltx25-upscaler-ref-test PRIVATE vpipe::vpipe)
+target_compile_features(ltx25-upscaler-ref-test PRIVATE cxx_std_20)
+if(NOT MSVC)
+    target_compile_options(ltx25-upscaler-ref-test PRIVATE -Wall -Werror)
+endif()
+add_test(NAME ltx25-upscaler-ref COMMAND ltx25-upscaler-ref-test)
+
+# The latent upscalers on the GPU, against the CPU reference.
+add_executable(ltx25-upscaler-test
+    tests/ltx25-upscaler-test.cc
+    $<TARGET_OBJECTS:ltx25_dit_obj>
+    $<TARGET_OBJECTS:ltx25_kernels_bf16_obj>)
+target_include_directories(ltx25-upscaler-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(ltx25-upscaler-test PRIVATE vpipe::vpipe)
+target_compile_features(ltx25-upscaler-test PRIVATE cxx_std_20)
+if(NOT MSVC)
+    target_compile_options(ltx25-upscaler-test PRIVATE -Wall -Werror)
+endif()
+add_test(NAME ltx25-upscaler COMMAND ltx25-upscaler-test)
 
 add_executable(ltx25-dit-stack-test
     tests/ltx25-dit-stack-test.cc

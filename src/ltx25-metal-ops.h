@@ -437,6 +437,48 @@ public:
                int Cin, int F, int H, int W, int p1, int p2, int p3,
                int drop) const;
 
+  // ---- the LATENT UPSCALERS ------------------------------------------
+  //
+  // Their convolutions ZERO-pad on every axis (torch Conv3d/Conv2d
+  // padding=1), which is why they cannot use either VAE im2col: that one
+  // REPLICATES in time, and the causal one pads frame 0 twice at the
+  // front. Wrong only at the first and last frame, so it would survive a
+  // mean check and show up as a temporal seam.
+  //
+  // The pixel shuffles need nothing new: `vae_d2s` already splits
+  // `(c p1 p2 p3)` with WIDTH fastest, which is exactly PixelShuffleND's
+  // nesting, and already drops the first frame. PixelShuffleND(1) is
+  // d2s(p1=2, p2=1, p3=1, drop=1); PixelShuffleND(2) is
+  // d2s(p1=1, p2=2, p3=2, drop=0).
+
+  // 3x3x3 im2col, ZERO-padded on all three axes. Columns [ci][kf][kh][kw].
+  void ups_im2col(vpipe::metal_compute::ComputeEncoder& enc,
+                  const vpipe::metal_compute::SharedBuffer& x,
+                  const vpipe::metal_compute::SharedBuffer& out,
+                  int C, int F, int H, int W, int cell0, int n_cells) const;
+
+  // 3x3 im2col applied PER FRAME -- the spatial upsampler's Conv2d.
+  // Columns [ci][kh][kw].
+  void ups_im2col2d(vpipe::metal_compute::ComputeEncoder& enc,
+                    const vpipe::metal_compute::SharedBuffer& x,
+                    const vpipe::metal_compute::SharedBuffer& out,
+                    int C, int F, int H, int W, int cell0,
+                    int n_cells) const;
+
+  // GroupNorm in place over channel-last [cells][C]. `gamma`/`beta` are
+  // f32 and per channel; eps is torch's 1e-5 default.
+  void ups_group_norm(vpipe::metal_compute::ComputeEncoder& enc,
+                      const vpipe::metal_compute::SharedBuffer& x,
+                      const vpipe::metal_compute::SharedBuffer& gamma,
+                      const vpipe::metal_compute::SharedBuffer& beta,
+                      int C, int cells, int groups = 32,
+                      float eps = 1e-5f) const;
+
+  // SiLU in place.
+  void ups_silu(vpipe::metal_compute::ComputeEncoder& enc,
+                const vpipe::metal_compute::SharedBuffer& x,
+                std::size_t n) const;
+
   // channel-last -> the channel-first f32 picture.
   void vae_unpatchify(vpipe::metal_compute::ComputeEncoder& enc,
                       const vpipe::metal_compute::SharedBuffer& x,
@@ -569,7 +611,8 @@ private:
       _fn_vae_whiten,
       _fn_aud_denorm, _fn_aud_im2col, _fn_aud_up2x, _fn_aud_out,
       _fn_aud_mel_in, _fn_aud_im2col_dn, _fn_aud_whiten,
-      _fn_bias_add;
+      _fn_bias_add,
+      _fn_ups_im2col, _fn_ups_im2col2d, _fn_ups_gn, _fn_ups_silu;
 
   // [bits 4|8][group 32|64][bm 32|64]. Resolved in init() and OPTIONAL
   // -- a host without them still runs a dense checkpoint.

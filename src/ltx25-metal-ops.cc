@@ -108,6 +108,10 @@ MetalOps::init(MetalCompute* mc, std::string* err)
   _fn_vae_pns     = _lib_ltx.function("ltx_vae_pixel_norm_silu");
   _fn_vae_add     = _lib_ltx.function("ltx_vae_add_into");
   _fn_vae_d2s     = _lib_ltx.function("ltx_vae_d2s");
+  _fn_ups_im2col   = _lib_ltx.function("ltx_ups_im2col");
+  _fn_ups_im2col2d = _lib_ltx.function("ltx_ups_im2col2d");
+  _fn_ups_gn       = _lib_ltx.function("ltx_ups_group_norm");
+  _fn_ups_silu     = _lib_ltx.function("ltx_ups_silu");
   _fn_vae_unpatch = _lib_ltx.function("ltx_vae_unpatchify");
   _fn_vae_patch_in  = _lib_ltx.function("ltx_vae_patchify_in");
   _fn_vae_im2col_c  = _lib_ltx.function("ltx_vae_im2col_causal");
@@ -275,6 +279,10 @@ MetalOps::init(MetalCompute* mc, std::string* err)
       {&_fn_vae_add, "ltx_vae_add_into"},
       {&_fn_vae_d2s, "ltx_vae_d2s"},
       {&_fn_vae_unpatch, "ltx_vae_unpatchify"},
+      {&_fn_ups_im2col, "ltx_ups_im2col"},
+      {&_fn_ups_im2col2d, "ltx_ups_im2col2d"},
+      {&_fn_ups_gn, "ltx_ups_group_norm"},
+      {&_fn_ups_silu, "ltx_ups_silu"},
       {&_fn_vae_patch_in, "ltx_vae_patchify_in"},
       {&_fn_vae_im2col_c, "ltx_vae_im2col_causal"},
       {&_fn_vae_s2d, "ltx_vae_s2d"},
@@ -1231,6 +1239,71 @@ MetalOps::vae_add_into(ComputeEncoder& enc, const SharedBuffer& y,
   enc.set_buffer(0, y);
   enc.set_buffer(1, x);
   enc.set_constant(2, (int)n);
+  enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
+}
+
+void
+MetalOps::ups_im2col(ComputeEncoder& enc, const SharedBuffer& x,
+                     const SharedBuffer& out, int C, int F, int H, int W,
+                     int cell0, int n_cells) const
+{
+  enc.set_function(_fn_ups_im2col);
+  enc.set_buffer(0, x);
+  enc.set_buffer(1, out);
+  enc.set_constant(2, C);
+  enc.set_constant(3, F);
+  enc.set_constant(4, H);
+  enc.set_constant(5, W);
+  enc.set_constant(6, cell0);
+  enc.set_constant(7, n_cells);
+  enc.dispatch({(unsigned)C, (unsigned)n_cells, 1}, {32, 1, 1});
+}
+
+void
+MetalOps::ups_im2col2d(ComputeEncoder& enc, const SharedBuffer& x,
+                       const SharedBuffer& out, int C, int F, int H, int W,
+                       int cell0, int n_cells) const
+{
+  enc.set_function(_fn_ups_im2col2d);
+  enc.set_buffer(0, x);
+  enc.set_buffer(1, out);
+  enc.set_constant(2, C);
+  enc.set_constant(3, F);
+  enc.set_constant(4, H);
+  enc.set_constant(5, W);
+  enc.set_constant(6, cell0);
+  enc.set_constant(7, n_cells);
+  enc.dispatch({(unsigned)C, (unsigned)n_cells, 1}, {32, 1, 1});
+}
+
+void
+MetalOps::ups_group_norm(ComputeEncoder& enc, const SharedBuffer& x,
+                         const SharedBuffer& gamma, const SharedBuffer& beta,
+                         int C, int cells, int groups, float eps) const
+{
+  if (groups <= 0 || C % groups != 0) { return; }
+  // ONE THREADGROUP PER GROUP, and 256 threads because that is the
+  // `part[]` the kernel declares and its tree reduction assumes a power
+  // of two. Only 32 groups, so this is low occupancy on its own -- it
+  // sits between two convolutions that are not.
+  enc.set_function(_fn_ups_gn);
+  enc.set_buffer(0, x);
+  enc.set_buffer(1, gamma);
+  enc.set_buffer(2, beta);
+  enc.set_constant(3, C);
+  enc.set_constant(4, cells);
+  enc.set_constant(5, groups);
+  enc.set_constant(6, eps);
+  enc.dispatch({(unsigned)(256 * groups), 1, 1}, {256, 1, 1});
+}
+
+void
+MetalOps::ups_silu(ComputeEncoder& enc, const SharedBuffer& x,
+                   std::size_t n) const
+{
+  enc.set_function(_fn_ups_silu);
+  enc.set_buffer(0, x);
+  enc.set_constant(1, (int)n);
   enc.dispatch({(unsigned)n, 1, 1}, {256, 1, 1});
 }
 

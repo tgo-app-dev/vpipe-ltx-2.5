@@ -28,6 +28,7 @@
 #include "ltx25-config.h"
 #include "ltx25-family.h"
 #include "ltx25-conditioner-stage.h"
+#include "ltx25-upscale-stage.h"
 #include "ltx25-model-config-stage.h"
 #include "ltx25-quant-family.h"
 #include "ltx25-vae-family.h"
@@ -75,6 +76,18 @@ ltx25_register(vpipe::VpipePluginContext* ctx)
   // produce a soundtrack at all.
   ctx->register_stage<ltx25::Ltx25ConditionerStage>(
       ltx25::Ltx25ConditionerStage::stage_spec());
+
+  // The LATENT upscalers. A STAGE rather than a registry entry, because
+  // unlike the VAE there is no host stage to join: nothing in the tree
+  // upscales a latent, so this is a new operation rather than a new
+  // backend for an existing one.
+
+  // The LATENT upscalers. A STAGE rather than a registry entry, because
+  // unlike the VAE there is no host stage to join: nothing in the tree
+  // upscales a latent, so this is a new operation rather than a new
+  // backend for an existing one.
+  ctx->register_stage<ltx25::Ltx25UpscaleStage>(
+      ltx25::Ltx25UpscaleStage::stage_spec());
 
   // ...and its VAE, through the registry rather than a stage of its own.
   // `vae-decode` picks its built-in decoder from a hardcoded

@@ -1440,3 +1440,184 @@ ltx_bias_add(
   if (i >= total) { return; }
   y[i] = VPIPE_ELT(float(y[i]) + float(bias[i % N]));
 }
+
+// ---------------------------------------------------------------------
+// The LATENT UPSCALERS
+// ---------------------------------------------------------------------
+//
+// These need their own im2col even though the VAE has two already, and
+// the reason is padding. ltx_vae_im2col REPLICATES in time and ZEROS in
+// space, which is the decoder's asymmetry; ltx_vae_im2col_causal pads
+// two copies of frame 0 at the front. The upsampler's convolutions are
+// plain torch Conv3d(padding=1), which is ZERO on EVERY axis. Reusing
+// either VAE gather here is wrong only at the first and last frame --
+// invisible in a mean, visible as a temporal seam.
+//
+// Following the VAE's own precedent, this is a separate entry point
+// rather than a flag: the gather is the hot path and a branch in it
+// costs more than a second kernel.
+
+// im2col for a 3x3x3 convolution, ZERO-padded on all three axes.
+// Column order [ci][kf][kh][kw], matching a [C_out][C_in][3][3][3]
+// weight's own flattening, so no weight is permuted at load.
+// 0:x 1:out 2:C 3:F 4:H 5:W 6:cell0 7:n_cells
+kernel void ltx_ups_im2col(
+    const device VPIPE_ELT* x       [[buffer(0)]],
+    device VPIPE_ELT*       out     [[buffer(1)]],
+    constant int&           C       [[buffer(2)]],
+    constant int&           F       [[buffer(3)]],
+    constant int&           H       [[buffer(4)]],
+    constant int&           W       [[buffer(5)]],
+    constant int&           cell0   [[buffer(6)]],
+    constant int&           n_cells [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const int ci = (int)gid.x;
+  const int j  = (int)gid.y;
+  if (ci >= C || j >= n_cells) { return; }
+  const int cell = cell0 + j;
+  const int w0 = cell % W;
+  const int h0 = (cell / W) % H;
+  const int f0 = cell / (W * H);
+
+  device VPIPE_ELT* dst = out + (uint)j * (uint)(C * 27) + (uint)ci * 27u;
+  for (int kf = 0; kf < 3; ++kf) {
+    const int sf = f0 + kf - 1;
+    for (int kh = 0; kh < 3; ++kh) {
+      const int sh = h0 + kh - 1;
+      for (int kw = 0; kw < 3; ++kw) {
+        const int sw = w0 + kw - 1;
+        const int t = (kf * 3 + kh) * 3 + kw;
+        if (sf < 0 || sf >= F || sh < 0 || sh >= H || sw < 0 || sw >= W) {
+          dst[t] = (VPIPE_ELT)0.0f;        // ZERO in time as well
+        } else {
+          dst[t] = x[(((uint)sf * (uint)H + (uint)sh) * (uint)W + (uint)sw)
+                     * (uint)C + (uint)ci];
+        }
+      }
+    }
+  }
+}
+
+// im2col for a 3x3 convolution applied PER FRAME -- the spatial
+// upsampler, whose weight is 4-D and whose module reshapes to
+// (b f) c h w before running a Conv2d. Column order [ci][kh][kw].
+// 0:x 1:out 2:C 3:F 4:H 5:W 6:cell0 7:n_cells
+kernel void ltx_ups_im2col2d(
+    const device VPIPE_ELT* x       [[buffer(0)]],
+    device VPIPE_ELT*       out     [[buffer(1)]],
+    constant int&           C       [[buffer(2)]],
+    constant int&           F       [[buffer(3)]],
+    constant int&           H       [[buffer(4)]],
+    constant int&           W       [[buffer(5)]],
+    constant int&           cell0   [[buffer(6)]],
+    constant int&           n_cells [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const int ci = (int)gid.x;
+  const int j  = (int)gid.y;
+  if (ci >= C || j >= n_cells) { return; }
+  const int cell = cell0 + j;
+  const int w0 = cell % W;
+  const int h0 = (cell / W) % H;
+  const int f0 = cell / (W * H);
+  if (f0 >= F) { return; }
+
+  device VPIPE_ELT* dst = out + (uint)j * (uint)(C * 9) + (uint)ci * 9u;
+  for (int kh = 0; kh < 3; ++kh) {
+    const int sh = h0 + kh - 1;
+    for (int kw = 0; kw < 3; ++kw) {
+      const int sw = w0 + kw - 1;
+      const int t = kh * 3 + kw;
+      if (sh < 0 || sh >= H || sw < 0 || sw >= W) {
+        dst[t] = (VPIPE_ELT)0.0f;
+      } else {
+        dst[t] = x[(((uint)f0 * (uint)H + (uint)sh) * (uint)W + (uint)sw)
+                   * (uint)C + (uint)ci];
+      }
+    }
+  }
+}
+
+// GroupNorm over channel-last [cells][C], in place, affine per channel.
+//
+// THE REDUCTION SPANS THE WHOLE GROUP -- channels-in-group x cells --
+// which is what makes it a GROUP norm. Reducing per channel instead is
+// an InstanceNorm, and it produces a normalised tensor of exactly the
+// same shape.
+//
+// TWO PASSES over the data for the variance rather than E[x^2]-E[x]^2:
+// the inputs here are bf16 and the group spans tens of thousands of
+// elements, where the one-pass form cancels. One threadgroup per group.
+// 0:x 1:gamma 2:beta 3:C 4:cells 5:groups 6:eps
+kernel void ltx_ups_group_norm(
+    device VPIPE_ELT*     x      [[buffer(0)]],
+    const device float*   gamma  [[buffer(1)]],
+    const device float*   beta   [[buffer(2)]],
+    constant int&         C      [[buffer(3)]],
+    constant int&         cells  [[buffer(4)]],
+    constant int&         groups [[buffer(5)]],
+    constant float&       eps    [[buffer(6)]],
+    uint  tgid [[threadgroup_position_in_grid]],
+    uint  lid  [[thread_index_in_threadgroup]],
+    uint  nth  [[threads_per_threadgroup]])
+{
+  threadgroup float part[256];
+  const int g = (int)tgid;
+  if (g >= groups) { return; }
+  const int per = C / groups;
+  const uint n = (uint)per * (uint)cells;
+
+  float s = 0.0f;
+  for (uint i = lid; i < n; i += nth) {
+    const uint k = i % (uint)per;
+    const uint cell = i / (uint)per;
+    s += (float)x[cell * (uint)C + (uint)(g * per) + k];
+  }
+  part[lid] = s;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint st = nth / 2; st > 0; st >>= 1) {
+    if (lid < st) { part[lid] += part[lid + st]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const float mean = part[0] / (float)n;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float q = 0.0f;
+  for (uint i = lid; i < n; i += nth) {
+    const uint k = i % (uint)per;
+    const uint cell = i / (uint)per;
+    const float d = (float)x[cell * (uint)C + (uint)(g * per) + k] - mean;
+    q += d * d;
+  }
+  part[lid] = q;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint st = nth / 2; st > 0; st >>= 1) {
+    if (lid < st) { part[lid] += part[lid + st]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const float inv = rsqrt(part[0] / (float)n + eps);
+
+  for (uint i = lid; i < n; i += nth) {
+    const uint k = i % (uint)per;
+    const uint cell = i / (uint)per;
+    const int ci = g * per + (int)k;
+    const uint o = cell * (uint)C + (uint)ci;
+    const float v = (float)x[o];
+    x[o] = (VPIPE_ELT)(((v - mean) * inv) * gamma[ci] + beta[ci]);
+  }
+}
+
+// SiLU in place. Standalone because the ResBlock needs it in two places
+// that are NOT both preceded by a norm: once after GroupNorm, and once
+// after the residual has already been added.
+// 0:x 1:N
+kernel void ltx_ups_silu(
+    device VPIPE_ELT* x [[buffer(0)]],
+    constant int&     N [[buffer(1)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= (uint)N) { return; }
+  const float v = (float)x[gid];
+  x[gid] = (VPIPE_ELT)(v / (1.0f + exp(-v)));
+}
