@@ -64,6 +64,9 @@ five files this port reads:
   — a picture and a prompt in, frames out: the clip starts AT your image.
 - **[`ltx-2.5-audio-reference.vpipeline`](pipelines/ltx-2.5-audio-reference.vpipeline)**
   — an audio file and a prompt in: the soundtrack is guided by the reference.
+- **[`ltx-2.5-spatial-upscale.vpipeline`](pipelines/ltx-2.5-spatial-upscale.vpipeline)**
+  — the text-to-video graph with one stage added: the latent is upscaled 2x
+  before it is decoded, so a 960 x 544 generation is saved at 1920 x 1088.
 
 They are plain JSON — read them, edit them, keep them in version control.
 
@@ -294,6 +297,84 @@ From `generate-video`:
 | `steps` | 8 | The distilled schedule is **fixed at 8**. Asking for another number is ignored with a warning — it is baked into the checkpoint, not a preference. |
 | `seed` | 6 | Same seed + same settings ⇒ same clip. |
 | `unload_when_idle` | `always` | Drop the DiT between runs. |
+| `sol_attn` | `false` | **Sol-Attn**, an opt-in *lossy* accelerated mode. See below. |
+| `sage_attn` | `false` | **SageAttention**, a second one — the QK product in int8. Matrix cores only. See below. |
+| `i8_gemm` | `false` | The block's GEMMs in int8. Matrix cores only, and independent of both of the above: this one changes how a weight is multiplied, they change what the attention between the GEMMs reads and how. |
+
+#### Faster attention — Sol-Attn
+
+`"sol_attn": true` on `generate-video`. It needs nothing you do not already
+have: no second checkpoint, no extra weights, and no memory — everything it
+computes lives for the length of one attention call, so it borrows two planes
+of the block's own scratch that are idle exactly then.
+
+Attention is dominated by key blocks that contribute almost nothing, and
+*which* ones those are depends on the clip, the head and the block, so it
+cannot be decided in advance. Sol decides it while the softmax runs, from a
+proxy it computes anyway: per block of 64 keys it keeps the keys' centroid and
+the values' mean, and one product against those centroids scores every key
+block at 1/64 of the dense cost. A block above the threshold is attended
+**exactly**; one below is folded into the same running softmax as if all 64 of
+its keys carried the centroid's score. Nothing is dropped and there is no
+second pass.
+
+**It applies to the VIDEO self-attention and to nothing else here.** The text
+cross-attention and both audio↔video directions have a key set that is not
+their query set, where summarising by centroids would be summarising the wrong
+sequence; the audio stream's own self-attention is 64 wide where the method is
+specified at 128. Those three stay dense, and the log line reports the fraction
+of key blocks the video attention kept exact once per forward — a measured
+number, since realized sparsity is a property of the clip rather than of the
+threshold.
+
+| key | shipped | notes |
+|---|---|---|
+| `sol_tau` | `1.0` | In standard deviations of the proxy's own spread. Higher keeps fewer blocks: speed rises and fidelity falls, monotonically in both. |
+| `sol_key_block` | `64` | **32 or 64 only.** 32 does more exact work and is more faithful; larger blocks were measured and lose on both counts. |
+| `sol_dense_layers` | `1` | Leading blocks left exact. The first is where the residual stream is least redundant. |
+| `sol_local_radius` | `1` | Key blocks either side of the query's own, kept exact whatever the threshold says. LTX's positions make the attention strongly local, so this band is doing most of the work. |
+
+`VPIPE_SOL_ATTN=0` takes it away from a graph that asked for it and `=1` gives
+it to one that did not, which is how to A/B a clip against itself. It composes
+with `i8_gemm`: that one changes how the block's GEMMs are computed, this one
+which key blocks the attention between them reads at all.
+
+#### Cheaper attention — SageAttention's int8 QK
+
+`"sage_attn": true`. Where Sol-Attn decides which key blocks are *read*,
+Sage changes how the ones that are read are *computed*: the flash
+attention's QK product runs in int8 with one scale per attention block,
+and the key side is quantized as `K − mean(K)` over tokens. That smoothing
+is exact rather than approximate — a per-channel shift moves every score
+in a row by the same amount and softmax does not see it — and `P·V` stays
+in the tensor dtype, because a probability is already well-conditioned
+and quantizing it buys the same again for a much worse error.
+
+**Matrix cores only.** The int8 fragment MMA has no ALU fallback, so on a
+GPU without them the mode declines, says so once, and the clip renders
+dense. That is not a failure and needs no change to the graph — the same
+pipeline runs on both boxes.
+
+**It applies to every attention here**, which is the difference from Sol.
+Sol summarises a key set, so it needs the keys to be the queries; Sage
+computes every key and every query, so the text cross-attention and both
+audio↔video directions take it as readily as the self-attentions, and the
+audio stream's 64-wide heads as readily as the video's 128.
+
+| key | shipped | notes |
+|---|---|---|
+| `sage_dense_layers` | `0` | Leading blocks left in the tensor dtype. Zero rather than `sol_dense_layers`' one: Sol *drops* keys, so an early block's less redundant residual stream is an argument for leaving it alone, while Sage computes all of them. |
+
+`VPIPE_SAGE_ATTN=0` / `=1` override, as for Sol.
+
+**Both at once is supported, and here is what it means.** They are
+orthogonal and neither reads the other's state, but on a block Sol
+*routes*, its exact half runs the flash kernel without the int8 twin — so
+Sage applies to everything Sol did not route: the text cross-attention,
+both audio↔video directions, the audio stream, and the leading blocks
+`sol_dense_layers` left exact. The two lend their scratch from different
+planes of the block's arena, which is why they can both be on without
+either allocating.
 
 And from **`ltx-2.5-model-config`**, wired to `generate-video`'s `model_config`
 iport (port 9):
@@ -408,6 +489,125 @@ has 9, and the clip came out coherent with its own soundtrack. Note what the
 generator logs — *"placed before the clip on the shared time axis"* — the
 reference sits at negative seconds, so it guides without overlapping the
 soundtrack being generated.
+
+## Step 5 — twice the picture, in latent space
+
+`ltx-2.5-spatial-upscale.vpipeline` is the text-to-video graph with **one
+stage inserted**: `ltx-2.5-latent-upscale` between `generate-video` and
+`vae-decode`. The clip is generated at 960 × 544 and saved at **1920 ×
+1088**.
+
+```
+generate-video -> ltx-2.5-latent-upscale -> vae-decode -> rgb-to-video -> save-video
+```
+
+```sh
+vpipe --plugin build/vpipe-ltx-2.5.so --launch ltx-2.5-spatial-upscale.vpipeline
+```
+
+**The upscale happens on the LATENT**, which is the whole point: decoding to
+pixels, resizing and re-encoding costs two extra VAE passes and loses whatever
+that round trip loses. `mode` picks the axis — `spatial` doubles height and
+width and leaves the frame count alone, `temporal` doubles the frames and
+leaves the picture alone. They are separate checkpoints, so doing both means
+two stages chained. A temporal pass emits **2F−1** latent frames rather than
+2F: the first latent frame encodes a single pixel frame, so the shuffle's
+first output frame is dropped — the same asymmetry the VAE decoder has.
+
+Only the **video** latent goes through it. The soundtrack is untouched and
+still comes off `generate-video`'s oport 1 into `audio-vae-decode`, so the
+audio branch is exactly the one Step 2 draws and is left out of the sketch
+above.
+
+### The upscalers are a separate download
+
+They are not in the DiT pack — 1.2 GB for the pair, catalogued on their own so
+a user who never runs stage 2 never fetches them. Add a second `model-fetch`
+stage to your prepare pipeline, or run one on its own:
+
+```json
+{
+  "id": "fetch-upscalers",
+  "type": "model-fetch",
+  "config": {
+    "model_path": "Lightricks/LTX-2.5",
+    "model_variant": "LTX-2.5-latent-upscalers",
+    "base_path": "./models",
+    "skip_existing_files": true
+  }
+}
+```
+
+They land in `latent_upscale_models/` beside the DiT, and the stage picks the
+file by **mode** rather than by a pinned name, so a re-versioned checkpoint
+still resolves.
+
+### Why this stage has its own `hf_dir`
+
+It takes no model port. It needs **two** things from a model directory and
+they do not have to come from the model you generated with:
+
+- `latent_upscale_models/` — the upscaler itself;
+- `vae/` — the **per-channel statistics**. The upscaler works in the VAE's
+  un-normalized latent space while `generate-video` emits a whitened one, so
+  the stage un-whitens on the way in and re-whitens on the way out. A
+  directory with no VAE is an error rather than a pass-through, because
+  running the model on the wrong scale returns a plausible latent that nothing
+  downstream can call wrong.
+
+In the shipped file `model-select` points at the quantized
+`local/LTX-2.5-distilled-8bit` while the upscale stage points at
+`LTX-2.5-latent-upscalers` — the key the fetch above registers, which resolves
+to the `Lightricks/LTX-2.5` directory holding both the upscalers and the VAE.
+That split is deliberate: the quantize pass builds a self-contained model out
+of the components it was given, and the upscalers are not among them. Both
+directories carry the same VAE, so the statistics agree.
+
+### What it costs
+
+One forward pass of a convolutional model — 949 MB of weights for the
+spatial one, 250 MB for the temporal — against a whole denoise of a 22B DiT.
+What you pay for is downstream: `vae-decode` then runs over **four times the
+pixels**, and the saved video is four times the frame area. Generating small
+and upscaling still beats generating at 1920 × 1088 outright, because the
+DiT's attention is quadratic in the token count and the upscaler's
+convolutions are not.
+
+**Measured**, at both 960 × 544 → 1920 × 1088 and 1280 × 704 → 2560 × 1408:
+**26.9 dB** against a Lanczos 2× of the same clip. That is the number that
+says the model does something a resize does not; what says it is *right* is
+the CPU reference the tests run against — the ported module matches both
+published checkpoints to **6.5e-7 – 4.4e-6** at every tap, and the Metal
+implementation tracks that reference to **1.2e-2 – 2.1e-2** at bf16, with the
+error flat across frames and channel groups.
+
+`unload_when_idle` takes the same words every model-holding stage takes:
+`auto` (the default, which lands on `park` here), `park`, `destroy`, `keep`.
+The shipped file says `park`, which lets the model go and hands its checkpoint
+to the kernel as purgeable, so a second clip rebuilds it without a disk read
+unless the box actually took the pages back. Measured on the run below: 949 MB
+handed over at the end of the clip.
+
+**Run end to end** on the graph above at 512 × 320 × 9 (the small geometry, to
+keep the denoise short): the DiT emitted a `[128, 2, 10, 16]` latent, the
+upscale stage loaded its 950 MB spatial checkpoint and doubled it, and
+`save-video` wrote a **1024 × 640** h264 clip with its AAC soundtrack. No
+warnings, and nothing else in the graph changed.
+
+### The other spatial upscaler
+
+There is a second one in the catalogue and it is a different mechanism.
+**`LTX-2.5-ic-lora-pixel-spatial-upscaler-x2`** is an in-context LoRA: you
+load it with `ltx-2.5-model-config`'s `lora` key, wire the source clip's
+encoded latent to `generate-video`'s `ref_latent0`, and run a **full denoise**
+at the doubled geometry with the small clip riding along as context. It
+generates the detail rather than interpolating it, and it costs a second full
+denoise at the larger size — where the latent upscaler costs one convolutional
+forward pass.
+
+The generator refuses that adapter when no reference is wired, because an
+IC-LoRA with nothing in context does not fail. It renders a plausible clip
+that ignored the input it was asked to upscale.
 
 ## Memory
 

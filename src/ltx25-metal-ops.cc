@@ -772,6 +772,156 @@ MetalOps::i8_takes(int M, int K, int N) const noexcept
 }
 
 bool
+MetalOps::set_sol(const vpipe::genai::sol::Config& cfg, std::string* err)
+{
+  _sol_cfg = cfg;
+  // The override goes THROUGH the config, not around it, so everything
+  // downstream -- sol_takes, the log line, the report -- reads one
+  // answer. =1 turns the tier on for a graph whose config left it off
+  // and =0 takes it away from one that asked; that is the A/B.
+  if (const char* e = std::getenv("VPIPE_SOL_ATTN")) {
+    _sol_cfg.enabled = (*e != '0');
+  }
+  _sol.reset();
+  if (!_sol_cfg.enabled) { return true; }
+  if (_mc == nullptr) {
+    if (err != nullptr) { *err = "no Metal device"; }
+    _sol_cfg.enabled = false;
+    return false;
+  }
+  std::string lerr;
+  _sol = vpipe::genai::MetalSolAttention::load(_mc, /*bf16=*/true, &lerr);
+  if (!_sol) {
+    // OFF, not half on. Leaving `enabled` true with no driver would make
+    // sol_takes() lie to a test that asks it whether the tier is live.
+    _sol_cfg.enabled = false;
+    if (err != nullptr) { *err = lerr; }
+    return false;
+  }
+  return true;
+}
+
+bool
+MetalOps::sol_takes(int heads, int tq, int tkv, int head_dim) const noexcept
+{
+  if (!_sol || !_sol_cfg.enabled || heads <= 0) { return false; }
+  if (head_dim != 128 || tq != tkv) { return false; }
+  const int blk = _sol_cfg.key_block > 0 ? _sol_cfg.key_block
+                                         : vpipe::genai::sol::kBlock;
+  return tq >= kSolMinBlocks * blk;
+}
+
+void
+MetalOps::sol_lend(const SharedBuffer& a, const SharedBuffer& b) const
+{
+  if (_sol) { _sol->set_arena(a, b); }
+}
+
+bool
+MetalOps::sol_attend(ComputeEncoder& enc, const SharedBuffer& q,
+                     const SharedBuffer& k, const SharedBuffer& v,
+                     const SharedBuffer& out, int heads, int tokens,
+                     int head_dim, std::string* err) const
+{
+  if (!_sol) {
+    if (err != nullptr) { *err = "sol_attn is not loaded"; }
+    return false;
+  }
+  // The SAME scale steel_attn_plan writes into its params, spelled once
+  // there and once here rather than shared, because the two kernels take
+  // it by different routes -- a buffer field and an argument.
+  const float scale = (float)(1.0 / std::sqrt((double)head_dim));
+  // A non-const copy so the sink can be filled per call. It is zero for
+  // every stream this model has, and stating that HERE is what makes a
+  // later heterogeneous sequence an edit at one site.
+  vpipe::genai::sol::Config c = _sol_cfg;
+  c.sink_start  = 0;
+  c.sink_tokens = 0;
+  SharedBuffer o = out.subview(0, out.byte_size());
+  return _sol->encode(enc, q, k, v, o, heads, tokens, head_dim, scale, c,
+                      err);
+}
+
+long long
+MetalOps::sol_exact_blocks() const noexcept
+{
+  return _sol ? _sol->exact_blocks() : 0;
+}
+
+long long
+MetalOps::sol_total_blocks() const noexcept
+{
+  return _sol ? _sol->total_blocks() : 0;
+}
+
+void
+MetalOps::sol_reset_counts() const noexcept
+{
+  if (_sol) { _sol->reset_counts(); }
+}
+
+std::size_t
+MetalOps::sol_resident_bytes() const noexcept
+{
+  return _sol ? _sol->resident_bytes() : 0;
+}
+
+bool
+MetalOps::set_sage(const vpipe::genai::sage::Config& cfg, std::string* err)
+{
+  _sage_cfg = cfg;
+  if (const char* e = std::getenv("VPIPE_SAGE_ATTN")) {
+    _sage_cfg.enabled = (*e != '0');
+  }
+  _sage.reset();
+  if (!_sage_cfg.enabled || _mc == nullptr) { return true; }
+  // THE MIDDLE CASE IS NOT A FAILURE, and the last one is. Null with
+  // `fatal` false is a box with no matrix cores, which
+  // load_for_model has already said once; null with `fatal` TRUE is a
+  // box that has them and could not build the kernels, and running
+  // dense there would report a Sage run whose numbers get believed.
+  bool fatal = false;
+  _sage = vpipe::genai::MetalSageAttention::load_for_model(
+      _mc, /*bf16=*/true, _sage_cfg, "ltx-2.5", &fatal);
+  if (!_sage) {
+    // OFF rather than half on, so sage_takes() cannot say yes to a tier
+    // with no driver behind it. The CALLER still holds what it asked
+    // for, which is what a log line about the decline needs.
+    _sage_cfg.enabled = false;
+    if (fatal) {
+      if (err != nullptr) {
+        *err = "the int8 attention kernels would not build";
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
+bool
+MetalOps::sage_takes(int head_dim) const noexcept
+{
+  // The steel plan has to exist for this width, because the int8 twin is
+  // the same specialisation with one more constant -- and it has to be
+  // the MATRIX-CORE plan, because that is the only kernel with an int8
+  // fragment MMA.
+  return (bool)_sage && _sage_cfg.enabled && _attn_nax &&
+         steel_attn_available(head_dim);
+}
+
+void
+MetalOps::sage_lend(const SharedBuffer& a, const SharedBuffer& b) const
+{
+  if (_sage) { _sage->set_arena(a, b); }
+}
+
+std::size_t
+MetalOps::sage_resident_bytes() const noexcept
+{
+  return _sage ? _sage->resident_bytes() : 0;
+}
+
+bool
 MetalOps::lora_on_matrix_cores(int M, int K, int N, int rank) const noexcept
 {
   if (_lora_mma_off || !_fn_lora_b128.valid()) { return false; }
@@ -1064,20 +1214,71 @@ MetalOps::steel_attn_plan(SteelAttn* p, int heads, int tq, int tkv,
   p->fn = (_attn_nax ? _lib_attn_nax : _lib_attn).function(name, fc);
   if (!p->fn.valid()) { return false; }
 
+  // AND THE INT8 TWIN, whenever this GPU could ever run it -- NOT when
+  // the current config asks for it. A plan is cached for the life of the
+  // stack while `sage_attn` is a per-GENERATION setting, so a twin built
+  // from the setting would be missing for every later generation that
+  // turned the tier on after one that had it off. The condition here is
+  // therefore the hardware and the library, both of which are fixed for
+  // the process; whether the twin is DISPATCHED is sdpa_steel's
+  // question and is asked per call.
+  //
+  // It costs one extra specialisation per distinct attention shape, of
+  // which a forward meets four.
+  if (_attn_nax && steel_attn_available(head_dim) &&
+      vpipe::genai::MetalSageAttention::available(_mc)) {
+    vpipe::metal_compute::FunctionConstants fi = fc;
+    fi.set_bool(vpipe::genai::sage::kQkInt8Constant, true);
+    p->fn_i8 = _lib_attn_nax.function(name, fi);
+  } else {
+    p->fn_i8 = vpipe::metal_compute::ComputeFunction{};
+  }
+
   p->heads = heads;
   p->tq = tq;
   p->tkv = tkv;
   p->head_dim = head_dim;
   p->bq = bq;
+  p->bk = bk;
   return true;
 }
 
 void
 MetalOps::sdpa_steel(ComputeEncoder& enc, const SteelAttn& p,
                      const SharedBuffer& q, const SharedBuffer& k,
-                     const SharedBuffer& v, const SharedBuffer& out) const
+                     const SharedBuffer& v, const SharedBuffer& out,
+                     int sage_layer) const
 {
-  enc.set_function(p.fn);
+  // THE INT8 PROLOGUE, into this encoder and immediately before the
+  // dispatch that reads what it wrote. The encoder is serial, so that
+  // ordering is the whole synchronisation.
+  //
+  // The tile check is not paranoia: the scales are one per the
+  // ATTENTION kernel's own tiles, so a prologue sized against different
+  // numbers than the kernel indexes with would read past its scale
+  // arrays. These two are the same numbers by construction -- Sage only
+  // runs on the matrix-core plan, whose tiles are 64/32 -- and asking
+  // is what keeps that true if either side ever moves.
+  bool i8 = false;
+  if (sage_layer >= 0 && p.fn_i8.valid() && (bool)_sage &&
+      sage_layer >= _sage_cfg.dense_layers &&
+      p.bq == vpipe::genai::MetalSageAttention::nax_query_block() &&
+      p.bk == vpipe::genai::MetalSageAttention::nax_key_block()) {
+    // Head-major [H, L, D]: head 0 row 0 is element 0, tokens are D
+    // apart and heads are L*D apart. The head stride is its own number
+    // and is NOT derived from the row stride -- in a fused projection
+    // the two are unrelated, and this layout is the easy case rather
+    // than the general one.
+    using Operand = vpipe::genai::MetalSageAttention::Operand;
+    const Operand qo{&q, 0, p.head_dim, p.tq * p.head_dim};
+    const Operand ko{&k, 0, p.head_dim, p.tkv * p.head_dim};
+    std::string serr;
+    // `kv_heads` is `heads`: there is no GQA anywhere in this DiT, which
+    // is the same assumption steel_attn_plan writes into gqa_factor.
+    i8 = _sage->prepare(enc, qo, ko, p.heads, p.heads, p.tq, p.tkv,
+                        p.head_dim, p.bq, p.bk, _sage_cfg, &serr);
+  }
+  enc.set_function(i8 ? p.fn_i8 : p.fn);
   enc.set_buffer(0, q);
   enc.set_buffer(1, k);
   enc.set_buffer(2, v);
@@ -1086,6 +1287,7 @@ MetalOps::sdpa_steel(ComputeEncoder& enc, const SteelAttn& p,
   // The mask and sink buffers (5, 6) are guarded by function constants
   // 300/302 and are not declared in this specialisation, so binding them
   // would be binding arguments the pipeline does not have.
+  if (i8) { _sage->bind(enc); }        // 15..18, and only on the twin
   enc.dispatch({32 * (unsigned)((p.tq + p.bq - 1) / p.bq),
                 4 * (unsigned)p.heads, 1}, {32, 4, 1});
 }

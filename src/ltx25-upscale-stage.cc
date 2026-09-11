@@ -6,6 +6,7 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
+#include "generative-models/generative-model-manager.h"
 #include "stages/model-memory.h"
 #include "stages/model-registry.h"
 
@@ -40,7 +41,23 @@ const ConfigKey kAttrs[] = {
           "<hf_dir>/latent_upscale_models/ and the per-channel statistics "
           "they need from <hf_dir>/vae -- both, because the upscaler's own "
           "checkpoint carries no statistics and works in the VAE's "
-          "un-normalized latent space"},
+          "un-normalized latent space",
+   // A picker of its own, filtered to the UPSCALER entry rather than to
+   // the family: `ltx-2.5` records name the same directory, but only
+   // this one's presence says latent_upscale_models/ was actually
+   // fetched -- they are a separate download. Without the allow-list the
+   // browser would offer nothing at all: the entry carries a
+   // parent_model_type, so it is a SUPPLEMENT, and an untyped model
+   // field shows plain models only.
+   //
+   // NOT on the "diffusion-model" channel, deliberately. A channel
+   // consumer contributes its types to what model-select offers, and an
+   // upscaler-only record is not something generate-video can run.
+   // The other half of what this stage needs -- a VAE beside the
+   // upscalers -- no model_type filter can express, so it stays the
+   // runtime check that names what is missing.
+   .suggest_db = vpipe::kModelRegistryDb,
+   .suggest_db_type = "ltx-2.5-upscaler"},
   {.key = "mode", .type = ConfigType::String, .required = false,
    .doc = "'spatial' (the default) doubles height and width and leaves the "
           "frame count alone; 'temporal' doubles the frames and leaves the "
@@ -49,13 +66,20 @@ const ConfigKey kAttrs[] = {
           "shuffle's first output frame is dropped -- the same asymmetry "
           "the VAE decoder has. Chain two stages to do both",
    .def_str = "spatial"},
-  {.key = "unload_when_idle", .type = ConfigType::Bool, .required = false,
-   .doc = "drop the model's scratch after each beat. The weights stay (a "
-          "GB for the spatial model, 260 MB for the temporal one); this "
-          "only releases the im2col and the two working planes, which "
-          "scale with the CLIP and are the part worth giving back to a "
-          "denoise that follows",
-   .def_bool = false},
+  {.key = "unload_when_idle", .type = ConfigType::String, .required = false,
+   .doc = "what happens to the upscaler between clips. The same "
+          "vocabulary every model-holding stage takes. \"auto\" (the "
+          "default) resolves from the box and lands on park here. "
+          "\"park\" lets the model go and hands its checkpoint to the "
+          "kernel as purgeable: the pages survive unless something else "
+          "needs the RAM, so the next clip rebuilds without a disk read "
+          "if nothing took them. \"destroy\" gives the bytes back and "
+          "pays a full reload. \"keep\" holds the model and its scratch "
+          "pinned. The legacy always|never and a legacy BOOL are "
+          "accepted. Anything but keep also releases the scratch -- the "
+          "im2col and the two working planes, which scale with the clip "
+          "and are the part worth giving back to a denoise that follows",
+   .def_str = "auto"},
 };
 
 const PortSpec kIports[] = {
@@ -94,15 +118,50 @@ Ltx25UpscaleStage::Ltx25UpscaleStage(const SessionContextIntf* session,
                                          std::move(iports),
                                          std::move(config))
 {
+  // The oports have to be ALLOCATED before any early return: a stage
+  // that skips this reports ZERO oports to pipeline_from_spec, and a
+  // bad-config refusal would then surface as an out-of-range edge
+  // instead of the message that says what is actually wrong.
+  allocate_oports(kSpec.oports.size());
+
   _hf_dir = attr_str("hf_dir");
   _mode = attr_str("mode");
   if (_mode.empty()) { _mode = "spatial"; }
-  _unload_idle = attr_bool("unload_when_idle");
+  // ACCEPTS THE STRING VOCABULARY AND A LEGACY BOOL, the way the
+  // conditioner beside it does. This key was a bool here -- `true` meant
+  // "drop the scratch", which is the cheap half of what park does -- and
+  // shipped pipeline JSON says so. Reading that bool as a string would
+  // resolve every such graph to "auto" and quietly change what it does,
+  // so both spellings are read and `true` lands on the policy closest to
+  // what it was documented to mean.
+  const FlexData& c = this->config();
+  if (c.is_object()) {
+    const auto o = c.as_object();
+    if (o.contains("unload_when_idle")) {
+      const FlexData& v = o.at("unload_when_idle");
+      if (v.is_bool()) {
+        _unload_cfg = v.as_bool(false)
+                          ? vpipe::model_memory::UnloadPolicy::kPark
+                          : vpipe::model_memory::UnloadPolicy::kKeep;
+      } else {
+        bool bad = false;
+        _unload_cfg = vpipe::model_memory::parse_unload_policy(
+            std::string(v.as_string("auto")), &bad);
+        if (bad) {
+          fail_config(fmt(
+              "Ltx25UpscaleStage('{}'): unload_when_idle must be "
+              "auto|destroy|park|keep (or the legacy always|never|"
+              "true|false); got '{}'",
+              this->id(), std::string(v.as_string(""))));
+          return;
+        }
+      }
+    }
+  }
   if (_mode != "spatial" && _mode != "temporal") {
     fail_config(fmt("Ltx25UpscaleStage('{}'): mode must be 'spatial' or "
                     "'temporal' (got '{}')", this->id(), _mode));
   }
-  allocate_oports(kSpec.oports.size());
 }
 
 Ltx25UpscaleStage::~Ltx25UpscaleStage() = default;
@@ -295,6 +354,7 @@ Ltx25UpscaleStage::ensure_loaded_()
     session()->warn(fmt("Ltx25UpscaleStage('{}'): load: {}", id(), e));
     return false;
   }
+  _ckpt = ck;
   session()->info(fmt(
       "Ltx25UpscaleStage('{}'): {} x2 latent upscaler from '{}' -- "
       "{} channels, mid {}, {} blocks per stage, {:.0f} MB",
@@ -395,8 +455,128 @@ Ltx25UpscaleStage::process(vpipe::RuntimeContext& ctx)
   session()->log_debug(fmt(
       "Ltx25UpscaleStage('{}'): latent #{} [{},{},{},{}] -> [{},{},{},{}]",
       id(), _emitted, C, F, H, W, shape[0], shape[1], shape[2], shape[3]));
-  if (_unload_idle) { _model->release_idle(); }
+  release_when_idle_();
   co_await ctx.write(0, std::move(beat));
+}
+
+// ---------------------------------------------------------------------
+// The idle policy.
+//
+// Resolved at the first beat rather than in the ctor, for the reason
+// docs/MODEL-MEMORY.md gives: at construction the graph is half loaded
+// and a stage would size against peers that have not appeared yet.
+// ---------------------------------------------------------------------
+void
+Ltx25UpscaleStage::resolve_idle_policy_()
+{
+  if (_idle_resolved) { return; }
+  _idle_resolved = true;
+
+  namespace mm = vpipe::model_memory;
+  switch (_unload_cfg) {
+    case mm::UnloadPolicy::kDestroy:
+    case mm::UnloadPolicy::kPark:
+    case mm::UnloadPolicy::kKeep:
+      _idle_action = _unload_cfg;
+      break;
+    default:
+      // PARK is the default answer here, and the conditioner's opposite
+      // choice next door is not an inconsistency -- it is the same rule
+      // reaching a different answer because the two models are held
+      // differently.
+      //
+      // Parking walks a weight SET's cached tensors. This model binds
+      // every conv and norm through WeightSet::tensor(), so they ARE
+      // cached entries with a source name and parking genuinely hands
+      // the bytes back; the conditioner's Gemma reads uncached into its
+      // own members, where the registry cannot see them, so parking it
+      // reports 0 and it has to destroy instead.
+      //
+      // And nothing sizes an irreversible decision against this model.
+      // It is under a gigabyte, it loads after the denoise it would have
+      // competed with, and its reload is one file -- so the cheaper,
+      // reversible half of the trade is the right default.
+      _idle_action = mm::UnloadPolicy::kPark;
+      break;
+  }
+  this->session()->log_debug(fmt(
+      "Ltx25UpscaleStage('{}'): unload_when_idle={} -> {}", this->id(),
+      mm::unload_policy_name(_unload_cfg),
+      mm::unload_policy_name(_idle_action)));
+}
+
+// BOTH POLICIES DROP THE MODEL FIRST, and that is not an implementation
+// detail -- it is the manager's rule. Nothing parks or frees a BORROWED
+// set: a borrower holds aliases of the very buffers a park makes
+// purgeable and reads them in a forward pass that asks the set for
+// nothing, so the manager refuses rather than hand a live model pages
+// the kernel may discard. This model binds every conv through
+// WeightSet::tensor() and keeps the set alive for its own lifetime, as
+// the weight contract requires, so it IS that borrower.
+//
+// MEASURED, and this is why the first version of these two was wrong:
+// asking to park while the model was still alive logged "still borrowed
+// by 1 model(s), so it is not parked" and reclaimed 0 MB. A park that
+// frees nothing looks exactly like a park that worked.
+//
+// `_tried` is cleared with the model on both paths. That flag exists to
+// stop a FAILED load being retried every beat, and letting go on purpose
+// is not a failure.
+void
+Ltx25UpscaleStage::release_model_()
+{
+  _model.reset();
+  _ops.reset();
+  _tried = false;
+}
+
+// Give the bytes back. The next clip pays a full reload from disk.
+void
+Ltx25UpscaleStage::destroy_model_()
+{
+  release_model_();
+  auto* mgr = this->session()->services()->generative_model_manager();
+  if (mgr == nullptr || _ckpt.empty()) { return; }
+  const std::size_t got = mgr->drop_weights(_ckpt);
+  this->session()->log_debug(fmt(
+      "Ltx25UpscaleStage('{}'): dropped the upscaler, {} MB back; the "
+      "next clip reloads it", this->id(), got >> 20));
+}
+
+// Hand the checkpoint to the kernel as purgeable instead. The pages
+// survive unless something else needs the RAM, so the next clip rebuilds
+// the model without a disk read if nothing took them -- never worse than
+// destroy, and cheaper whenever the box was not actually short.
+//
+// NO declaration revision on purpose: parked bytes are still HELD bytes
+// for the accounting, and they return to the box only if the kernel gets
+// round to reclaiming them. A peer deciding this step whether it can
+// hold a block must not be told room exists on that basis.
+void
+Ltx25UpscaleStage::park_model_()
+{
+  release_model_();
+  auto* mgr = this->session()->services()->generative_model_manager();
+  if (mgr == nullptr || _ckpt.empty()) { return; }
+  const std::size_t got = mgr->park_weights(_ckpt);
+  this->session()->log_debug(fmt(
+      "Ltx25UpscaleStage('{}'): parked {} MB of the upscaler", this->id(),
+      got >> 20));
+}
+
+void
+Ltx25UpscaleStage::release_when_idle_()
+{
+  resolve_idle_policy_();
+  switch (_idle_action) {
+    case vpipe::model_memory::UnloadPolicy::kDestroy:
+      destroy_model_();
+      break;
+    case vpipe::model_memory::UnloadPolicy::kPark:
+      park_model_();
+      break;
+    default: break;                     // kKeep: hold it, scratch and all
+  }
 }
 
 }  // namespace ltx25

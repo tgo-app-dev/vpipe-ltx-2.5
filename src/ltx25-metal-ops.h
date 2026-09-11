@@ -5,6 +5,8 @@
 #include "apple-silicon/metal-compute/compute-library.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "generative-models/shared/i8-gemm.h"
+#include "generative-models/shared/metal-sage-attention.h"
+#include "generative-models/shared/metal-sol-attention.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 
 #include <cstddef>
@@ -153,6 +155,135 @@ public:
   // within their tolerance, so a test that did not ASSERT the path would
   // pass while measuring another one.
   bool i8_takes(int M, int K, int N) const noexcept;
+
+  // ---- Sol-Attn ------------------------------------------------------
+  //
+  // The other acceleration tier, and it is orthogonal to the one above:
+  // `i8_gemm` changes how the block's GEMMs are computed, Sol changes
+  // which key blocks the attention between them reads at all. Both can
+  // be on.
+  //
+  // libvpipe's, whole. Per key block it keeps the keys' centroid and the
+  // values' mean; one product against the centroids scores every block
+  // at 1/BLK of the dense cost; a block over the threshold is attended
+  // EXACTLY by the same steel flash kernel sdpa_steel already dispatches,
+  // and one under it folds into the same running softmax as if all its
+  // keys carried the centroid's score. So nothing is dropped and there
+  // is no second pass -- and this plugin supplies no kernel, because the
+  // head-major q/k/v the transposes above already produce is the only
+  // thing the driver wants.
+  //
+  // LOSSY, hence off by default. `sol_attn` on generate-video turns it
+  // on and arrives in VideoGenRequest::sol; VPIPE_SOL_ATTN=0|1 overrides
+  // either way, which is the A/B.
+  // False (with `err`) when the tier was asked for and could not be
+  // built, so the caller can say so: a lossy mode that silently did not
+  // engage is indistinguishable from one that did nothing, and the
+  // timings get believed either way.
+  bool set_sol(const vpipe::genai::sol::Config& cfg, std::string* err);
+
+  // Is this attention a candidate? Three conditions, and the caller
+  // supplies a fourth (the layer) because only it knows one.
+  //
+  //   * head_dim 128 -- the method is specified there and the driver
+  //     refuses anything else, so the AUDIO stream's 64 declines here
+  //     rather than at the encode;
+  //   * SELF-attention -- a centroid summarises keys the query is being
+  //     compared against, and the text and audio<->video crossings have
+  //     both a different key set and a short one;
+  //   * long enough to have something to route. Below `kSolMinBlocks`
+  //     routing blocks the local band, the tail and the sink already
+  //     cover most of the sequence, so the summaries and the CSR are
+  //     paid for nothing.
+  bool sol_takes(int heads, int tq, int tkv, int head_dim) const noexcept;
+
+  // Lend Sol the two regions that are dead while it runs, so it holds no
+  // scratch of its own. Cheap to repeat: it returns immediately when the
+  // regions are the ones it already has, and rebuilds when they are not
+  // -- which is what makes a caller whose arena GREW correct without
+  // having to notice that it did.
+  void sol_lend(const vpipe::metal_compute::SharedBuffer& a,
+                const vpipe::metal_compute::SharedBuffer& b) const;
+
+  // The routed attention, head-major in and head-major out -- the same
+  // buffers and the same layout sdpa_steel takes. `sink_tokens` is 0 for
+  // every stream in this model: LTX attends each modality to itself and
+  // brings the prompt in through a separate cross-attention, so there is
+  // no foreign prefix inside this sequence for a centroid to misread.
+  bool sol_attend(vpipe::metal_compute::ComputeEncoder& enc,
+                  const vpipe::metal_compute::SharedBuffer& q,
+                  const vpipe::metal_compute::SharedBuffer& k,
+                  const vpipe::metal_compute::SharedBuffer& v,
+                  const vpipe::metal_compute::SharedBuffer& out,
+                  int heads, int tokens, int head_dim,
+                  std::string* err) const;
+
+  // What the PREVIOUS forward routed, in steel key blocks, and the
+  // denominator it is a fraction of. Realized sparsity is a property of
+  // the activations rather than of tau, so it is measured and reported
+  // rather than predicted. Zero when Sol is off or has not run.
+  long long sol_exact_blocks() const noexcept;
+  long long sol_total_blocks() const noexcept;
+  void      sol_reset_counts() const noexcept;
+
+  // Scratch Sol OWNS, as opposed to what it carved out of the arena the
+  // block lent it. Exposed because "it costs no memory" is a claim, and
+  // this is the number that makes it a measurement -- zero when the lend
+  // covered everything, which is the case the block is written for.
+  std::size_t sol_resident_bytes() const noexcept;
+
+  const vpipe::genai::sol::Config& sol_config() const noexcept
+  {
+    return _sol_cfg;
+  }
+
+  // Routing blocks below which sol_takes() declines. 16 leaves the
+  // local band, the tail and their rounding at a quarter of the
+  // sequence in the worst case, which is the point below which there is
+  // nothing left to drop.
+  static constexpr int kSolMinBlocks = 16;
+
+  // ---- SageAttention -------------------------------------------------
+  //
+  // The third tier, and the one that changes neither which keys are read
+  // nor which weights are multiplied: it runs the flash attention's
+  // QK^T product in INT8, with one scale per attention block and the key
+  // side quantized as K - mean(K) over tokens. That smoothing is exact
+  // rather than approximate -- a per-channel shift moves every score in
+  // a row by the same amount and softmax does not see it -- and P*V
+  // stays in the tensor dtype.
+  //
+  // IT APPLIES TO EVERY ATTENTION HERE, unlike Sol. Sol summarises a key
+  // set and so needs the keys to be the queries; Sage computes every
+  // key and every query, so the text cross-attention and both
+  // audio<->video directions take it as readily as the self-attentions,
+  // and the audio stream's 64-wide heads as readily as the video's 128.
+  //
+  // MATRIX CORES ARE THE WHOLE CONDITION. The int8 fragment MMA has no
+  // ALU fallback, so on a box without them this declines and the model
+  // runs dense -- which is not a failure and is said once.
+  bool set_sage(const vpipe::genai::sage::Config& cfg, std::string* err);
+
+  // Is the tier live for this head width? The width is asked because the
+  // int8 twin is a per-shape specialisation like the f16 one, and a
+  // width steel has no entry point for has no twin either.
+  bool sage_takes(int head_dim) const noexcept;
+
+  // Lend Sage the two regions that are dead while it runs. DIFFERENT
+  // regions from Sol's, and that is a correctness requirement rather
+  // than a preference: both tiers can be on at once, both carve from
+  // what they are lent, and two carves over one region would overlap.
+  // See run_attention_, which lends `ff`/`q` to one and `k`/`v` to the
+  // other.
+  void sage_lend(const vpipe::metal_compute::SharedBuffer& a,
+                 const vpipe::metal_compute::SharedBuffer& b) const;
+
+  std::size_t sage_resident_bytes() const noexcept;
+
+  const vpipe::genai::sage::Config& sage_config() const noexcept
+  {
+    return _sage_cfg;
+  }
 
   // Did the affine qmm kernels resolve at init? They are libvpipe's,
   // embedded in the host binary and reached by name, so this is only
@@ -372,9 +503,21 @@ public:
   // this one cannot.
   struct SteelAttn {
     vpipe::metal_compute::ComputeFunction fn;
+    // The SAME kernel with constant 306 true: the int8 QK twin. Built
+    // beside the f16 one and not instead of it, because
+    // `sage_dense_layers` leaves the leading blocks on the f16 kernel
+    // and a forward therefore needs both. Invalid on every box without
+    // matrix cores.
+    //
+    // Built from what the GPU CAN do, not from what the config asked:
+    // this plan outlives a generation and `sage_attn` does not, so a
+    // twin conditioned on the setting would be missing for a later
+    // generation that turned the tier on.
+    vpipe::metal_compute::ComputeFunction fn_i8;
     vpipe::metal_compute::SharedBuffer    params;
     int heads = 0, tq = 0, tkv = 0, head_dim = 0;
     int bq = 0;                   // query tile, 32 (ALU) or 64 (M5 nax)
+    int bk = 0;                   // key tile,   16 (ALU) or 32 (M5 nax)
   };
 
   // Can steel serve this head dim? False without the library, under
@@ -387,12 +530,21 @@ public:
   bool steel_attn_plan(SteelAttn* p, int heads, int tq, int tkv,
                        int head_dim) const;
 
+  // `sage_layer` is this block's index in the stack when the caller is
+  // willing to have Sage applied, and -1 when it is not. It is a
+  // parameter and not a member for the reason MetalBlock::forward's is:
+  // a streaming slot is refilled with another layer's weights between
+  // forwards. When the tier is live and the layer is past
+  // `sage_dense_layers`, the int8 prologue is encoded HERE -- into the
+  // same encoder, immediately before the dispatch, which is what orders
+  // it against the kernel that reads it.
   void sdpa_steel(vpipe::metal_compute::ComputeEncoder& enc,
                   const SteelAttn& p,
                   const vpipe::metal_compute::SharedBuffer& q,
                   const vpipe::metal_compute::SharedBuffer& k,
                   const vpipe::metal_compute::SharedBuffer& v,
-                  const vpipe::metal_compute::SharedBuffer& out) const;
+                  const vpipe::metal_compute::SharedBuffer& out,
+                  int sage_layer = -1) const;
 
   // Which attention kernel init() settled on, for the log line. One of
   // "steel-nax" (M5 matrix cores), "steel", or "scalar".
@@ -670,6 +822,23 @@ private:
   // mutable because I8GemmContext::gemm grows its own scratches, and
   // every dispatch helper here is const.
   mutable std::unique_ptr<vpipe::genai::I8GemmContext> _i8;
+
+  // Sol-Attn's driver and the settings it was built from. One per model,
+  // like the arena the blocks share and for the same reason: its scratch
+  // is keyed on (heads, tokens, head_dim), every block of the stack
+  // meets the same one, and the stack runs strictly sequentially.
+  //
+  // mutable for the same reason `_i8` is -- every dispatch helper here
+  // is const, and this one allocates on first sight of a geometry.
+  mutable std::unique_ptr<vpipe::genai::MetalSolAttention> _sol;
+  vpipe::genai::sol::Config _sol_cfg;
+
+  // SageAttention's driver and the settings it was built from, on the
+  // same terms as Sol's above: one per model, mutable because every
+  // dispatch helper here is const and this one allocates on first sight
+  // of a geometry.
+  mutable std::unique_ptr<vpipe::genai::MetalSageAttention> _sage;
+  vpipe::genai::sage::Config _sage_cfg;
 
   vpipe::metal_compute::ComputeLibrary  _lib_dequant;
   vpipe::metal_compute::ComputeFunction _fn_dequant[2][2];  // [w4|w8][g32|g64]

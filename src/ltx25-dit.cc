@@ -1460,6 +1460,29 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
   // minted during it -- and once the slots are built and the resident
   // set has stopped growing, the honest value is zero.
   const auto alloc0 = vpipe::metal_compute::shared_buffer_memory_stats();
+  // WHAT SOL-ATTN ROUTED, reported here and reset here, and both for the
+  // same reason: the counter is written by the GPU and read on the
+  // ENCODE thread, so mid-forward it holds a partial total, and it
+  // accumulates across every routed block, so it has to be read before
+  // it is cleared. What is printed is therefore the PREVIOUS forward,
+  // complete -- a diagnostic may lag, it may not misattribute.
+  //
+  // Realized sparsity is a property of the ACTIVATIONS rather than of
+  // tau alone, which is why it is measured at all: the same threshold
+  // keeps a different fraction at a different resolution, a different
+  // clip, and a different step of the same clip.
+  if (o.sol_config().enabled) {
+    const long long got = o.sol_exact_blocks();
+    const int routed = (int)_blocks.size() - o.sol_config().dense_layers;
+    const long long tot = o.sol_total_blocks() * (routed > 0 ? routed : 1);
+    if (got > 0 && tot > 0 && o.mc()->session() != nullptr) {
+      o.mc()->session()->log_normal(vpipe::fmt(
+          "ltx-2.5: Sol-Attn kept {} of {} key blocks exact ({:.1f}%) over "
+          "{} routed blocks of the PREVIOUS forward", got, tot,
+          100.0 * (double)got / (double)tot, routed));
+    }
+    o.sol_reset_counts();
+  }
   int promoted_n = 0;
   for (int i = 0; i < (int)_blocks.size(); ++i) {
     if (in.progress && !in.progress(i, (int)_blocks.size())) {
@@ -1519,7 +1542,7 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
     {
       auto enc = s.begin_compute();
       if (!blk->forward(enc, gv, ga, err,
-                        _lora != nullptr ? _lora->block(i) : nullptr)) {
+                        _lora != nullptr ? _lora->block(i) : nullptr, i)) {
         return false;
       }
     }

@@ -11,9 +11,11 @@ vpipe tree keeps each under its own terms.
 ## Start here
 
 **[docs/LTX-2.5.md](docs/LTX-2.5.md)** — what the model is, how to fetch it,
-and how to generate a clip with sound or from a picture, with the four
-ready-to-run pipelines in [docs/pipelines/](docs/pipelines/). Read that
-first; the rest of this file is how the port is built and what it is made of.
+and how to generate a clip with sound, from a picture or from a reference
+soundtrack. Six ready-to-run pipelines live in
+[docs/pipelines/](docs/pipelines/): two that prepare a checkpoint and four
+that generate. Read that first; the rest of this file is how the port is
+built and what it is made of.
 
 ## Status
 
@@ -49,6 +51,30 @@ became 10 appended audio tokens, the DiT denoised 19 audio tokens where an
 unreferenced run has 9, and the clip came out coherent with its soundtrack.
 That is also the first exercise of the APPENDED-token conditioning path on the
 real 22B model -- the same machinery the closing-frame anchor uses.
+
+**And it upscales in LATENT space.** `ltx-2.5-latent-upscale` doubles a
+generated latent before it is decoded -- no VAE round trip, one convolutional
+forward pass -- so a 960x544 generation is saved at 1920x1088. Measured at
+**26.9 dB** against a Lanczos 2x of the same clip, at that geometry and at
+1280x704 -> 2560x1408. `mode` picks the axis; chain two stages to double both.
+See
+[docs/pipelines/ltx-2.5-spatial-upscale.vpipeline](docs/pipelines/ltx-2.5-spatial-upscale.vpipeline).
+
+**And it takes the host's three acceleration tiers**, all off by default and
+all read off `generate-video`'s acceleration bag rather than spelled again
+here — so a graph asks every family for them the same way, and a tier added
+to the host later needs no rebuild of this binary.
+
+| tier | what it changes | on this port |
+|---|---|---|
+| `sol_attn` | which key blocks the video self-attention READS | **1.20x denoise, 1.14x end to end** at 960x544x121 on an M4 Pro w8g64, keeping 23% of key blocks exact over 47 routed blocks |
+| `sage_attn` | how the blocks that are read are COMPUTED — QK^T in int8 | applies to EVERY attention here, self, text-cross and both audio/video directions. Needs matrix cores; on a box without them it declines and the model runs dense |
+| `i8_gemm` | the block's big matmuls in int8 | same condition |
+
+Sol is lossy and the two clips are **different clips, not one degraded** — a
+diffusion sampler is chaotic, so a perturbation lands on another sample from
+the same distribution. 17.9 dB against the dense clip, both coherent. Judge
+it by looking, not by PSNR against a dense run.
 
 Verified against the reference implementation:
 
@@ -99,15 +125,26 @@ is finished. It is not:
   second sampling loop.
 - Refused rather than approximated, and so also "not done": audio VAE `attn`
   blocks, and any `rope_type` other than `split`.
-- `duration_head` is a config passthrough, not an implementation.
+- **The int8 tiers have never run on matrix hardware.** `sage_attn` and
+  `i8_gemm` both need a matrix-core GPU; the box this port was written on
+  has none, so on it both tiers DECLINE and the model runs dense. Their
+  tests pass by exercising the decline. What is unproven is the arm that
+  does the work.
+- `duration_head` is a config passthrough, not an implementation. It is
+  parsed, carried and read by nothing.
 - Perf lever untried: the `bm128` qmm arm at LTX's token counts.
 
 ## Building
 
-Needs an installed vpipe with **plugin ABI 1** — the host loads a plugin on
+Needs an installed vpipe with **plugin ABI 3** — the host loads a plugin on
 STRICT equality, so this is an exact requirement, not a minimum. Rebuild
 against the vpipe you deploy with; a mismatch is refused with a clear
 message rather than crashed.
+
+ABI 3 is what the acceleration bag needs. The tiers below arrive as one
+open `FlexData` rather than as typed fields on the request, which is the
+change that stops the NEXT tier invalidating this binary — but the bag
+itself was a version bump, and a host older than that cannot describe it.
 
 ```sh
 # in the vpipe tree
@@ -118,9 +155,6 @@ cmake --install ../vpipe-build --prefix /path/to/vpipe-install
 cmake -S . -B build -DCMAKE_PREFIX_PATH=/path/to/vpipe-install
 cmake --build build -j
 ```
-
-A plugin must be rebuilt against the vpipe it deploys with — the handshake
-is strict equality, so a mismatch is refused at load rather than crashing.
 
 ## Running
 
@@ -154,18 +188,35 @@ graph can be pointed at a different model family without being re-authored.
 
 The bf16 DiT is 42 GB, which on a 64 GB box means block STREAMING — 37 GB
 re-read from disk *every step*, about 67 s/step at 768x448. Quantizing it
-removes that entirely:
+removes that entirely, and the way to do it is the shipped pipeline:
 
 ```sh
-vpipe --launch-stage model-quantize \
-      --stage-cfg src_model='"<models>/Lightricks/LTX-2.5/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors"' \
-      --stage-cfg output_name='"<models>/Lightricks/LTX-2.5/diffusion_models/ltx-2.5-22b-distilled-w8g64"' \
-      --stage-cfg target='"transformer_blocks."' \
-      --stage-cfg bits=8 --stage-cfg group_size=64 \
-      --stage-cfg quant_exclude='"scale_shift,to_gate_logits"'
+vpipe --plugin build/vpipe-ltx-2.5.so \
+      --launch docs/pipelines/prepare-ltx-2.5-8bit.vpipeline
 ```
 
-Measured on the 22B distilled DiT (same seed, 768x448x9):
+That fetches the checkpoint and packs **both** components into one
+self-contained model, `local/LTX-2.5-distilled-8bit`. It is idempotent, so
+re-running after an interruption resumes rather than repeating a finished
+half.
+
+**The recipe is the plugin's, not the command line's**, and
+`register_quantize_family` is what supplies it. `target: "dit"` selects
+both block stacks — the DiT's
+own `transformer_blocks.` and the two text connectors' `transformer_1d_blocks.`
+— and the exclusions come with it. Hand-rolling the scope is how the
+connectors used to be missed, which shipped 3.75 GB of dense bf16 inside a
+pack whose whole point was to be small, and which never streams: the trunk is
+resident for the entire denoise.
+
+The exclusions are worth knowing even though you no longer type them. The
+wholesale rule takes every 2-D floating-point tensor whose leaf is not a norm
+or an embedding, which over a block stack also catches the f32
+`scale_shift_table`s (modulation tables, not matrices) and the `[32, dim]`
+gate logits. Quantizing either produces a checkpoint that loads fine and
+generates the wrong thing.
+
+Measured on the 22B distilled DiT alone (same seed, 768x448x9):
 
 | pack | size | residency | PSNR vs bf16 |
 |---|---|---|---|
@@ -201,14 +252,9 @@ Both widths escape streaming, so the bit width is a quality/size trade with
 the throughput win already banked. **w8 is the sensible default on a 64 GB
 box**; w4 is for a tighter one and visibly softens the subject.
 
-`quant_exclude` is **not optional**. The wholesale scope rule takes every 2D
-floating-point tensor whose leaf is not a norm or an embedding — which over
-`transformer_blocks.` also catches the f32 `scale_shift_table`s (modulation
-tables, not matrices) and the `[32, dim]` gate logits. Quantizing either
-produces a checkpoint that loads fine and generates the wrong thing.
-
-Then pick the pack explicitly — a bf16 file and a quantized directory can sit
-side by side, and the choice is never implicit:
+Where a pack sits beside the bf16 file rather than in a model of its own,
+pick it explicitly — a bf16 file and a quantized directory can sit side by
+side, and the choice is never implicit:
 
 ```sh
 VPIPE_LTX25_VARIANT=w8g64 vpipe --plugin build/vpipe-ltx-2.5.so --launch graph.json
@@ -220,9 +266,18 @@ The family logs which pack it loaded on every run.
 
 | extension point | what this contributes |
 |---|---|
-| `register_video_family` | the `ltx-2.5` family for `generate-video` — detection, the frame rule, the resource declaration, and (eventually) the denoise loop |
-| `register_stage` | `ltx-2.5-model-config`, this family's own knobs |
+| `register_video_family` | the `ltx-2.5` family for `generate-video` — detection, the frame rule, the resource declaration and the whole joint audio-video denoise |
+| `register_vae_family` | the `ltx-2.5` VAE for the stock `vae-decode`, `vae-encode`, `audio-vae-decode` and `audio-vae-encode` — the conv video codec, and the audio codec with its vocoder and bandwidth extension behind it |
+| `register_quantize_family` | the recipe `model-quantize` packages this checkpoint with: which component lives where, and which of its tensors are matrices |
+| `register_stage` | `ltx-2.5-model-config` (this family's own knobs), `ltx-2.5-conditioner` (the caption, and the audio context beside it), `ltx-2.5-latent-upscale` (the x2 latent upscalers) |
+| `register_metal_library` | three metallibs — the same kernels compiled for bf16, f16 and f32, because the vocoder runs f32 where the DiT runs bf16 |
 | `register_catalog_entries` | five entries: distilled, dev, the distilled LoRA, the x2 pixel-spatial IC-LoRA, the x2 latent upscalers |
+
+Six of them, which is the point worth taking from the table: **no stage of
+this plugin's own touches a pixel or a sample.** Generation goes through the
+host's `generate-video`, both codecs through the host's four VAE stages, and
+packaging through the host's `model-quantize`. The three stages here carry
+knobs and the latent upscaler, nothing else.
 
 The knobs are a **stage** rather than keys on `generate-video` for the
 reason `stages/model-config-source.h` gives: a stage serving several
@@ -280,23 +335,43 @@ otherwise finishes and returns a plausible clip that ignored its input:
 ## Layout
 
 ```
-src/ltx25-config.{h,cc}              comfy __metadata__ -> LtxConfig; frame rule
-src/ltx25-rope.{h,cc}                LTX's rotary embedding (verified 1.8e-8)
-src/ltx25-block-ref.{h,cc}           CPU reference for one AV block (3.0e-7)
-src/ltx25-kernels.metal              the 7 kernels libvpipe does NOT have
-src/ltx25-metal-ops.{h,cc}           the op vocabulary the block is written in
-src/ltx25-block-metal.{h,cc}         one AV block on the GPU
-src/ltx25-dit-weights.{h,cc}         bind the checkpoint's bf16 straight to the GPU
-src/ltx25-dit.{h,cc}                 the 48-block stack, adaLN chains, head
-src/ltx25-connector.{h,cc}           the two 8-layer caption resamplers
-src/ltx25-lora.{h,cc}                adapters, bound at load and applied at RUN
-src/ltx25-sampler.{h,cc}             the ancestral Euler step + distilled sigmas
-src/ltx25-text-features.{h,cc}       49 hidden states -> the two contexts
-src/ltx25-family.{h,cc}              VideoModelFamily: claims / align / declare / load
-src/ltx25-model-config-stage.{h,cc}  the ltx-2.5-model-config stage
-src/ltx25-catalog.{h,cc}             the catalogue entries
-src/ltx25-plugin.cc                  the three-symbol handshake
-tests/                               ctest: config / rope / block / kernels
+the DiT
+  src/ltx25-config.{h,cc}            comfy __metadata__ -> LtxConfig; frame rule
+  src/ltx25-rope.{h,cc}              LTX's rotary embedding (verified 1.8e-8)
+  src/ltx25-block-ref.{h,cc}         CPU reference for one AV block (3.0e-7)
+  src/ltx25-metal-ops.{h,cc}         the op vocabulary the block is written in
+  src/ltx25-block-metal.{h,cc}       one AV block on the GPU
+  src/ltx25-dit-weights.{h,cc}       bind the checkpoint straight to the GPU
+  src/ltx25-dit.{h,cc}               the 48-block stack, adaLN chains, head
+  src/ltx25-connector.{h,cc}         the two 8-layer caption resamplers
+  src/ltx25-lora.{h,cc}              adapters, bound at load and applied at RUN
+  src/ltx25-sampler.{h,cc}           the ancestral Euler step + distilled sigmas
+  src/ltx25-conditioning.{h,cc}      denoise mask, clean latent, appended rows
+  src/ltx25-generator.{h,cc}         the joint audio-video denoise loop
+conditioning
+  src/ltx25-text-encoder.{h,cc}      the Gemma caption encoder
+  src/ltx25-text-features.{h,cc}     49 hidden states -> the two contexts
+the codecs
+  src/ltx25-vae-config.{h,cc}        both VAEs' geometry out of the checkpoint
+  src/ltx25-vae-ref.{h,cc}           CPU ref for the conv video VAE (1.0e-6)
+  src/ltx25-vae.{h,cc}               the conv video VAE on the GPU
+  src/ltx25-audio-vae.{h,cc}         the audio VAE decoder -> log-mel
+  src/ltx25-audio-encoder.{h,cc}     its encoder, and the mel front end
+  src/ltx25-vocoder.{h,cc}           BigVGAN, mel -> 16 kHz (f32, 3.1e-5)
+  src/ltx25-bwe.{h,cc}               bandwidth extension, 16 -> 48 kHz stereo
+  src/ltx25-upscaler-ref.{h,cc}      CPU reference for the x2 latent upscalers
+  src/ltx25-upscaler.{h,cc}          them on the GPU
+the seams
+  src/ltx25-family.{h,cc}            VideoModelFamily: claims/align/declare/load
+  src/ltx25-vae-family.{h,cc}        VaeModelFamily: all four codec roles
+  src/ltx25-quant-family.{h,cc}      QuantizableFamily: the quantize recipe
+  src/ltx25-model-config-stage.{h,cc}  the ltx-2.5-model-config stage
+  src/ltx25-conditioner-stage.{h,cc}   the ltx-2.5-conditioner stage
+  src/ltx25-upscale-stage.{h,cc}       the ltx-2.5-latent-upscale stage
+  src/ltx25-catalog.{h,cc}           the catalogue entries
+  src/ltx25-plugin.cc                the three-symbol handshake
+src/ltx25-kernels.metal              the 47 kernels libvpipe does NOT have
+tests/                               32 ctest targets
 ARCHITECTURE.md                      what the checkpoint IS, and the port order
 ```
 
@@ -307,14 +382,22 @@ are settled with no kernels involved. The Metal path is then checked against
 it locally, so a kernel bug and a semantics bug are never debugged together
 through 48 blocks of a 22B model.
 
-Seven kernels are the plugin's own: `ltx_rope_half_perhead`,
+**47 kernels are the plugin's own**, and the split by area says where the
+work went: 13 for the BigVGAN vocoder, 11 for the video VAE, 7 for the audio
+VAE, 4 for the latent upscalers, and 12 for the DiT block itself. That last
+group is the one the port started with — `ltx_rope_half_perhead`,
 `ltx_gate_heads`, `ltx_rms_norm_gain`, the fused `ltx_ada_zero` (the block's
-most-used op — composing libvpipe's `rms_norm` and `adaln_modulate` would
-write a full `[tokens][dim]` intermediate six times per block),
-`ltx_rms_norm_out`, `ltx_add` and `ltx_copy`. Everything else — GEMMs, full
-attention, adaLN modulation, gated residual, gelu-tanh, transpose, and
-im2col for the VAE later — is reached by name out of libvpipe's embedded
-libraries.
+most-used op; composing libvpipe's `rms_norm` and `adaln_modulate` would
+write a full `[tokens][dim]` intermediate six times per block), and the
+handful of copies and gated adds beside them.
+
+Everything else — GEMMs, quantized GEMMs, full and flash attention, adaLN
+modulation, gated residual, gelu-tanh, transpose, im2col, group norm — is
+reached by NAME out of libvpipe's embedded libraries, which is why the
+plugin is a few megabytes rather than a second copy of the kernel tree. The
+47 are compiled three times, for bf16, f16 and f32: the DiT runs bf16 and
+the vocoder runs f32, and the reference documents the f32 as load-bearing
+rather than cautious.
 
 ## Licence
 

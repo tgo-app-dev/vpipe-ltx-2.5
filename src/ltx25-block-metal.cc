@@ -423,7 +423,8 @@ MetalBlock::run_attention_(ComputeEncoder& enc, const GpuAttn& a,
                            const SharedBuffer& xq, int tq,
                            const SharedBuffer& xkv, int tkv,
                            const RopeGpu* q_pe, const RopeGpu* k_pe,
-                           const SharedBuffer& out, const LoraAttn* lora)
+                           const SharedBuffer& out, const LoraAttn* lora,
+                           int layer, bool sol_ok)
 {
   const int inner = a.heads * a.head_dim;
   _ops->linear(enc, xq,  a.q_w, &a.q_b, _s->q, tq,  a.query_dim, inner);
@@ -450,16 +451,59 @@ MetalBlock::run_attention_(ComputeEncoder& enc, const GpuAttn& a,
   _ops->transpose_abd(enc, _s->q, _s->qh, tq,  a.heads, a.head_dim);
   _ops->transpose_abd(enc, _s->k, _s->kh, tkv, a.heads, a.head_dim);
   _ops->transpose_abd(enc, _s->v, _s->vh, tkv, a.heads, a.head_dim);
+  // SOL-ATTN, where the graph asked for it and this attention is one it
+  // can serve. It reads the same head-major q/k/v the two kernels below
+  // read and writes the same `oh`, so it is a third dispatch group in
+  // the same place rather than a second data path -- and its own exact
+  // half IS the steel kernel, walking only the key blocks the routing
+  // kept.
+  //
+  // LENT, NOT ALLOCATED. Everything Sol needs lives for the length of
+  // this call, and two of this arena's planes are dead across it: `ff`
+  // is not written until the feed-forward that ends the block, and `q`
+  // has already been copied into `qh` by the transpose above. That is
+  // ~330 MB at 8160 video tokens against the ~160 Sol wants, so what
+  // the tier costs the process is its pinned few hundred bytes.
+  //
+  // The lend is repeated per call because reserve() may have GROWN the
+  // arena since the last one; set_arena returns immediately when the
+  // regions are unchanged, which they are for all 48 blocks of a stack.
+  bool routed = false;
+  if (sol_ok && layer >= _ops->sol_config().dense_layers &&
+      _ops->sol_takes(a.heads, tq, tkv, a.head_dim)) {
+    _ops->sol_lend(_s->ff, _s->q);
+    std::string serr;
+    if (_ops->sol_attend(enc, _s->qh, _s->kh, _s->vh, _s->oh, a.heads, tq,
+                         a.head_dim, &serr)) {
+      routed = true;
+    } else if (_sol_err.empty()) {
+      // REMEMBERED, not thrown away. This is an encode, so there is no
+      // result to check here -- the caller fails the forward on it, and
+      // the alternative is 48 blocks of silently dense attention under a
+      // setting that says otherwise.
+      _sol_err = serr;
+    }
+  }
   // Steel flash attention where it has an entry point for this head
   // width, the scalar kernel otherwise. Same buffers either way -- the
   // plan carries the shape, so the choice is one dispatch or the other.
-  const MetalOps::SteelAttn* st =
-      _s->steel_for(*_ops, a.heads, tq, tkv, a.head_dim);
-  if (st != nullptr) {
-    _ops->sdpa_steel(enc, *st, _s->qh, _s->kh, _s->vh, _s->oh);
-  } else {
-    _ops->sdpa_full(enc, _s->qh, _s->kh, _s->vh, _s->oh, a.heads, tq, tkv,
-                    a.head_dim);
+  if (!routed) {
+    const MetalOps::SteelAttn* st =
+        _s->steel_for(*_ops, a.heads, tq, tkv, a.head_dim);
+    if (st != nullptr) {
+      // SAGE, on TWO PLANES SOL IS NOT USING. Both tiers can be on at
+      // once and both carve from what they are lent, so lending either
+      // one the other's region would be two allocators over one buffer.
+      // `k` and `v` are as dead here as `ff` and `q` are: the transposes
+      // above copied all three into the head-major planes the attention
+      // actually reads, and nothing touches the token-major ones again
+      // until the next attention's projections rewrite them.
+      if (_ops->sage_takes(a.head_dim)) { _ops->sage_lend(_s->k, _s->v); }
+      _ops->sdpa_steel(enc, *st, _s->qh, _s->kh, _s->vh, _s->oh, layer);
+    } else {
+      _ops->sdpa_full(enc, _s->qh, _s->kh, _s->vh, _s->oh, a.heads, tq, tkv,
+                      a.head_dim);
+    }
   }
   _ops->transpose_abd(enc, _s->oh, _s->o, a.heads, tq, a.head_dim);
 
@@ -485,7 +529,8 @@ MetalBlock::run_attention_(ComputeEncoder& enc, const GpuAttn& a,
 void
 MetalBlock::stream_first_half_(ComputeEncoder& enc, const GpuStream& w,
                                GpuStreamInput& s, const RopeGpu* pe,
-                               const LoraAttn* l1, const LoraAttn* l2)
+                               const LoraAttn* l1, const LoraAttn* l2,
+                               int layer, bool sol_ok)
 {
   const int d = w.dim, n = s.tokens, tt = s.text_tokens;
 
@@ -500,7 +545,8 @@ MetalBlock::stream_first_half_(ComputeEncoder& enc, const GpuStream& w,
   } else {
     _ops->ada_zero(enc, (*s.x), _s->mod_scale, _s->mod_shift, _s->a, d, n);
   }
-  run_attention_(enc, w.attn1, _s->a, n, _s->a, n, pe, nullptr, _s->b, l1);
+  run_attention_(enc, w.attn1, _s->a, n, _s->a, n, pe, nullptr, _s->b, l1,
+                 layer, sol_ok);
   // x = x + out * gate, THEN x_normed = rms_norm(x). The second
   // normalisation feeds the cross-attention and is NOT re-derived from
   // the pre-residual x -- keeping both is why rms_norm_out exists.
@@ -542,8 +588,11 @@ MetalBlock::stream_first_half_(ComputeEncoder& enc, const GpuStream& w,
                        w.prompt_scale_shift, 0, _s->e, d, tt);
   }
 
+  // NOT a Sol candidate -- the keys are the prompt, not the queries --
+  // but Sage takes it like any other, which is why the layer goes
+  // through and only the flag is false.
   run_attention_(enc, w.attn2, _s->d, n, _s->e, tt, nullptr, nullptr, _s->b,
-                 l2);
+                 l2, layer, /*sol_ok=*/false);
   if (pt) {
     _ops->gated_residual_g(enc, (*s.x), _s->mod_gate, _s->b, *s.level, d, n);
   } else {
@@ -597,7 +646,7 @@ MetalBlock::av_cross_(ComputeEncoder& enc, const GpuAttn& attn,
                       const GpuStream& kv_w, GpuStreamInput& kv_in,
                       const SharedBuffer& kv_snap, int lo,
                       const RopeGpu* q_pe, const RopeGpu* kv_pe,
-                      const LoraAttn* lora)
+                      const LoraAttn* lora, int layer)
 {
   const int qd = q_w.dim, kd = kv_w.dim;
   const std::size_t qrow = (std::size_t)qd * 2, krow = (std::size_t)kd * 2;
@@ -624,20 +673,24 @@ MetalBlock::av_cross_(ComputeEncoder& enc, const GpuAttn& attn,
   _ops->ada_zero(enc, kv_snap, _s->kv_scale, _s->kv_shift, _s->e, kd,
                  kv_in.tokens);
 
+  // A CROSSING: one modality's queries over the other's keys, so Sol
+  // would be summarising the wrong sequence. Sage is indifferent to
+  // that -- it computes every key -- so the layer goes through here too.
   run_attention_(enc, attn, _s->d, q_in.tokens, _s->e, kv_in.tokens, q_pe,
-                 kv_pe, _s->b, lora);
+                 kv_pe, _s->b, lora, layer, /*sol_ok=*/false);
   _ops->gated_residual(enc, (*q_in.x), _s->mod_gate, _s->b, qd, q_in.tokens);
 }
 
 bool
 MetalBlock::forward(ComputeEncoder& enc, GpuStreamInput& video,
                     GpuStreamInput& audio, std::string* err,
-                    const LoraBlock* lora)
+                    const LoraBlock* lora, int layer)
 {
   auto fail = [&](const std::string& m) {
     if (err != nullptr) { *err = m; }
     return false;
   };
+  _sol_err.clear();
   const bool rv = video.present && video.tokens > 0;
   const bool ra = _w.have_audio && audio.present && audio.tokens > 0;
   if (!rv && !ra) { return fail("neither stream is present"); }
@@ -662,12 +715,20 @@ MetalBlock::forward(ComputeEncoder& enc, GpuStreamInput& video,
   if (rv) {
     stream_first_half_(enc, _w.video, video, &_v_self,
                        lora != nullptr ? &lora->video_attn1 : nullptr,
-                       lora != nullptr ? &lora->video_attn2 : nullptr);
+                       lora != nullptr ? &lora->video_attn2 : nullptr,
+                       layer, /*sol_ok=*/true);
   }
   if (ra) {
+    // NOT A SOL CANDIDATE, and not merely because the audio stream is
+    // short: its head dim is 64 where the method is specified at 128, so
+    // sol_takes() would decline it anyway. Saying so here is what makes
+    // the two reasons distinguishable if either changes. SAGE still
+    // applies -- the matrix-core steel kernel has a 64-wide entry point
+    // and the int8 twin is the same specialisation.
     stream_first_half_(enc, _w.audio, audio, &_a_self,
                        lora != nullptr ? &lora->audio_attn1 : nullptr,
-                       lora != nullptr ? &lora->audio_attn2 : nullptr);
+                       lora != nullptr ? &lora->audio_attn2 : nullptr,
+                       layer, /*sol_ok=*/false);
   }
 
   if (rv && ra) {
@@ -680,10 +741,10 @@ MetalBlock::forward(ComputeEncoder& enc, GpuStreamInput& video,
     _ops->copy(enc, (*audio.x), _s->snap_a, audio.tokens * _w.audio.dim);
     av_cross_(enc, _w.a2v, _w.video, video, _s->snap_v, _w.audio, audio,
               _s->snap_a, 0, &_v_cross, &_a_cross,
-              lora != nullptr ? &lora->a2v : nullptr);
+              lora != nullptr ? &lora->a2v : nullptr, layer);
     av_cross_(enc, _w.v2a, _w.audio, audio, _s->snap_a, _w.video, video,
               _s->snap_v, 2, &_a_cross, &_v_cross,
-              lora != nullptr ? &lora->v2a : nullptr);
+              lora != nullptr ? &lora->v2a : nullptr, layer);
   }
 
   if (rv) {
@@ -696,6 +757,12 @@ MetalBlock::forward(ComputeEncoder& enc, GpuStreamInput& video,
                lora != nullptr ? &lora->audio_ff_in : nullptr,
                lora != nullptr ? &lora->audio_ff_out : nullptr);
   }
+  // FAILED HERE, not where it happened. Sol's encode reports a geometry
+  // or a specialisation it cannot serve, and the alternative to failing
+  // the forward is 48 blocks of dense attention under a setting that
+  // says routed -- which renders, and reads as the tier having bought
+  // nothing.
+  if (!_sol_err.empty()) { return fail(_sol_err); }
   return true;
 }
 

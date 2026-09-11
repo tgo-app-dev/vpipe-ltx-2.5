@@ -9,6 +9,7 @@
 #include "pipeline/runtime-context.h"
 #include "pipeline/stage-spec.h"
 #include "pipeline/typed-stage.h"
+#include "stages/model-memory.h"
 
 #include <memory>
 #include <string>
@@ -62,10 +63,29 @@ private:
   // message naming what it looked for.
   std::string checkpoint_(std::string* err) const;
 
+  // The idle policy, resolved after the init barrier and applied at the
+  // end of each beat. See the .cc for why `auto` lands on park here and
+  // on destroy in the conditioner.
+  void resolve_idle_policy_();
+  void release_when_idle_();
+  // Drops the model, which is what lets go of the manager's set --
+  // nothing parks or frees a BORROWED checkpoint.
+  void release_model_();
+  void destroy_model_();
+  void park_model_();
+
   std::string _hf_dir;
   std::string _mode = "spatial";
-  bool        _unload_idle = false;
   bool        _tried = false;
+
+  vpipe::model_memory::UnloadPolicy _unload_cfg =
+      vpipe::model_memory::UnloadPolicy::kAuto;
+  vpipe::model_memory::UnloadPolicy _idle_action =
+      vpipe::model_memory::UnloadPolicy::kKeep;
+  bool        _idle_resolved = false;
+  // The file the model was loaded from, kept because parking is asked
+  // for by checkpoint path.
+  std::string _ckpt;
 
   std::unique_ptr<MetalOps>       _ops;
   std::unique_ptr<Ltx25Upscaler>  _model;

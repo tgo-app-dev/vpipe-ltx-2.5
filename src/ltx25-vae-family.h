@@ -52,10 +52,12 @@ public:
   // is the whole 142 GB repository. Every release, pool and
   // phase-release the VAE stages perform is keyed on the name they get
   // from here.
-  std::string vae_path(const std::string& root, Role role) const override;
+  std::string vae_path(const std::string& root,
+                       std::string_view role) const override;
 
   std::vector<vpipe::StageHolding>
-  declare_holdings(const std::string& root, Role role) const override;
+  declare_holdings(const std::string& root,
+                   std::string_view role) const override;
 
   std::vector<std::string> idle_peers(const std::string& root) const override;
 

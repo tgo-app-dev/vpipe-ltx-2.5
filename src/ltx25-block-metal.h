@@ -310,9 +310,19 @@ public:
   // refilled with a DIFFERENT layer's weights between forwards, and a
   // cached pointer would then adapt block 12 with block 5's delta --
   // which renders, slightly wrong, and nothing in the shapes says so.
+  //
+  // `layer` is this block's index in the stack, and it is a PARAMETER
+  // for the same reason `lora` is: a streaming slot is refilled with a
+  // different layer's weights between forwards, so a block that
+  // remembered its own index would answer for whichever layer it held
+  // first. Both accelerated tiers read it -- `sol_dense_layers` and
+  // `sage_dense_layers` each leave a prefix of the stack alone -- and a
+  // caller with no opinion leaves it 0, which is the block Sol's default
+  // keeps dense anyway.
   bool forward(vpipe::metal_compute::ComputeEncoder& enc,
                GpuStreamInput& video, GpuStreamInput& audio,
-               std::string* err, const LoraBlock* lora = nullptr);
+               std::string* err, const LoraBlock* lora = nullptr,
+               int layer = 0);
 
   // The RoPE tables this forward will use, uploaded. Held here rather
   // than passed per call because a 48-block stack shares one set and
@@ -333,6 +343,15 @@ private:
   // One attention, whole: projections, q/k norm, RoPE, transpose in,
   // sdpa, transpose out, per-head gate, output projection. `out` is
   // token-major [tq][query_dim].
+  //
+  // `layer` is the stack index, which BOTH accelerated tiers need and
+  // neither may remember (see forward()). `sol_ok` says whether this
+  // attention is a Sol-Attn candidate, and only the caller knows: Sol
+  // summarises a key set, so it needs the keys to BE the queries, and
+  // every crossing here -- the text cross-attention, both audio<->video
+  // directions -- has a key set that is not the query set. Sage needs no
+  // such flag: it computes every key and every query, just in int8, so
+  // it applies wherever there is a steel plan.
   void run_attention_(vpipe::metal_compute::ComputeEncoder& enc,
                       const GpuAttn& a,
                       const vpipe::metal_compute::SharedBuffer& xq,
@@ -341,12 +360,12 @@ private:
                       int tkv,
                       const RopeGpu* q_pe, const RopeGpu* k_pe,
                       const vpipe::metal_compute::SharedBuffer& out,
-                      const LoraAttn* lora);
+                      const LoraAttn* lora, int layer, bool sol_ok);
 
   void stream_first_half_(vpipe::metal_compute::ComputeEncoder& enc,
                           const GpuStream& w, GpuStreamInput& s,
                           const RopeGpu* pe, const LoraAttn* l1,
-                          const LoraAttn* l2);
+                          const LoraAttn* l2, int layer, bool sol_ok);
   void stream_ff_(vpipe::metal_compute::ComputeEncoder& enc,
                   const GpuStream& w, GpuStreamInput& s,
                   const LoraPair* l_in, const LoraPair* l_out);
@@ -359,7 +378,7 @@ private:
                  const GpuStream& kv_w, GpuStreamInput& kv_in,
                  const vpipe::metal_compute::SharedBuffer& kv_snap, int lo,
                  const RopeGpu* q_pe, const RopeGpu* kv_pe,
-                 const LoraAttn* lora);
+                 const LoraAttn* lora, int layer);
 
   // `y[M][N] += (x @ A^T) @ B^T` through the shared arena, skipping
   // silently when `p` is null or empty so every call site reads as one
@@ -386,6 +405,10 @@ private:
   // BORROWED-BY-SHARING: every block of one stack holds the same
   // arena. Never written between forwards, never read across them.
   std::shared_ptr<BlockScratch> _s;
+  // The first Sol-Attn refusal of the forward in progress, cleared at
+  // the top of forward() and read at the bottom. Per-call state, not
+  // memory: an encode has no result to check where it is issued.
+  std::string _sol_err;
 };
 
 }  // namespace ltx25

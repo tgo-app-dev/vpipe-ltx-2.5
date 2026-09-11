@@ -53,7 +53,11 @@ struct GenerationParams {
   // default the in-tree DiTs carry. Composes with the quantized
   // checkpoint rather than competing with it: the tier takes the
   // dequant-once expansion as its weight.
-  bool i8_gemm = false;
+  // Whether the graph still carries the RETIRED model_config key. Not a
+  // value: `i8_gemm` is read from generate-video's acceleration bag with
+  // the other two tiers, and this only exists so a graph carrying the
+  // old spelling is told where it went instead of being quietly ignored.
+  bool i8_gemm_moved = false;
 
   // Never throws and never half-applies: a malformed value leaves its
   // field at the default and is named in `err`.

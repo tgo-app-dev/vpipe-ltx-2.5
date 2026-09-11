@@ -52,7 +52,14 @@ GenerationParams::from_flex(const FlexData& fd, std::string* err)
   real("ref_audio_strength", p.ref_audio_strength);
   boolean("audio", p.audio);
   boolean("duration_head", p.duration_head);
-  boolean("i8_gemm", p.i8_gemm);
+  // `i8_gemm` USED TO BE HERE and is not any more. It is a
+  // family-agnostic acceleration tier exactly as `sol_attn` and
+  // `sage_attn` are, so it comes off generate-video's acceleration bag
+  // with them and this stage no longer owns a spelling of it. A graph
+  // still carrying the old key is told where it went rather than having
+  // it silently honoured, because two spellings of one decision is the
+  // thing being removed.
+  p.i8_gemm_moved = o.contains("i8_gemm");
   if (o.contains("lora")) {
     p.lora = std::string(o.at("lora").as_string(""));
     real("lora_scale", p.lora_scale);
@@ -272,7 +279,99 @@ Ltx25Generator::generate(const VideoGenRequest& req, VideoGenResult* out)
   // The int8 tier, before anything is encoded. Per-graph rather than
   // per-load: it costs no memory and holds no weights, so a second
   // generation can ask for it and a third can drop it.
-  _ops.set_i8_gemm(p.i8_gemm);
+  //
+  // ONE SPELLING, the bag's. `i8_gemm` sits in the same place `sol_attn`
+  // and `sage_attn` do -- a tier the graph asks every family for, on
+  // generate-video, settled by the host -- so it is read the same way
+  // and this plugin owns no key of its own for it.
+  _ops.set_i8_gemm(
+      vpipe::genai::accel::flag(req.accel, vpipe::genai::accel::kI8Gemm));
+  if (p.i8_gemm_moved) {
+    warn_("model_config key 'i8_gemm' moved to generate-video's own "
+          "config and is IGNORED here -- set it there, beside sol_attn "
+          "and sage_attn");
+  }
+  // ...and Sol-Attn, for the same reasons and at the same moment. This
+  // one comes out of the request's ACCELERATION BAG rather than out of
+  // model_config: the routing is family-agnostic -- it approximates
+  // attention, which every DiT has -- so generate-video owns the
+  // vocabulary (`sol_attn`, `sol_tau`, `sol_key_block`,
+  // `sol_dense_layers`, `sol_local_radius`) and hands every family the
+  // same settled values. A key of our own beside it would be a second
+  // spelling of one decision.
+  //
+  // THE BAG IS WHY THIS PLUGIN SURVIVES THE NEXT TIER. `req.accel` is
+  // one pointer and stays one pointer; `sol::config_from_flex` is
+  // header-only and compiled into this binary, so a host that grows a
+  // key we have never heard of sends it and we do not ask. See
+  // generative-models/shared/accel-settings.h.
+  {
+    const vpipe::genai::sol::Config want =
+        vpipe::genai::sol::config_from_flex(req.accel);
+    std::string serr;
+    if (!_ops.set_sol(want, &serr)) {
+      // WARNED, not fatal. It is an optional accelerator, and a
+      // generation that runs dense is right where one that stops is not
+      // -- but silence would leave a lossy mode indistinguishable from
+      // one that never engaged.
+      warn_("sol_attn requested but " + serr + "; running dense");
+    } else if (_ops.sol_config().enabled) {
+      log_(fmt("Sol-Attn on: tau {:.2f}, key block {}, {} leading blocks "
+               "dense, local radius {}",
+               (double)_ops.sol_config().tau,
+               _ops.sol_config().key_block > 0
+                   ? _ops.sol_config().key_block
+                   : vpipe::genai::sol::kBlock,
+               _ops.sol_config().dense_layers,
+               _ops.sol_config().local_radius)());
+    }
+  }
+
+  // ...and SageAttention, the third tier and the one that changes how a
+  // key is computed rather than which keys are read. Same bag, same
+  // header-only reader.
+  //
+  // A REFUSAL HERE IS FATAL where Sol's is a warning, and the asymmetry
+  // is the contract's: `load_for_model` distinguishes "asked, and this
+  // box has no matrix cores" -- which is null, not a failure, and said
+  // once -- from "asked, and the kernels would not build", which is. A
+  // generation that ran dense under a config asking for Sage would be
+  // reported as a Sage run and its numbers would be believed.
+  {
+    const vpipe::genai::sage::Config want =
+        vpipe::genai::sage::config_from_flex(req.accel);
+    std::string serr;
+    if (!_ops.set_sage(want, &serr)) {
+      warn_("sage_attn: " + serr);
+      return false;
+    }
+    if (_ops.sage_config().enabled) {
+      log_(fmt("SageAttention on: the QK product in int8, {} leading "
+               "blocks in the tensor dtype",
+               _ops.sage_config().dense_layers)());
+    } else if (want.enabled) {
+      // Declined, and said EVERY generation where the driver says the
+      // reason once per process. That is the whole difference between
+      // the two lines and why both are here: a second generation with
+      // the tier still on would otherwise be silent about it, and a
+      // knob that silently did nothing is what this reports on.
+      log_("sage_attn was asked for and is not active here; the "
+           "attention runs dense");
+    }
+  }
+  // WHAT THE GRAPH TURNED ON THAT WE DO NOT DO. Empty today: this family
+  // implements all three tiers the bag currently names. It is here for
+  // the day a host names a fourth, because the reader is compiled into
+  // THIS binary -- so a tier we have never heard of does not appear, and
+  // one we have heard of and did not implement does.
+  for (std::string_view tier : vpipe::genai::accel::tiers_on(req.accel)) {
+    if (tier != vpipe::genai::accel::kI8Gemm &&
+        tier != vpipe::genai::accel::kSolAttn &&
+        tier != vpipe::genai::accel::kSageAttn) {
+      warn_(fmt("'{}' was asked for and is not implemented here",
+                std::string(tier))());
+    }
+  }
 
   std::shared_ptr<const LoraAdapter> lora;
   if (!p.lora.empty()) {

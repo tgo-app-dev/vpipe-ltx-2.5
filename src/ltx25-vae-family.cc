@@ -261,18 +261,26 @@ Ltx25VaeFamily::declare_resources(const std::string& root,
 }
 
 std::string
-Ltx25VaeFamily::vae_path(const std::string& root, Role role) const
+Ltx25VaeFamily::vae_path(const std::string& root,
+                         std::string_view role) const
 {
   Config cfg;
   // resolve() rather than resolve_vae_(): this must answer for the AUDIO
   // half too, and that file has its own config which resolve_vae_ does
   // not read. Both are located by the same directory walk.
   if (!resolve(root, cfg, nullptr)) { return {}; }
-  return role == Role::kAudio ? cfg.audio_vae_file : cfg.vae_file;
+  // A role this family has no codec for gets an EMPTY path, which the
+  // caller reads as "not here" -- never the nearest one. `role` became a
+  // name rather than an enumerator so a third codec costs nobody a
+  // rebuild, and the cost of that is exactly this check.
+  if (role == kRoleAudio) { return cfg.audio_vae_file; }
+  if (role == kRoleVideo) { return cfg.vae_file; }
+  return {};
 }
 
 std::vector<vpipe::StageHolding>
-Ltx25VaeFamily::declare_holdings(const std::string& root, Role role) const
+Ltx25VaeFamily::declare_holdings(const std::string& root,
+                                 std::string_view role) const
 {
   const std::string p = vae_path(root, role);
   if (p.empty()) { return {}; }

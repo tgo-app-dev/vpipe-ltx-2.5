@@ -81,11 +81,6 @@ ltx25_register(vpipe::VpipePluginContext* ctx)
   // unlike the VAE there is no host stage to join: nothing in the tree
   // upscales a latent, so this is a new operation rather than a new
   // backend for an existing one.
-
-  // The LATENT upscalers. A STAGE rather than a registry entry, because
-  // unlike the VAE there is no host stage to join: nothing in the tree
-  // upscales a latent, so this is a new operation rather than a new
-  // backend for an existing one.
   ctx->register_stage<ltx25::Ltx25UpscaleStage>(
       ltx25::Ltx25UpscaleStage::stage_spec());
 

@@ -9,8 +9,9 @@ project(vpipe_ltx_2_5 LANGUAGES CXX)
 #
 # A plugin must be rebuilt against the vpipe it deploys with: the ABI
 # handshake is strict equality, so a mismatch is refused at load rather
-# than crashing. This plugin needs ABI >= 2 (register_video_family +
-# register_catalog_entries).
+# than crashing. This plugin needs ABI 3 -- exactly, not "or newer", and
+# the number moves whenever the host's plugin surface does. 3 is what the
+# acceleration bag needs.
 find_package(vpipe REQUIRED)
 
 # The 48-block stack. No test target yet -- it is exercised through the
@@ -266,6 +267,50 @@ if(NOT MSVC)
     target_compile_options(ltx25-i8-gemm-test PRIVATE -Wall -Werror)
 endif()
 add_test(NAME ltx25-i8-gemm COMMAND ltx25-i8-gemm-test)
+
+# Sol-Attn wired into the block. Needs no checkpoint and no goldens --
+# the weights are drawn from a fixed PRNG -- so unlike most of the files
+# here it never skips on a box with a GPU.
+add_executable(ltx25-sol-attn-test
+    tests/ltx25-sol-attn-test.cc
+    src/ltx25-block-metal.cc
+    src/ltx25-block-ref.cc
+    src/ltx25-metal-ops.cc
+    src/ltx25-config.cc
+    src/ltx25-lora.cc
+    src/ltx25-quant-family.cc
+    src/ltx25-rope.cc
+    $<TARGET_OBJECTS:ltx25_kernels_bf16_obj>)
+target_include_directories(ltx25-sol-attn-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(ltx25-sol-attn-test PRIVATE vpipe::vpipe)
+target_compile_features(ltx25-sol-attn-test PRIVATE cxx_std_20)
+if(NOT MSVC)
+    target_compile_options(ltx25-sol-attn-test PRIVATE -Wall -Werror)
+endif()
+add_test(NAME ltx25-sol-attn COMMAND ltx25-sol-attn-test)
+
+# SageAttention wired into the block. Like the file above it needs no
+# checkpoint; unlike it, what it can check depends on the GPU, and it
+# says which on every run.
+add_executable(ltx25-sage-attn-test
+    tests/ltx25-sage-attn-test.cc
+    src/ltx25-block-metal.cc
+    src/ltx25-block-ref.cc
+    src/ltx25-metal-ops.cc
+    src/ltx25-config.cc
+    src/ltx25-lora.cc
+    src/ltx25-quant-family.cc
+    src/ltx25-rope.cc
+    $<TARGET_OBJECTS:ltx25_kernels_bf16_obj>)
+target_include_directories(ltx25-sage-attn-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(ltx25-sage-attn-test PRIVATE vpipe::vpipe)
+target_compile_features(ltx25-sage-attn-test PRIVATE cxx_std_20)
+if(NOT MSVC)
+    target_compile_options(ltx25-sage-attn-test PRIVATE -Wall -Werror)
+endif()
+add_test(NAME ltx25-sage-attn COMMAND ltx25-sage-attn-test)
 
 add_executable(ltx25-dit-block0-test
     tests/ltx25-dit-block0-test.cc
