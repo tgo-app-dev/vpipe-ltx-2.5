@@ -240,6 +240,37 @@ Ltx25UpscaleStage::declare_resources() const
   return vpipe::model_memory::weight_claims({ck});
 }
 
+// The topological ledger. The SAME key the claim above names and
+// ensure_loaded_() opens, so the manager's ledger, the plan and the
+// release in destroy_model_() / park_model_() all describe one
+// checkpoint under one name. Without it this stage was a hole in the
+// plan, which reads as room that is not there.
+//
+// No floor: the upscaler does not stream, so the least it can be held
+// at is all of it.
+//
+// `releases` and `reclaimable` answer the questions the conditioner's
+// declare_memory() answers, and reach a different answer on `park` for
+// the reason resolve_idle_policy_() gives. This model binds every conv
+// through WeightSet::tensor() and release_model_() drops the borrow
+// before parking, so a park genuinely hands the bytes back -- where the
+// conditioner's uncached Gemma parks nothing. `auto` lands on park here,
+// so it is reclaimable for the same reason.
+vpipe::StageMemory
+Ltx25UpscaleStage::declare_memory() const
+{
+  vpipe::StageMemory m;
+  std::string e;
+  const std::string ck = checkpoint_(&e);
+  if (ck.empty()) { return m; }
+  namespace mm = vpipe::model_memory;
+  m.hold(ck, mm::dir_weights_bytes(ck), /*floor=*/0,
+         _unload_cfg == mm::UnloadPolicy::kDestroy,
+         _unload_cfg == mm::UnloadPolicy::kAuto ||
+             _unload_cfg == mm::UnloadPolicy::kPark);
+  return m;
+}
+
 bool
 Ltx25UpscaleStage::ensure_loaded_()
 {

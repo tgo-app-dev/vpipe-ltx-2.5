@@ -22,9 +22,12 @@ namespace {
 // docs/MODEL-MEMORY.md is about loaders that allocate a converted copy
 // per dtype mismatch, which this is not. Which residency each call
 // gets, and the measurement behind the split, is in the body.
+//
+// `part` attributes a CACHED read to a WeightSet part; see bind_block in
+// the header for who names one and why.
 SharedBuffer
 get_(WeightSet& ws, MetalCompute* mc, const std::string& name, bool stream,
-     WeightSet::Residency kept)
+     WeightSet::Residency kept, const std::string& part = {})
 {
   if (!ws.has(name)) { return SharedBuffer{}; }
   // COPIED only when STREAMING, and the difference is measured rather
@@ -46,7 +49,7 @@ get_(WeightSet& ws, MetalCompute* mc, const std::string& name, bool stream,
   // model's pinned prefix and trunk come out Copied too. kept_residency()
   // in the header is where that distinction is argued.
   const auto res = stream ? WeightSet::Residency::Copied : kept;
-  if (!stream) { return ws.tensor(name, mc, res); }
+  if (!stream) { return ws.tensor(name, mc, res, part); }
   // The streamed read, which is the one that happens 140 times a block,
   // 48 blocks a step, every step. Allocate the destination and pread the
   // bytes straight into it rather than letting stream_tensor allocate
@@ -102,7 +105,8 @@ get_(WeightSet& ws, MetalCompute* mc, const std::string& name, bool stream,
 // the key is all the cache compares). They are tiny -- 9 x 4096 floats at the widest -- so
 // this costs ~19 MB across all 48 blocks.
 SharedBuffer
-get_f32_as_bf16_(WeightSet& ws, MetalCompute* mc, const std::string& name)
+get_f32_as_bf16_(WeightSet& ws, MetalCompute* mc, const std::string& name,
+                 const std::string& part = {})
 {
   if (!ws.has(name)) { return SharedBuffer{}; }
   return ws.derived("ltx25/bf16/" + name, [&ws, mc, &name]() {
@@ -121,14 +125,15 @@ get_f32_as_bf16_(WeightSet& ws, MetalCompute* mc, const std::string& name)
       out[i] = (std::uint16_t)((u + r) >> 16);
     }
     return dst;
-  });
+  }, part);
 }
 
 bool
 need_f32_as_bf16_(WeightSet& ws, MetalCompute* mc, const std::string& name,
-                  SharedBuffer& out, std::string* miss)
+                  SharedBuffer& out, std::string* miss,
+                  const std::string& part = {})
 {
-  out = get_f32_as_bf16_(ws, mc, name);
+  out = get_f32_as_bf16_(ws, mc, name, part);
   if (out.empty()) {
     if (miss != nullptr && miss->empty()) { *miss = name; }
     return false;
@@ -169,14 +174,15 @@ refill_into_(WeightSet& ws, const std::string& name, SharedBuffer& dst)
 
 bool
 need_(WeightSet& ws, MetalCompute* mc, const std::string& name, bool stream,
-      SharedBuffer& out, std::string* miss, WeightSet::Residency kept)
+      SharedBuffer& out, std::string* miss, WeightSet::Residency kept,
+      const std::string& part = {})
 {
   // A live destination is a slot being reused. Only when STREAMING: a
   // preloaded block's buffers are the weight set's own cached tensors,
   // and writing into one would corrupt every other holder of it (the
   // WeightSet contract -- cached tensors are shared and immutable).
   if (stream && refill_into_(ws, name, out)) { return true; }
-  out = get_(ws, mc, name, stream, kept);
+  out = get_(ws, mc, name, stream, kept, part);
   if (out.empty()) {
     if (miss != nullptr && miss->empty()) { *miss = name; }
     return false;
@@ -223,11 +229,14 @@ need_(WeightSet& ws, MetalCompute* mc, const std::string& name, bool stream,
 // bytes.
 SharedBuffer
 get_as_bf16_(WeightSet& ws, MetalCompute* mc, const std::string& name,
-             bool stream, WeightSet::Residency kept)
+             bool stream, WeightSet::Residency kept,
+             const std::string& part = {})
 {
   const auto* info = ws.src().info(name);
   if (info == nullptr || info->shape.empty()) { return SharedBuffer{}; }
-  if (info->dtype == "BF16") { return get_(ws, mc, name, stream, kept); }
+  if (info->dtype == "BF16") {
+    return get_(ws, mc, name, stream, kept, part);
+  }
 
   std::size_t n = 1;
   for (auto d : info->shape) { n *= (std::size_t)d; }
@@ -264,7 +273,8 @@ get_as_bf16_(WeightSet& ws, MetalCompute* mc, const std::string& name,
   // Streamed: not retained, so it is rebuilt per read -- which is what
   // streaming means, and these are ~1.2 GB across the whole 4-bit stack.
   if (stream) { return ws.stream_derived(build); }
-  return ws.derived("ltx25/bf16/" + info->dtype + "/" + name, build);
+  return ws.derived("ltx25/bf16/" + info->dtype + "/" + name, build,
+                    part);
 }
 
 // The same, into a destination that ALREADY EXISTS.
@@ -326,12 +336,12 @@ refill_as_bf16_(WeightSet& ws, const std::string& name, SharedBuffer& dst)
 bool
 need_as_bf16_(WeightSet& ws, MetalCompute* mc, const std::string& name,
               bool stream, SharedBuffer& out, std::string* miss,
-              WeightSet::Residency kept)
+              WeightSet::Residency kept, const std::string& part = {})
 {
   // A live destination is a slot being reused; see need_() for why this
   // is gated on STREAMING.
   if (stream && refill_as_bf16_(ws, name, out)) { return true; }
-  out = get_as_bf16_(ws, mc, name, stream, kept);
+  out = get_as_bf16_(ws, mc, name, stream, kept, part);
   if (out.empty()) {
     if (miss != nullptr && miss->empty()) { *miss = name; }
     return false;
@@ -342,7 +352,7 @@ need_as_bf16_(WeightSet& ws, MetalCompute* mc, const std::string& name,
 bool
 need_q_(WeightSet& ws, MetalCompute* mc, const std::string& name, bool stream,
         int K, QWeight& out, int* group, std::string* miss, std::string* err,
-        WeightSet::Residency kept)
+        WeightSet::Residency kept, const std::string& part = {})
 {
   const auto& src = ws.src();
   const auto* si = src.info(name + ".scales");
@@ -378,24 +388,25 @@ need_q_(WeightSet& ws, MetalCompute* mc, const std::string& name, bool stream,
     out.quantized = true;
     // The CODES are u32 and go through untouched; the scales and
     // biases are F16 in the checkpoint and bfloat to the kernel.
-    if (!need_(ws, mc, name + ".weight", stream, out.codes, miss, kept) ||
+    if (!need_(ws, mc, name + ".weight", stream, out.codes, miss, kept,
+               part) ||
         !need_as_bf16_(ws, mc, name + ".scales", stream, out.scales, miss,
-            kept) ||
+            kept, part) ||
         !need_as_bf16_(ws, mc, name + ".biases", stream, out.qbias, miss,
-            kept)) {
+            kept, part)) {
       return false;
     }
     return true;
   }
   out.quantized = false;
-  return need_(ws, mc, name + ".weight", stream, out.w, miss, kept);
+  return need_(ws, mc, name + ".weight", stream, out.w, miss, kept, part);
 }
 
 bool
 bind_attn_(WeightSet& ws, MetalCompute* mc, const std::string& p, int heads,
            int head_dim, int query_dim, int ctx_dim, bool stream, GpuAttn& a,
            int* group, std::string* miss, std::string* qerr,
-           WeightSet::Residency kept)
+           WeightSet::Residency kept, const std::string& part = {})
 {
   a.heads = heads;
   a.head_dim = head_dim;
@@ -407,28 +418,31 @@ bind_attn_(WeightSet& ws, MetalCompute* mc, const std::string& p, int heads,
   const int inner = heads * head_dim;
   const bool ok =
       need_q_(ws, mc, p + ".to_q", stream, query_dim, a.q_w, group, miss,
-              qerr, kept) &&
-      need_(ws, mc, p + ".to_q.bias",   stream, a.q_b, miss, kept) &&
+              qerr, kept, part) &&
+      need_(ws, mc, p + ".to_q.bias", stream, a.q_b, miss, kept, part) &&
       need_q_(ws, mc, p + ".to_k", stream, ctx_dim, a.k_w, group, miss,
-              qerr, kept) &&
-      need_(ws, mc, p + ".to_k.bias",   stream, a.k_b, miss, kept) &&
+              qerr, kept, part) &&
+      need_(ws, mc, p + ".to_k.bias", stream, a.k_b, miss, kept, part) &&
       need_q_(ws, mc, p + ".to_v", stream, ctx_dim, a.v_w, group, miss,
-              qerr, kept) &&
-      need_(ws, mc, p + ".to_v.bias",   stream, a.v_b, miss, kept) &&
+              qerr, kept, part) &&
+      need_(ws, mc, p + ".to_v.bias", stream, a.v_b, miss, kept, part) &&
       // to_out is a Sequential; the linear is index 0 and index 1 is an
       // Identity that carries nothing.
       need_q_(ws, mc, p + ".to_out.0", stream, inner, a.o_w, group, miss,
-              qerr, kept) &&
-      need_(ws, mc, p + ".to_out.0.bias",   stream, a.o_b, miss, kept) &&
-      need_(ws, mc, p + ".q_norm.weight", stream, a.q_norm, miss, kept) &&
-      need_(ws, mc, p + ".k_norm.weight", stream, a.k_norm, miss, kept);
+              qerr, kept, part) &&
+      need_(ws, mc, p + ".to_out.0.bias", stream, a.o_b, miss, kept,
+            part) &&
+      need_(ws, mc, p + ".q_norm.weight", stream, a.q_norm, miss, kept,
+            part) &&
+      need_(ws, mc, p + ".k_norm.weight", stream, a.k_norm, miss, kept,
+            part);
   if (!ok) { return false; }
   // Gating is on for every attention in LTX-2.5, but the absence of the
   // tensors is a legal (older) checkpoint rather than an error.
-  a.gate_w = get_(ws, mc, p + ".to_gate_logits.weight", stream, kept);
+  a.gate_w = get_(ws, mc, p + ".to_gate_logits.weight", stream, kept, part);
   a.has_gate = !a.gate_w.empty();
   if (a.has_gate) {
-    a.gate_b = get_(ws, mc, p + ".to_gate_logits.bias", stream, kept);
+    a.gate_b = get_(ws, mc, p + ".to_gate_logits.bias", stream, kept, part);
   }
   return true;
 }
@@ -437,7 +451,7 @@ bool
 bind_stream_(WeightSet& ws, MetalCompute* mc, const std::string& block,
              bool is_audio, const DitConfig& cfg, bool stream, GpuStream& g,
              int* group, std::string* miss, std::string* qerr,
-             WeightSet::Residency kept)
+             WeightSet::Residency kept, const std::string& part = {})
 {
   const std::string pre = block + (is_audio ? "audio_" : "");
   const int dim   = is_audio ? cfg.audio_inner_dim() : cfg.inner_dim();
@@ -451,18 +465,18 @@ bind_stream_(WeightSet& ws, MetalCompute* mc, const std::string& block,
   // attn1 is SELF-attention, so its context width is the stream's own;
   // attn2 reads the text conditioning at `cross_attention_dim`.
   if (!bind_attn_(ws, mc, pre + "attn1", heads, hd, dim, dim, stream,
-                  g.attn1, group, miss, qerr, kept) ||
+                  g.attn1, group, miss, qerr, kept, part) ||
       !bind_attn_(ws, mc, pre + "attn2", heads, hd, dim, ctx, stream,
-                  g.attn2, group, miss, qerr, kept)) {
+                  g.attn2, group, miss, qerr, kept, part)) {
     return false;
   }
   // FeedForward: net.0.proj is the input linear, net.2 the output. 1 is
   // the activation and 3 the dropout, so neither carries weights.
   // ff.net.0.proj reads `dim` and writes 4*dim; ff.net.2 reads 4*dim.
   if (!need_q_(ws, mc, pre + "ff.net.0.proj", stream, dim, g.ff_in, group,
-               miss, qerr, kept) ||
+               miss, qerr, kept, part) ||
       !need_q_(ws, mc, pre + "ff.net.2", stream, dim * 4, g.ff_out, group,
-               miss, qerr, kept)) {
+               miss, qerr, kept, part)) {
     return false;
   }
   // The VIDEO feed-forward has NO bias (`ff_bias: false`) and the audio
@@ -472,8 +486,9 @@ bind_stream_(WeightSet& ws, MetalCompute* mc, const std::string& block,
   g.ff_has_bias = is_audio ? cfg.audio_ff_bias : cfg.ff_bias;
   if (g.ff_has_bias) {
     if (!need_(ws, mc, pre + "ff.net.0.proj.bias", stream, g.ff_in_b, miss,
-        kept) ||
-        !need_(ws, mc, pre + "ff.net.2.bias", stream, g.ff_out_b, miss, kept)) {
+        kept, part) ||
+        !need_(ws, mc, pre + "ff.net.2.bias", stream, g.ff_out_b, miss,
+               kept, part)) {
       return false;
     }
   }
@@ -486,9 +501,9 @@ bind_stream_(WeightSet& ws, MetalCompute* mc, const std::string& block,
   // honoured for these: they are 100 KB against a block's 800 MB, and a
   // streamed table would be re-converted every forward.
   if (!need_f32_as_bf16_(ws, mc, pre + "scale_shift_table", g.scale_shift,
-                         miss) ||
+                         miss, part) ||
       !need_f32_as_bf16_(ws, mc, pre + "prompt_scale_shift_table",
-                         g.prompt_scale_shift, miss)) {
+                         g.prompt_scale_shift, miss, part)) {
     return false;
   }
   // NOT `audio_`-prefixed: the two cross tables are named for the
@@ -497,7 +512,7 @@ bind_stream_(WeightSet& ws, MetalCompute* mc, const std::string& block,
   // `audio_scale_shift_table_a2v_ca_*`.
   const std::string ct = block + "scale_shift_table_a2v_ca_" +
                          (is_audio ? "audio" : "video");
-  return need_f32_as_bf16_(ws, mc, ct, g.cross_table, miss);
+  return need_f32_as_bf16_(ws, mc, ct, g.cross_table, miss, part);
 }
 
 bool
@@ -534,7 +549,7 @@ bind_qlinear(WeightSet& ws, MetalCompute* mc, const std::string& name, int K,
 bool
 bind_block(WeightSet& ws, MetalCompute* mc, const DitConfig& cfg, int layer,
            bool stream, GpuBlockWeights& out, std::string* err,
-           WeightSet::Residency kept)
+           WeightSet::Residency kept, const std::string& part)
 {
   std::string miss, qerr;
   // A quantization-shape complaint says far more than "missing X" -- the
@@ -549,14 +564,14 @@ bind_block(WeightSet& ws, MetalCompute* mc, const DitConfig& cfg, int layer,
       + ".";
   out.norm_eps = cfg.norm_eps;
   if (!bind_stream_(ws, mc, b, false, cfg, stream, out.video, &out.quant_group,
-                    &miss, &qerr, kept)) {
+                    &miss, &qerr, kept, part)) {
     report(err);
     return false;
   }
   out.have_audio = cfg.use_audio_video_cross_attention;
   if (!out.have_audio) { return true; }
   if (!bind_stream_(ws, mc, b, true, cfg, stream, out.audio, &out.quant_group,
-                    &miss, &qerr, kept)) {
+                    &miss, &qerr, kept, part)) {
     report(err);
     return false;
   }
@@ -569,10 +584,12 @@ bind_block(WeightSet& ws, MetalCompute* mc, const DitConfig& cfg, int layer,
   const bool ok =
       bind_attn_(ws, mc, b + "audio_to_video_attn", ah, ahd,
                  /*query=*/cfg.inner_dim(), /*ctx=*/cfg.audio_inner_dim(),
-                 stream, out.a2v, &out.quant_group, &miss, &qerr, kept) &&
+                 stream, out.a2v, &out.quant_group, &miss, &qerr, kept,
+                 part) &&
       bind_attn_(ws, mc, b + "video_to_audio_attn", ah, ahd,
                  /*query=*/cfg.audio_inner_dim(), /*ctx=*/cfg.inner_dim(),
-                 stream, out.v2a, &out.quant_group, &miss, &qerr, kept);
+                 stream, out.v2a, &out.quant_group, &miss, &qerr, kept,
+                 part);
   if (!ok) { report(err); }
   return ok;
 }

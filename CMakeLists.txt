@@ -9,9 +9,10 @@ project(vpipe_ltx_2_5 LANGUAGES CXX)
 #
 # A plugin must be rebuilt against the vpipe it deploys with: the ABI
 # handshake is strict equality, so a mismatch is refused at load rather
-# than crashing. This plugin needs ABI 3 -- exactly, not "or newer", and
-# the number moves whenever the host's plugin surface does. 3 is what the
-# acceleration bag needs.
+# than crashing. This plugin needs ABI 4 -- exactly, not "or newer", and
+# the number moves whenever the host's plugin surface does. 4 is what
+# VideoModelFamily::denoise_scratch_bytes needs, and it also carries the
+# MetalCompute::MemoryBudget layout the residency code reads by value.
 find_package(vpipe REQUIRED)
 
 # The 48-block stack. No test target yet -- it is exercised through the

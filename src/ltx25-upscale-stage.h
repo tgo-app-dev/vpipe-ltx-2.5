@@ -56,6 +56,11 @@ public:
 
   std::vector<vpipe::ResourceClaim> declare_resources() const override;
 
+  // The topological plan's half of the same claim: the checkpoint the
+  // claim names, at its size on disk. See the .cc for why `park` counts
+  // as reclaimable here when it does not in the conditioner.
+  vpipe::StageMemory declare_memory() const override;
+
 private:
   bool ensure_loaded_();
   std::string model_root_() const;

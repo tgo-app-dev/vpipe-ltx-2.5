@@ -136,12 +136,14 @@ is finished. It is not:
 
 ## Building
 
-Needs an installed vpipe with **plugin ABI 3** — the host loads a plugin on
+Needs an installed vpipe with **plugin ABI 4** — the host loads a plugin on
 STRICT equality, so this is an exact requirement, not a minimum. Rebuild
 against the vpipe you deploy with; a mismatch is refused with a clear
 message rather than crashed.
 
-ABI 3 is what the acceleration bag needs. The tiers below arrive as one
+ABI 4 is what `VideoModelFamily::denoise_scratch_bytes` needs, and it also
+carries the `MetalCompute::MemoryBudget` layout read by value. ABI 3 was
+the acceleration bag. The tiers below arrive as one
 open `FlexData` rather than as typed fields on the request, which is the
 change that stops the NEXT tier invalidating this binary — but the bag
 itself was a version bump, and a host older than that cannot describe it.

@@ -3,7 +3,9 @@
 
 #include "generative-models/video-model-registry.h"
 
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -11,11 +13,14 @@ namespace ltx25 {
 
 // The LTX-2.5 family, as `generate-video` sees it.
 //
-// The family is process-wide and stateless: it answers "is this
+// The family is process-wide and all but stateless: it answers "is this
 // checkpoint mine", "what frame counts can it do", and "what will
 // loading it cost" without touching a weight. Only `load` builds
 // anything, and what it builds -- a VideoGenerator -- owns the whole
-// denoise loop for one resident checkpoint.
+// denoise loop for one resident checkpoint. The one thing it remembers
+// is which DiT file that load opened, for as long as the generator lives
+// (see declared_dit_), because the stage names what it later releases by
+// what the planning calls return.
 class Ltx25Family : public vpipe::genai::VideoModelFamily {
 public:
   std::string_view tag() const noexcept override;
@@ -51,8 +56,31 @@ public:
                   std::size_t* latent, std::size_t* pcm,
                   std::size_t* arena) const override;
 
+  // The block stack's shared scratch arena at this geometry, from the
+  // same static estimator the DiT's own arena is checked against. See
+  // the definition for what a plan cannot see.
+  std::size_t
+  denoise_scratch_bytes(const std::string& root, int width, int height,
+                        int frames,
+                        const vpipe::FlexData* model_config) const override;
+
   std::unique_ptr<vpipe::genai::VideoGenerator>
   load(const vpipe::genai::VideoModelCreateArgs& args) override;
+
+private:
+  // The DiT the planning calls name under `root`: the file load() opened
+  // while the generator built from it is alive, the largest candidate
+  // otherwise. Empty when `root` does not resolve.
+  std::string declared_dit_(const std::string& root) const;
+
+  // What load() last opened under each root, and a LEASE the generator
+  // owns. The record answers only while the lease has not expired.
+  struct Loaded {
+    std::string         file;
+    std::weak_ptr<void> lease;
+  };
+  mutable std::mutex            _loaded_mu;
+  std::map<std::string, Loaded> _loaded;
 };
 
 }  // namespace ltx25

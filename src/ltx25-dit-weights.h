@@ -132,12 +132,20 @@ inline vpipe::genai::WeightSet::Residency kept_residency(bool stream_blocks)
                        : vpipe::genai::WeightSet::Residency::Mapped;
 }
 
+// `part` names the WeightSet part a CACHED bind is attributed to. It is
+// ignored when `stream` is set: nothing streamed is retained, so there
+// is nothing for a part to own. A caller that may later give back ONE
+// block of what it kept -- the pinned prefix -- names each block's part
+// separately, because WeightSet::release_part() is the only way to drop
+// a subset of the cache, and resetting the block's aliases alone leaves
+// the set holding every buffer.
 bool bind_block(vpipe::genai::WeightSet& ws,
                 vpipe::metal_compute::MetalCompute* mc, const DitConfig& cfg,
                 int layer, bool stream, GpuBlockWeights& out,
                 std::string* err,
                 vpipe::genai::WeightSet::Residency kept =
-                    vpipe::genai::WeightSet::Residency::Mapped);
+                    vpipe::genai::WeightSet::Residency::Mapped,
+                const std::string& part = {});
 
 // Bind the trunk. Always cached -- it is small and every step reads it.
 bool bind_trunk(vpipe::genai::WeightSet& ws,

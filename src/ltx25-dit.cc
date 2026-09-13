@@ -406,6 +406,17 @@ block_bytes_(const MetalBlock* b)
   return n;
 }
 
+// The WeightSet part one PINNED block's cached tensors are attributed
+// to. Per block because the prefix is given back one block at a time
+// (evict_tail_block_), and a part is the only handle the set offers for
+// dropping a subset of what it cached. Namespaced per class, by the same
+// rule a derived() key follows.
+std::string
+pinned_part_(int layer)
+{
+  return "ltx25-dit/pinned-block/" + std::to_string(layer);
+}
+
 }  // namespace
 
 std::unique_ptr<Ltx25Dit>
@@ -500,8 +511,13 @@ Ltx25Dit::load(const Config& cfg, std::shared_ptr<WeightSet> ws_in,
     // the weight set's own rule, and it is what makes the manager's
     // accounting of this checkpoint true. Only the streamed tail is read
     // uncached, in build_block_, where it is genuinely consumed.
+    //
+    // Under a PART of its own, so that giving this block back later --
+    // evict_tail_block_, when even the prefix does not fit -- can release
+    // exactly its entries from the set. Resetting the block alone drops
+    // only this model's aliases; the cache would keep every buffer.
     if (!bind_block(ws, ops.mc(), cfg.dit, i, /*stream=*/false, gw, err,
-                    kept)) {
+                    kept, pinned_part_(i))) {
       return nullptr;
     }
     // A quantized checkpoint on a host whose affine kernels did not
@@ -588,6 +604,11 @@ std::size_t
 Ltx25Dit::held_weight_bytes() const noexcept
 {
   std::size_t n = pinned_bytes();
+  // The two streaming SLOTS as well. Nothing reads them twice, but each
+  // is a block's worth of buffers, built on the first streamed forward
+  // and kept for the run -- and a promotion MOVES a slot's block into
+  // `_blocks` rather than copying it, so nothing is counted twice.
+  for (const auto& s : _slot) { n += block_bytes_(s.get()); }
   for_each_weight(_trunk, [&](const SharedBuffer& x) { n += x.byte_size(); });
   if (_v_conn) {
     _v_conn->for_each_weight([&](const SharedBuffer& x) {
@@ -808,7 +829,19 @@ Ltx25Dit::evict_tail_block_(bool allow_pinned)
     // measurement saying its pages are no longer in RAM is that belief
     // being wrong. The forward decides resident-or-streamed by whether
     // the slot is EMPTY, not by this count, so it simply streams now.
-    if (i < _pinned) { _pinned = i; }
+    //
+    // AND GIVES ITS BYTES BACK, which the reset above does not do on its
+    // own. A pinned block was bound through the set's CACHE (see load),
+    // so the set still holds every buffer the block aliased: without the
+    // release this reported `n` freed, freed nothing, and then re-read
+    // the block from disk on every forward beside the copy that stayed
+    // resident. Released AFTER the reset, so the cache entries are the
+    // last holders when they go. A promoted block (index >= _pinned)
+    // owns uncached buffers and needs nothing beyond the reset.
+    if (i < _pinned) {
+      _pinned = i;
+      if (_ws) { _ws->release_part(pinned_part_(i)); }
+    }
     return n;
   }
   return 0;

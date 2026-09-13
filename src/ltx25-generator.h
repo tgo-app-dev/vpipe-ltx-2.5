@@ -11,6 +11,7 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ltx25 {
@@ -103,7 +104,10 @@ public:
                 vpipe::genai::VideoGenResult* out) override;
 
   void release_idle() override;
-  std::uint64_t resident_bytes() const override { return _resident; }
+  // LIVE, not a figure taken at create(): the resident set grows and
+  // sheds during the denoise, and the adaLN bake releases projections
+  // the trunk held at load. See the definition.
+  std::uint64_t resident_bytes() const override;
 
 private:
   Ltx25Generator() = default;
@@ -124,8 +128,10 @@ private:
   MetalOps _ops;
   std::unique_ptr<Ltx25Dit> _dit;
   const vpipe::SessionContextIntf* _session = nullptr;
-  std::uint64_t _resident = 0;
   bool _stream_blocks = false;
+  // Held for this generator's lifetime and never read; see
+  // set_family_lease().
+  std::shared_ptr<void> _family_lease;
   // The plan's pinned-prefix fraction, kept for the reload path.
   // The clip the graph planned, for the reload path's pin sizing.
   int _plan_w = 0, _plan_h = 0, _plan_frames = 0;
@@ -145,6 +151,14 @@ public:
   bool streaming_blocks() const noexcept;
   int  pinned_blocks() const noexcept;
   std::size_t pinned_weight_bytes() const noexcept;
+
+  // The family keeps the other end of this WEAKLY, so its record of
+  // which DiT file is loaded expires exactly when this generator does --
+  // see Ltx25Family::declared_dit_(). Held, never read.
+  void set_family_lease(std::shared_ptr<void> lease)
+  {
+    _family_lease = std::move(lease);
+  }
 
 private:
   // The geometry the DiT is currently sized for; a request that changes

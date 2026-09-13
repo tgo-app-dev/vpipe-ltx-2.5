@@ -135,16 +135,30 @@ Ltx25Generator::create(const Config& cfg, std::shared_ptr<WeightSet> ws,
                            plan_w, plan_h, plan_frames, err,
                            /*with_connectors=*/true);
   if (!g->_dit) { return nullptr; }
-  // WHAT THIS GENERATOR HOLDS, answered rather than left at the default.
-  //
-  // resident_bytes() returned a member that was only ever assigned 0, so
-  // every peer sizing itself against this family saw a 39 GB checkpoint
-  // as costing nothing -- which docs/MODEL-MEMORY.md calls the single
-  // most consequential default a family can get wrong. It is the blocks
-  // this model kept PLUS the trunk and both connectors; the blocks alone
-  // (pinned_bytes) miss several GB that never streams.
-  g->_resident = g->_dit->held_weight_bytes();
   return g;
+}
+
+std::uint64_t
+Ltx25Generator::resident_bytes() const
+{
+  // WHAT THIS GENERATOR HOLDS, answered rather than left at the default
+  // -- and answered NOW, rather than from a figure taken at load.
+  //
+  // The default 0 had every peer sizing itself against this family see
+  // a 39 GB checkpoint as costing nothing, which docs/MODEL-MEMORY.md
+  // calls the single most consequential default a family can get wrong.
+  // The snapshot that replaced it, taken in create(), was the next wrong
+  // answer: it never saw a block the residency policy promoted or
+  // evicted, nor the projections the adaLN bake releases. The DiT walks
+  // what it holds -- trunk, both connectors, every resident block and
+  // the streaming slots -- so this cannot drift from it.
+  std::uint64_t n = _dit ? _dit->held_weight_bytes() : 0;
+  // The adapter is weights this generator holds too. 8.9 GB for the
+  // distilled file: reporting only the DiT would put a fifth of this
+  // graph's footprint outside the accounting, which is the same class of
+  // error a model opening its own mmap makes.
+  if (_lora_adapter) { n += _lora_adapter->bytes(); }
+  return n;
 }
 
 void
@@ -155,13 +169,18 @@ Ltx25Generator::release_idle()
   // and the next request rebuilds from the weight set, which still has
   // the bytes mapped.
   //
-  // TO THE POOL FIRST, and before the reset: pool_weights() finds the
-  // set through a WEAK reference, so once `_dit` and `_ws` drop their
-  // last strong one there is nothing left to pool and the call is a
-  // silent no-op. Pooled, the checkpoint stays purgeable -- a peer that
-  // genuinely needs the room takes it, one that does not leaves the next
-  // clip nothing to reload, and a RELAUNCH over the same model pays no
-  // reload at all.
+  // TO THE POOL, asked here and not settled here. The manager holds its
+  // sets STRONGLY and parks nothing a model still borrows, and this
+  // generator keeps `_ws` -- and `_lora_ws` until the lines below --
+  // for as long as it exists, so both calls find their checkpoint
+  // borrowed and settle nothing yet. That is safe in either order, and
+  // it is not what makes the release happen: generate-video resets the
+  // generator straight after this returns, which ends the borrow, and
+  // then pools or drops the DiT by the name it planned. The adapter's
+  // set is settled by the manager once nothing holds it. Pooled, a
+  // checkpoint stays purgeable -- a peer that genuinely needs the room
+  // takes it, one that does not leaves the next clip nothing to reload,
+  // and a RELAUNCH over the same model pays no reload at all.
   //
   // Recyclable, deliberately unmarked: the adaLN bake specialises this
   // MODEL to a schedule but writes nothing into the weight set (it
@@ -192,7 +211,6 @@ Ltx25Generator::release_idle()
   _a_levels = {1.0};
   _v_baked.clear();
   _a_baked.clear();
-  _resident = 0;
 }
 
 bool
@@ -239,17 +257,13 @@ Ltx25Generator::ensure_lora_(const std::string& ref, double scale,
   // set owns. Kept alive by the manager for as long as any tensor taken
   // from it is in use -- which here is the adapter's whole lifetime, so
   // the handle is held beside it.
-  // Whatever was held before is being replaced, not added to.
-  if (_lora_adapter) { _resident -= _lora_adapter->bytes(); }
+  // Whatever was held before is REPLACED, not added to -- and
+  // resident_bytes() reads whichever adapter it finds here, so the
+  // accounting follows without being told.
   _lora_ws = std::move(ws);
   _lora_adapter = std::move(a);
   _lora_ref = ref;
   _lora_scale = scale;
-  // The adapter is weights this generator HOLDS, so the manager has to
-  // see them. 8.9 GB for the distilled file -- reporting only the DiT
-  // would put a fifth of this graph's footprint outside the accounting,
-  // which is the same class of error a model opening its own mmap makes.
-  _resident += _lora_adapter->bytes();
   return true;
 }
 

@@ -80,7 +80,10 @@ public:
   std::size_t pinned_bytes() const noexcept;
 
   // EVERYTHING this model holds in weights: the blocks it is keeping,
-  // the trunk, and both connectors.
+  // the trunk, both connectors, and the two streaming slots once a
+  // streamed forward has built them. Walked on every call, so it follows
+  // promotion, eviction and the adaLN bake rather than describing the
+  // model as it was at load.
   //
   // pinned_bytes() answers a narrower question -- the blocks alone --
   // and the difference is not small: the trunk plus the two connectors
