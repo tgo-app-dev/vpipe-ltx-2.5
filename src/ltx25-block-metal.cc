@@ -600,13 +600,15 @@ MetalBlock::stream_first_half_(ComputeEncoder& enc, const GpuStream& w,
   }
 }
 
-// The feed-forward tail: rows 3..6.
+// The feed-forward tail: rows 3..6, in three pieces so the rows of the
+// middle one can be split with another engine -- see forward_head().
+
+// The modulated pre-norm: the feed-forward's input, into `_s->a`.
 void
-MetalBlock::stream_ff_(ComputeEncoder& enc, const GpuStream& w,
-                       GpuStreamInput& s, const LoraPair* l_in,
-                       const LoraPair* l_out)
+MetalBlock::ff_pre_(ComputeEncoder& enc, const GpuStream& w,
+                    GpuStreamInput& s)
 {
-  const int d = w.dim, n = s.tokens, h = w.ff_hidden;
+  const int d = w.dim, n = s.tokens;
   const int g = s.n_levels;
   const bool pt = (g > 1 && s.level != nullptr);
   ada3_(enc, w.scale_shift, (*s.timesteps), 9, d, 3, g);
@@ -616,6 +618,16 @@ MetalBlock::stream_ff_(ComputeEncoder& enc, const GpuStream& w,
   } else {
     _ops->ada_zero(enc, (*s.x), _s->mod_scale, _s->mod_shift, _s->a, d, n);
   }
+}
+
+// The two linears around the GELU, over rows [0, rows) of `_s->a`, into
+// the same rows of `_s->b`. Nothing past `rows` is read or written.
+void
+MetalBlock::ff_core_(ComputeEncoder& enc, const GpuStream& w, int rows,
+                     const LoraPair* l_in, const LoraPair* l_out)
+{
+  const int d = w.dim, n = rows, h = w.ff_hidden;
+  if (n <= 0) { return; }
   _ops->linear(enc, _s->a, w.ff_in, w.ff_has_bias ? &w.ff_in_b : nullptr,
                _s->ff, n, d, h);
   // BEFORE the GELU. `ff.net.0.proj` is the widest adapted linear in
@@ -626,11 +638,30 @@ MetalBlock::stream_ff_(ComputeEncoder& enc, const GpuStream& w,
   _ops->linear(enc, _s->ff, w.ff_out, w.ff_has_bias ? &w.ff_out_b : nullptr,
                _s->b, n, h, d);
   lora_(enc, l_out, _s->ff, _s->b, n);
+}
+
+// The gated residual, over every row of `_s->b`.
+void
+MetalBlock::ff_post_(ComputeEncoder& enc, const GpuStream& w,
+                     GpuStreamInput& s)
+{
+  const int d = w.dim, n = s.tokens;
+  const bool pt = (s.n_levels > 1 && s.level != nullptr);
   if (pt) {
     _ops->gated_residual_g(enc, (*s.x), _s->mod_gate, _s->b, *s.level, d, n);
   } else {
     _ops->gated_residual(enc, (*s.x), _s->mod_gate, _s->b, d, n);
   }
+}
+
+void
+MetalBlock::stream_ff_(ComputeEncoder& enc, const GpuStream& w,
+                       GpuStreamInput& s, const LoraPair* l_in,
+                       const LoraPair* l_out)
+{
+  ff_pre_(enc, w, s);
+  ff_core_(enc, w, s.tokens, l_in, l_out);
+  ff_post_(enc, w, s);
 }
 
 // One direction of the audio<->video cross-attention.
@@ -682,9 +713,9 @@ MetalBlock::av_cross_(ComputeEncoder& enc, const GpuAttn& attn,
 }
 
 bool
-MetalBlock::forward(ComputeEncoder& enc, GpuStreamInput& video,
-                    GpuStreamInput& audio, std::string* err,
-                    const LoraBlock* lora, int layer)
+MetalBlock::forward_head(ComputeEncoder& enc, GpuStreamInput& video,
+                         GpuStreamInput& audio, std::string* err,
+                         const LoraBlock* lora, int layer)
 {
   auto fail = [&](const std::string& m) {
     if (err != nullptr) { *err = m; }
@@ -747,11 +778,40 @@ MetalBlock::forward(ComputeEncoder& enc, GpuStreamInput& video,
               lora != nullptr ? &lora->v2a : nullptr, layer);
   }
 
-  if (rv) {
-    stream_ff_(enc, _w.video, video,
-               lora != nullptr ? &lora->video_ff_in : nullptr,
-               lora != nullptr ? &lora->video_ff_out : nullptr);
-  }
+  // The video feed-forward's input. Its linears are video_ff_rows(), so
+  // a caller may compute some of their rows elsewhere; see the header.
+  if (rv) { ff_pre_(enc, _w.video, video); }
+  return true;
+}
+
+bool
+MetalBlock::forward(ComputeEncoder& enc, GpuStreamInput& video,
+                    GpuStreamInput& audio, std::string* err,
+                    const LoraBlock* lora, int layer)
+{
+  if (!forward_head(enc, video, audio, err, lora, layer)) { return false; }
+  video_ff_rows(enc, video, video.tokens, lora);
+  return forward_tail(enc, video, audio, err, lora);
+}
+
+void
+MetalBlock::video_ff_rows(ComputeEncoder& enc, GpuStreamInput& video,
+                          int rows, const LoraBlock* lora)
+{
+  if (!video.present || video.tokens <= 0) { return; }
+  ff_core_(enc, _w.video, std::min(rows, video.tokens),
+           lora != nullptr ? &lora->video_ff_in : nullptr,
+           lora != nullptr ? &lora->video_ff_out : nullptr);
+}
+
+bool
+MetalBlock::forward_tail(ComputeEncoder& enc, GpuStreamInput& video,
+                         GpuStreamInput& audio, std::string* err,
+                         const LoraBlock* lora)
+{
+  const bool rv = video.present && video.tokens > 0;
+  const bool ra = _w.have_audio && audio.present && audio.tokens > 0;
+  if (rv) { ff_post_(enc, _w.video, video); }
   if (ra) {
     stream_ff_(enc, _w.audio, audio,
                lora != nullptr ? &lora->audio_ff_in : nullptr,
@@ -762,7 +822,10 @@ MetalBlock::forward(ComputeEncoder& enc, GpuStreamInput& video,
   // the forward is 48 blocks of dense attention under a setting that
   // says routed -- which renders, and reads as the tier having bought
   // nothing.
-  if (!_sol_err.empty()) { return fail(_sol_err); }
+  if (!_sol_err.empty()) {
+    if (err != nullptr) { *err = _sol_err; }
+    return false;
+  }
   return true;
 }
 

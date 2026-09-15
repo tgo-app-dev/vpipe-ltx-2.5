@@ -287,8 +287,20 @@ Ltx25Family::declare_resources(const std::string& root) const
   // A streamable component that declares no floor is counted at full
   // size by the pool check, and reads as a graph that cannot run when
   // it can.
-  return {vpipe::model_memory::weight_claim_streamable(
+  std::vector<ResourceClaim> out{vpipe::model_memory::weight_claim_streamable(
       dit, dit_floor_bytes(dit))};
+  // The ANE feed-forward module (`ane_ffn`): ONE unit in the denoise phase,
+  // held by CoreML where no other ledger sees it. Booked unconditionally,
+  // because this call cannot see the graph's settings: generate-video
+  // keeps it only when the graph asked for the tier, re-labels it as its
+  // own, and tells the generator no when the plan grants nothing. The
+  // architecture is fixed, so the default config's width is the width.
+  for (auto& c : vpipe::model_memory::coreml_claims(
+           "ltx-2.5-ane-ffn", Ltx25Dit::ane_bytes(DitConfig{}), 1,
+           vpipe::model_memory::kPhaseDenoise)) {
+    out.push_back(std::move(c));
+  }
+  return out;
 }
 
 std::vector<vpipe::StageHolding>

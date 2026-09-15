@@ -324,6 +324,39 @@ public:
                std::string* err, const LoraBlock* lora = nullptr,
                int layer = 0);
 
+  // THE FEED-FORWARD SPLIT: forward() as three encodes, so the rows of the
+  // video feed-forward can be shared with another engine (the ANE).
+  //
+  //   forward_head   everything before the video feed-forward's linears;
+  //                  its input is left in ff_input(), rows [0, tokens)
+  //   video_ff_rows  the video feed-forward over rows [0, rows) ONLY, into
+  //                  ff_output() -- rows [rows, tokens) are the caller's
+  //   forward_tail   the video gated residual over every row, then the
+  //                  audio stream's whole feed-forward
+  //
+  // forward() IS head + video_ff_rows(tokens) + tail, in that order, so a
+  // split that computes the same rows elsewhere is the same block. The
+  // caller may commit and wait between the three; the arena carries the
+  // state across, so nothing else may run on it in between.
+  bool forward_head(vpipe::metal_compute::ComputeEncoder& enc,
+                    GpuStreamInput& video, GpuStreamInput& audio,
+                    std::string* err, const LoraBlock* lora = nullptr,
+                    int layer = 0);
+  void video_ff_rows(vpipe::metal_compute::ComputeEncoder& enc,
+                     GpuStreamInput& video, int rows,
+                     const LoraBlock* lora = nullptr);
+  bool forward_tail(vpipe::metal_compute::ComputeEncoder& enc,
+                    GpuStreamInput& video, GpuStreamInput& audio,
+                    std::string* err, const LoraBlock* lora = nullptr);
+  const vpipe::metal_compute::SharedBuffer& ff_input() const noexcept
+  {
+    return _s->a;
+  }
+  const vpipe::metal_compute::SharedBuffer& ff_output() const noexcept
+  {
+    return _s->b;
+  }
+
   // The RoPE tables this forward will use, uploaded. Held here rather
   // than passed per call because a 48-block stack shares one set and
   // re-uploading them per block would dominate a short sequence.
@@ -369,6 +402,15 @@ private:
   void stream_ff_(vpipe::metal_compute::ComputeEncoder& enc,
                   const GpuStream& w, GpuStreamInput& s,
                   const LoraPair* l_in, const LoraPair* l_out);
+  // stream_ff_'s three pieces: the pre-norm into `_s->a`, the linears
+  // over rows [0, rows) into `_s->b`, the gated residual over every row.
+  void ff_pre_(vpipe::metal_compute::ComputeEncoder& enc,
+               const GpuStream& w, GpuStreamInput& s);
+  void ff_core_(vpipe::metal_compute::ComputeEncoder& enc,
+                const GpuStream& w, int rows, const LoraPair* l_in,
+                const LoraPair* l_out);
+  void ff_post_(vpipe::metal_compute::ComputeEncoder& enc,
+                const GpuStream& w, GpuStreamInput& s);
   // One direction of the audio<->video cross-attention. `lo` is 0 for
   // a2v and 2 for v2a.
   void av_cross_(vpipe::metal_compute::ComputeEncoder& enc,

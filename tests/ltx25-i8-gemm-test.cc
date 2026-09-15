@@ -86,6 +86,55 @@ main()
     std::printf("ops.init: %s\n", err.c_str());
     return 1;
   }
+  {
+    // THE WHOLE FEED-FORWARD at a clip's token count, on any GPU --
+    // linear+bias, gelu, linear+bias, as stream_ff_ dispatches it. The
+    // figure an ANE split of the feed-forward has to beat per row.
+    const int M = 8160, D = 4096, H = 16384;
+    std::mt19937 frng(5);
+    std::normal_distribution<float> fnd(0.0f, 0.02f);
+    auto up = [&](std::size_t n) {
+      std::vector<float> v(n);
+      for (auto& f : v) { f = fnd(frng); }
+      return ops.upload_bf16(v);
+    };
+    auto xb = up((std::size_t)M * D);
+    auto w1 = up((std::size_t)H * D), b1 = up((std::size_t)H);
+    auto w2 = up((std::size_t)D * H), b2 = up((std::size_t)D);
+    auto hb = ops.alloc((std::size_t)M * H);
+    auto yb = ops.alloc((std::size_t)M * D);
+    if (!xb.empty() && !hb.empty() && !yb.empty()) {
+      auto once = [&](bool use_i8) {
+        ops.set_i8_gemm(use_i8);
+        auto stream = mc.make_command_stream();
+        {
+          auto enc = stream.begin_compute();
+          ops.linear(enc, xb, w1, &b1, hb, M, D, H);
+          ops.gelu(enc, hb, hb, M * H);
+          ops.linear(enc, hb, w2, &b2, yb, M, H, D);
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        stream.commit().wait();
+        return std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - t0).count();
+      };
+      const bool i8 = mc.supports_matrix_cores();
+      once(false);
+      if (i8) { once(true); }
+      double bf = 1e9, q = 1e9;
+      for (int r = 0; r < 5; ++r) {
+        bf = std::min(bf, once(false));
+        if (i8) { q = std::min(q, once(true)); }
+      }
+      ops.set_i8_gemm(false);
+      std::printf("  --- whole ff %dx%dx%d: bf16 %.1f ms (%.2f ms/1k rows)",
+                  M, D, H, bf, bf * 1000.0 / M);
+      if (i8) {
+        std::printf(", int8 %.1f ms (%.2f ms/1k rows)", q, q * 1000.0 / M);
+      }
+      std::printf(" ---\n");
+    }
+  }
   if (!mc.supports_matrix_cores()) {
     std::printf("SKIPPED: no matrix cores, so there is no int8 pipe to "
                 "measure. NOTHING was checked.\n");

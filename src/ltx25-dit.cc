@@ -685,16 +685,23 @@ Ltx25Dit::wire_fixed_(bool on)
   std::size_t unwirable = 0;
   auto one = [&](SharedBuffer& b) {
     if (b.byte_size() == 0 || b.is_wired() == on) { return; }
-    if (full) { unwirable += b.byte_size(); return; }
     if (!on) { mgr->unwire_from_pool(b); changed += b.byte_size(); return; }
+    // Too small to be a pool question (heap slices, a few scalars): never
+    // wired, not counted, and above all not a reason to stop.
+    if (!vpipe::genai::GenerativeModelManager::pool_wirable(b)) { return; }
+    if (full) { unwirable += b.byte_size(); return; }
     const std::size_t got = mgr->wire_into_pool(b);
     if (got == 0) {
-      // STOP, and keep what is already wired rather than unwinding it.
-      // A partly wired model is partly protected, which is strictly
-      // better than none -- and handing protection back on the way out
-      // means competing for it again against a pool that just said no.
-      full = true;
       unwirable += b.byte_size();
+      // A buffer that would not wire for a reason of its OWN leaves the
+      // pool able to take the next one: go on. Only a pool that can no
+      // longer take it -- full, or capped by a real shortage -- ends the
+      // pass, keeping what is wired rather than unwinding it (a partly
+      // protected model beats an unprotected one), and arms the retry.
+      if (!mgr->wired_pool_can_take(b.byte_size())) {
+        full = true;
+        note_wire_refused_();
+      }
       return;
     }
     changed += got;
@@ -732,13 +739,81 @@ Ltx25Dit::wire_block_(MetalBlock& b, bool on)
   auto* mgr = manager_();
   if (mgr == nullptr) { return 0; }
   std::size_t changed = 0;
+  bool refused = false;
   for_each_weight(b.weights(), [&](const SharedBuffer& x) {
     if (x.byte_size() == 0 || x.is_wired() == on) { return; }
     SharedBuffer& m = const_cast<SharedBuffer&>(x);
     if (!on) { mgr->unwire_from_pool(m); changed += m.byte_size(); return; }
-    changed += mgr->wire_into_pool(m);
+    // See wire_fixed_: small buffers are not a pool question.
+    if (!vpipe::genai::GenerativeModelManager::pool_wirable(m)) { return; }
+    const std::size_t got = mgr->wire_into_pool(m);
+    changed += got;
+    if (got == 0 && !mgr->wired_pool_can_take(m.byte_size())) {
+      refused = true;
+    }
   });
+  if (refused) { note_wire_refused_(); }
+  // A promotion that wired less than it asked for is protection lost, and
+  // nothing else in the log says so. The first few are reported.
+  if (on && _ops != nullptr && _ops->mc() != nullptr &&
+      _ops->mc()->session() != nullptr) {
+    std::size_t asked = 0;
+    for_each_weight(b.weights(), [&](const SharedBuffer& x) {
+      if (vpipe::genai::GenerativeModelManager::pool_wirable(x) &&
+          !x.is_wired()) {
+        asked += x.byte_size();
+      }
+    });
+    static std::atomic<int> said{0};
+    if ((asked > 0 || changed > 0) &&
+        said.fetch_add(1, std::memory_order_relaxed) < 3) {
+      _ops->mc()->session()->info(vpipe::fmt(
+          "ltx-2.5: block wiring left {} MB unwired ({} MB wired this call); "
+          "pool {} of {} MB, can take it: {}", asked >> 20, changed >> 20,
+          mgr->wired_pool_used() >> 20, mgr->wired_pool_limit() >> 20,
+          mgr->wired_pool_can_take(asked) ? "yes" : "no"));
+    }
+  }
   return changed;
+}
+
+void
+Ltx25Dit::note_wire_refused_()
+{
+  if (_wire_retry || _ops == nullptr || _ops->mc() == nullptr) { return; }
+  _wire_retry    = true;
+  _wire_retry_at = _ops->mc()->memory_budget().available_physical;
+}
+
+void
+Ltx25Dit::maybe_retry_wiring_()
+{
+  if (!_wire_retry || !_wired_fixed) { return; }
+  auto* mgr = manager_();
+  if (mgr == nullptr || _ops == nullptr || _ops->mc() == nullptr) { return; }
+  // GATED on the box having freed a block's worth SINCE the refusal, as
+  // WiredPool::retry is: reopening a genuinely full box only fails again,
+  // one block per forward, and leaves each of them held but unwired.
+  MetalBlock* any = !_blocks.empty() ? _blocks[0].get() : nullptr;
+  const std::size_t block = any != nullptr ? block_bytes_(any) : 0;
+  const std::size_t now = _ops->mc()->memory_budget().available_physical;
+  if (now <= _wire_retry_at + block) { return; }
+  _wire_retry = false;
+  mgr->reopen_wired_pool();
+  std::size_t n = wire_fixed_(true);
+  for (auto& b : _blocks) {
+    if (b) { n += wire_block_(*b, true); }
+  }
+  if (n > 0) {
+    // Growth stopped when the pool did and cannot see that it moved.
+    _resid.note_landscape_changed();
+    if (_ops->mc()->session() != nullptr) {
+      _ops->mc()->session()->log_normal(vpipe::fmt(
+          "ltx-2.5: the wired pool took {} MB more after reopening; it "
+          "holds {} MB of {} MB", n >> 20, mgr->wired_pool_used() >> 20,
+          mgr->wired_pool_limit() >> 20));
+    }
+  }
 }
 
 std::size_t
@@ -863,6 +938,14 @@ Ltx25Dit::resident_pages_(std::size_t* examined, std::size_t* incore) const
       // measuring. With everything wired `examined` stays 0, which the
       // caller already reads as "no evidence" rather than a shortfall.
       if (x.is_wired()) { return; }
+      // NOR ONE BELOW THE POOL'S MINIMUM. Those are never wired (see
+      // GenerativeModelManager::pool_wirable): slices of the shared
+      // small-buffer heap, whose pages the heap owns and share with other
+      // allocations, and a few KB per block. Measured, they read partly
+      // out of RAM for reasons unrelated to this block, and every held
+      // block then looked short -- a release per step with the rest of the
+      // block wired and in RAM.
+      if (!vpipe::genai::GenerativeModelManager::pool_wirable(x)) { return; }
       const auto r = x.page_residency(64);
       if (!r.valid) { return; }
       ex += r.examined;
@@ -1149,6 +1232,148 @@ Ltx25Dit::set_geometry(int latent_frames, int latent_h, int latent_w,
   wire_into_pool();
 
   return true;
+}
+
+void
+Ltx25Dit::set_ane(bool on, float rows, int layers)
+{
+  _ane_on     = on;
+  _ane_rows   = rows;
+  _ane_layers = layers;
+  // A tier that declined -- too few rows for one chunk -- is asked again
+  // by the next clip, which may be longer. One that armed stays armed.
+  if (_ane == nullptr) { _ane_tried = false; }
+}
+
+namespace {
+
+// The ANE tier's SPEC for the video feed-forward: FlexData, so this plugin
+// asks for what it needs by name and a host that grows new kinds and keys
+// does not move anything this binary was built against. See ane-tier.h.
+vpipe::FlexData
+ane_spec_of(int hidden, int inner, int seq, bool biases, float rows)
+{
+  namespace ane = vpipe::genai::ane;
+  namespace acc = vpipe::genai::accel;
+  vpipe::FlexData s = vpipe::FlexData::make_object();
+  acc::set_text(&s, ane::kKind, std::string(ane::kKindFfn));
+  acc::set_text(&s, ane::kActivation, std::string(ane::kActGeluTanh));
+  acc::set_integer(&s, ane::kHidden, hidden);
+  acc::set_integer(&s, ane::kInner, inner);
+  acc::set_integer(&s, ane::kSeq, seq);
+  acc::set_flag(&s, ane::kBiases, biases);
+  acc::set_real(&s, ane::kRows, (double)rows);
+  if (const char* c = std::getenv("VPIPE_LTX25_ANE_CHUNK")) {
+    acc::set_integer(&s, ane::kChunk, std::atoi(c));
+  }
+  acc::set_flag(&s, ane::kProfile,
+                std::getenv("VPIPE_LTX25_ANE_PROFILE") != nullptr);
+  acc::set_text(&s, ane::kTag, "ltx-2.5");
+  return s;
+}
+
+}  // namespace
+
+std::size_t
+Ltx25Dit::ane_bytes(const DitConfig& cfg) noexcept
+{
+  const int d = cfg.inner_dim();
+  // ff.net.0.proj widens to 4x the stream, as bind_block reads it. The
+  // count does not depend on the clip, so any positive seq will do.
+  return vpipe::genai::ane::runtime_bytes(
+      ane_spec_of(d, 4 * d, 1, cfg.ff_bias, 0.0f));
+}
+
+vpipe::genai::ane::Tier::Plan
+Ltx25Dit::ane_plan_(int layer, const MetalBlock& blk,
+                    const GpuStreamInput& gv)
+{
+  using Plan = vpipe::genai::ane::Tier::Plan;
+  if (!_ane_on || !gv.present || gv.tokens <= 0) { return Plan::kGpu; }
+  const GpuStream& w = blk.weights().video;
+  if (!_ane_tried) {
+    _ane_tried = true;
+    const auto* ss = _ops->mc()->session();
+    std::string why;
+    _ane = vpipe::genai::ane::create(
+        ss, _ops->mc(),
+        ane_spec_of(w.dim, w.ff_hidden, gv.tokens, w.ff_has_bias, _ane_rows),
+        &why);
+    if (_ane == nullptr && ss != nullptr) {
+      ss->info(vpipe::fmt("ltx-2.5: the ANE feed-forward is not used: {}",
+                          why));
+    }
+  }
+  if (_ane == nullptr) { return Plan::kGpu; }
+  if (_ane_layers > 0 && layer >= _ane_layers) { return Plan::kGpu; }
+  auto stageable = [](const QWeight& q) {
+    if (!q.quantized) { return !q.w.empty(); }
+    return (q.bits == 4 || q.bits == 8) && !q.codes.empty() &&
+           !q.scales.empty() && !q.qbias.empty();
+  };
+  if (!stageable(w.ff_in) || !stageable(w.ff_out)) {
+    if (!_ane_warned && _ops->mc()->session() != nullptr) {
+      _ane_warned = true;
+      _ops->mc()->session()->warn(vpipe::fmt(
+          "ltx-2.5: block {} has no bf16 or 4/8-bit affine video "
+          "feed-forward, so it (and any like it) keeps the GPU", layer));
+    }
+    return Plan::kGpu;
+  }
+  return _ane->plan_block();
+}
+
+void
+Ltx25Dit::ane_stage_(int layer, const MetalBlock& blk, const LoraBlock* lora)
+{
+  namespace ane = vpipe::genai::ane;
+  namespace acc = vpipe::genai::accel;
+  const GpuStream& w = blk.weights().video;
+  vpipe::FlexData params = vpipe::FlexData::make_object();
+  acc::set_integer(&params, ane::kGroup, blk.weights().quant_group);
+  // A Binding VIEWS its name, so the names live here, reserved up front so
+  // none moves: two projections x at most seven bindings each.
+  std::vector<std::string> names;
+  names.reserve(16);
+  std::vector<ane::Binding> binds;
+  binds.reserve(16);
+  auto bind_proj = [&](std::string_view p, const QWeight& q,
+                       const SharedBuffer* bias, const LoraPair* lp) {
+    auto add = [&](std::string_view field, const SharedBuffer* buf) {
+      if (buf == nullptr || buf->empty()) { return; }
+      names.push_back(ane::key(p, field));
+      binds.push_back({names.back(), buf});
+    };
+    if (q.quantized) {
+      add("codes", &q.codes);
+      add("scales", &q.scales);
+      add("qbias", &q.qbias);
+      acc::set_integer(&params, ane::key(p, "bits"), q.bits);
+    } else {
+      add("w", &q.w);
+    }
+    add("bias", bias);
+    // The adapter's strength is folded into A at load (ltx25-lora.h), so
+    // it goes in at the default unit scale; A is [rank][k], B [n][rank].
+    if (lp != nullptr && lp->valid()) {
+      add("lora0.a", &lp->a);
+      add("lora0.b", &lp->b);
+      acc::set_integer(&params, ane::key(p, "lora0.rank"), lp->rank);
+    }
+  };
+  bind_proj(ane::kProjUp, w.ff_in, w.ff_has_bias ? &w.ff_in_b : nullptr,
+            lora != nullptr ? &lora->video_ff_in : nullptr);
+  bind_proj(ane::kProjDown, w.ff_out, w.ff_has_bias ? &w.ff_out_b : nullptr,
+            lora != nullptr ? &lora->video_ff_out : nullptr);
+  if (!_ane->stage(layer, params, binds) && !_ane_warned &&
+      _ops->mc()->session() != nullptr) {
+    // The split then finds nothing staged and keeps the GPU; say why once.
+    _ane_warned = true;
+    const vpipe::FlexData inf = _ane->info();
+    _ops->mc()->session()->warn(vpipe::fmt(
+        "ltx-2.5: the ANE refused block {}'s feed-forward: {}", layer,
+        acc::text(&inf, ane::kInfoError)));
+  }
 }
 
 bool
@@ -1451,6 +1676,9 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
   // budget, so those bytes are already out of `available_physical`.
   // Reserving them again is asking for the same room twice, which is the
   // documented way this refuses a block it could afford.
+  // A pool that stopped taking blocks is asked again once the box has room;
+  // growth below then sees a budget that moved. See maybe_retry_wiring_.
+  maybe_retry_wiring_();
   _resid.note_reserve_allocated((std::size_t)scratch_bytes());
   const auto mb0 = o.mc()->memory_budget();
   _resid.begin_forward(mb0, [this] { return evict_tail_block_(); });
@@ -1571,18 +1799,15 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
       if (ex > 0 && ic * 4 < ex * 3) { ++bp_cold_blocks; }   // < 75% in RAM
     }
 
-    auto s = o.mc()->make_command_stream();
-    {
-      auto enc = s.begin_compute();
-      if (!blk->forward(enc, gv, ga, err,
-                        _lora != nullptr ? _lora->block(i) : nullptr, i)) {
-        return false;
-      }
-    }
-    // BETWEEN THE COMMIT AND THE WAIT is the whole opportunity: the GPU
-    // is busy with block i and this thread has nothing to do.
-    auto fence = s.commit();
-    if (pf_on && pf.block < 0) {
+    const LoraBlock* blora = _lora != nullptr ? _lora->block(i) : nullptr;
+
+    // Issue the NEXT streamed block's read into the other slot, under GPU
+    // work this block has committed. Called at a block's first commit: for
+    // an ANE split that is the head, whose drain plus both halves of the
+    // feed-forward cover the read -- at the tail it hid behind little more
+    // than a gated add, and a streamed M4 run lost ~200 ms a block to it.
+    auto issue_prefetch = [&]() {
+      if (!pf_on || pf.block >= 0) { return; }
       const int nxt = pf_next(i + 1);
       // Asked PER BLOCK, with the same budget question growth asks,
       // because on a box that fits one block the failure mode is not
@@ -1608,7 +1833,104 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
           return fill_slot_(nxt, slot, arena, &perr);
         });
       }
+    };
+
+    // ---- the ANE feed-forward split (`ane_ffn`) -----------------------
+    //
+    // A SPLIT block runs as three command buffers: everything up to the
+    // video feed-forward's input (the weights staging on the ANE worker
+    // meanwhile), then the GPU's rows of the feed-forward while the ANE
+    // predicts the tail rows, then the tail. A PROBE block runs the same
+    // three with every row on the GPU, which is the on/off measurement;
+    // a GPU block is the one command buffer below, unchanged.
+    using AnePlan = vpipe::genai::ane::Tier::Plan;
+    namespace ane_ns = vpipe::genai::ane;
+    namespace acc_ns = vpipe::genai::accel;
+    const AnePlan ane_plan = ane_plan_(i, *blk, gv);
+    const bool ane_split = ane_plan == AnePlan::kSplit;
+    const bool ane_measured = ane_split || ane_plan == AnePlan::kProbe;
+    if (ane_measured) {
+      auto ms_since = [](std::chrono::steady_clock::time_point t) {
+        return std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - t).count();
+      };
+      if (ane_split) { ane_stage_(i, *blk, blora); }
+      const auto t_d0 = std::chrono::steady_clock::now();
+      auto s1 = o.mc()->make_command_stream();
+      {
+        auto enc = s1.begin_compute();
+        if (!blk->forward_head(enc, gv, ga, err, blora, i)) {
+          _ane->join();
+          return false;
+        }
+      }
+      auto f1 = s1.commit();
+      issue_prefetch();
+      const bool staged = ane_split && _ane->join_stage(i);
+      std::string e1;
+      if (!f1.wait_ok(&e1)) {
+        return fail("block " + std::to_string(i) + ": " +
+                    (e1.empty() ? std::string("GPU error") : e1));
+      }
+      const double drain_ms = ms_since(t_d0);
+      int a_rows = 0;
+      if (staged) {
+        vpipe::FlexData args = vpipe::FlexData::make_object();
+        acc_ns::set_integer(&args, ane_ns::kSeq, gv.tokens);
+        const ane_ns::Binding io[] = {{ane_ns::kIoIn, &blk->ff_input()},
+                                      {ane_ns::kIoOut, &blk->ff_output()}};
+        a_rows = _ane->begin(args, io);
+      }
+      if (ane_split && !staged && !_ane_warned &&
+          o.mc()->session() != nullptr) {
+        _ane_warned = true;
+        o.mc()->session()->warn(vpipe::fmt(
+            "ltx-2.5: staging block {}'s feed-forward for the ANE failed; "
+            "it keeps the GPU feed-forward", i));
+      }
+      // The GPU's rows. The ANE writes rows [tokens - a_rows, tokens) of
+      // the same plane, which this does not touch.
+      const auto t_g0 = std::chrono::steady_clock::now();
+      auto s2 = o.mc()->make_command_stream();
+      {
+        auto enc = s2.begin_compute();
+        blk->video_ff_rows(enc, gv, gv.tokens - a_rows, blora);
+      }
+      std::string e2;
+      const bool ok2 = s2.commit().wait_ok(&e2);
+      const double gpu_ms = ms_since(t_g0);
+      // Joined BEFORE any return: the worker is still writing the plane.
+      vpipe::FlexData timing = vpipe::FlexData::make_object();
+      acc_ns::set_real(&timing, ane_ns::kGpuMs, gpu_ms);
+      acc_ns::set_real(&timing, ane_ns::kDrainMs, drain_ms);
+      if (a_rows > 0) {
+        if (!_ane->finish(i, timing)) {
+          return fail("block " + std::to_string(i) +
+                      ": the ANE feed-forward produced non-finite rows");
+        }
+      } else if (!ane_split) {
+        _ane->note_probe(timing);
+      }
+      if (!ok2) {
+        return fail("block " + std::to_string(i) + ": " +
+                    (e2.empty() ? std::string("GPU error") : e2));
+      }
     }
+
+    auto s = o.mc()->make_command_stream();
+    {
+      auto enc = s.begin_compute();
+      const bool ok = ane_measured
+                          ? blk->forward_tail(enc, gv, ga, err, blora)
+                          : blk->forward(enc, gv, ga, err, blora, i);
+      if (!ok) { return false; }
+    }
+    // BETWEEN THE COMMIT AND THE WAIT is the whole opportunity: the GPU
+    // is busy with block i and this thread has nothing to do.
+    auto fence = s.commit();
+    // A split block issued it at its FIRST commit already; this is a no-op
+    // then (one outstanding read at a time).
+    issue_prefetch();
     // wait_ok, not wait: a command buffer can END IN ERROR, and the one
     // that matters here is an OUT-OF-MEMORY or page fault from
     // over-committing GPU memory -- exactly what a bounded box produces

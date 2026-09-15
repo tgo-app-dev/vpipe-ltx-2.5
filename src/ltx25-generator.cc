@@ -381,7 +381,8 @@ Ltx25Generator::generate(const VideoGenRequest& req, VideoGenResult* out)
   for (std::string_view tier : vpipe::genai::accel::tiers_on(req.accel)) {
     if (tier != vpipe::genai::accel::kI8Gemm &&
         tier != vpipe::genai::accel::kSolAttn &&
-        tier != vpipe::genai::accel::kSageAttn) {
+        tier != vpipe::genai::accel::kSageAttn &&
+        tier != vpipe::genai::accel::kAneFfn) {
       warn_(fmt("'{}' was asked for and is not implemented here",
                 std::string(tier))());
     }
@@ -758,6 +759,18 @@ Ltx25Generator::generate(const VideoGenRequest& req, VideoGenResult* out)
       warn_("lora: " + serr);
       return false;
     }
+  }
+
+  // The ANE feed-forward tier, per generation and off the same bag -- and
+  // AFTER the rebuild above, whose fresh DiT starts with the tier off. The
+  // key arrives already settled: generate-video turns it off when the plan
+  // left no room for the module this family booked.
+  {
+    namespace acc = vpipe::genai::accel;
+    _dit->set_ane(acc::flag(req.accel, acc::kAneFfn),
+                  (float)acc::real(req.accel, acc::kAneRows, 0.0),
+                  (int)std::max<long long>(
+                      0, acc::integer(req.accel, acc::kAneLayers, 0)));
   }
 
   if (lf != _lf || lh != _lh || lw != _lw || at != _at ||

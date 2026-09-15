@@ -11,6 +11,8 @@
 #include "ltx25-rope.h"
 
 #include "generative-models/generative-model-manager.h"
+#include "generative-models/shared/accel-settings.h"
+#include "generative-models/shared/ane-tier.h"
 #include "generative-models/shared/block-residency.h"
 #include "generative-models/weight-set.h"
 
@@ -331,8 +333,47 @@ public:
   bool connector_weights_present() const { return _has_connector; }
   bool connectors_loaded() const { return _v_conn != nullptr; }
 
+  // ---- the ANE feed-forward tier (`ane_ffn`) -------------------------
+  //
+  // The VIDEO stream's feed-forward rows, split between the GPU and the
+  // ANE: the ANE takes the tail rows through the host's described tier
+  // (ane-tier.h, kind "ffn", activation "gelu_tanh"), the GPU the rest, and the
+  // two land in one plane before the gated residual. The audio stream is
+  // too short to fill a chunk and stays on the GPU.
+  //
+  // Per generation, off generate-video's bag: `rows` is the ANE's share
+  // (0 balances from measured rates, and the tier turns itself off where
+  // the GPU is faster), `layers` caps the blocks that split (0 = all).
+  // The module is built on the first forward that has the rows for it,
+  // on the session's ANE worker; with no session the tier stays off.
+  void set_ane(bool on, float rows, int layers);
+  bool ane_armed() const noexcept { return _ane != nullptr; }
+
+  // What the tier holds at `cfg`'s width: the module's weight slots, its
+  // staging and one chunk of host rows. Independent of the clip.
+  static std::size_t ane_bytes(const DitConfig& cfg) noexcept;
+
 private:
   Ltx25Dit() = default;
+
+  // Build the tier on first use and decide this block: kGpu when it is
+  // off, not armed, past `layers`, or the block's feed-forward is not
+  // stageable (dense bf16 or 4/8-bit affine).
+  vpipe::genai::ane::Tier::Plan
+  ane_plan_(int layer, const MetalBlock& blk, const GpuStreamInput& gv);
+  // Stage block `layer`'s video feed-forward weights, with its adapter
+  // folded in, on the ANE worker. Joined before the split.
+  void ane_stage_(int layer, const MetalBlock& blk, const LoraBlock* lora);
+
+  // The host's described ANE surface (ane-tier.h): opaque, driven through
+  // FlexData specs and named buffer bindings, so it adds nothing to this
+  // plugin's ABI with the host.
+  std::unique_ptr<vpipe::genai::ane::Tier> _ane;
+  bool  _ane_on     = false;
+  bool  _ane_tried  = false;
+  bool  _ane_warned = false;
+  float _ane_rows   = 0.0f;
+  int   _ane_layers = 0;
 
   // The adaLN MLP chain, on the HOST in f32.
   //
@@ -491,6 +532,16 @@ private:
   bool _wired_reported = false;
   // Bytes the pool would not take on the last wire pass; see wire_fixed_.
   std::size_t _unwirable = 0;
+  // RETRY AFTER A REFUSAL. A pool that stopped taking blocks -- full, or
+  // capped by a real shortage -- is reopened at a later forward once the
+  // box has freed a block's worth since, and what is held but unwired is
+  // wired then. Without it one refusal held for the rest of the process.
+  // `_wire_retry_at` is available_physical when it happened.
+  bool        _wire_retry    = false;
+  std::size_t _wire_retry_at = 0;
+  void note_wire_refused_();
+  // Top of a forward: reopen and re-wire when the box has room again.
+  void maybe_retry_wiring_();
   bool _has_connector = false;
   bool _have_audio = false;
 
