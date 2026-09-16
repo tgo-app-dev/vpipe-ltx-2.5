@@ -14,6 +14,7 @@
 #include "generative-models/shared/accel-settings.h"
 #include "generative-models/shared/ane-tier.h"
 #include "generative-models/shared/block-residency.h"
+#include "generative-models/shared/wired-pool.h"
 #include "generative-models/weight-set.h"
 
 #include <cstdint>
@@ -532,15 +533,10 @@ private:
   bool _wired_reported = false;
   // Bytes the pool would not take on the last wire pass; see wire_fixed_.
   std::size_t _unwirable = 0;
-  // RETRY AFTER A REFUSAL. A pool that stopped taking blocks -- full, or
-  // capped by a real shortage -- is reopened at a later forward once the
-  // box has freed a block's worth since, and what is held but unwired is
-  // wired then. Without it one refusal held for the rest of the process.
-  // `_wire_retry_at` is available_physical when it happened.
-  bool        _wire_retry    = false;
-  std::size_t _wire_retry_at = 0;
-  void note_wire_refused_();
-  // Top of a forward: reopen and re-wire when the box has room again.
+  // This model's window onto the manager's wired pool: the gate on
+  // admission, the refusal, and when to ask again (shared/wired-pool.h).
+  vpipe::genai::WiredPool _wire;
+  // Top of a forward: reopen and re-wire when the pool can take more.
   void maybe_retry_wiring_();
   bool _has_connector = false;
   bool _have_audio = false;

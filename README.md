@@ -136,7 +136,7 @@ is finished. It is not:
 
 ## Building
 
-Needs an installed vpipe with **plugin ABI 4** — the host loads a plugin on
+Needs an installed vpipe with **plugin ABI 5** — the host loads a plugin on
 STRICT equality, so this is an exact requirement, not a minimum. Rebuild
 against the vpipe you deploy with; a mismatch is refused with a clear
 message rather than crashed.

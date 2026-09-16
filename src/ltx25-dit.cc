@@ -343,15 +343,14 @@ Ltx25Dit::bake_adaln(const std::vector<double>& sigmas, std::string* err)
   // charged to the pool for the rest of the run while no longer
   // existing -- and the pool would fill with bytes nothing holds.
   if (_wired_fixed) {
-    if (auto* mgr = manager_()) {
-      for (const DitTrunk::AdaLN* a : all) {
-        const SharedBuffer* bufs[] = {&a->emb1_w, &a->emb1_b, &a->emb2_w,
-                                      &a->emb2_b, &a->out_w,  &a->out_b};
-        for (const SharedBuffer* sb : bufs) {
-          mgr->unwire_from_pool(const_cast<SharedBuffer&>(*sb));
-        }
+    std::vector<SharedBuffer*> bufs;
+    for (const DitTrunk::AdaLN* a : all) {
+      for (const SharedBuffer* sb : {&a->emb1_w, &a->emb1_b, &a->emb2_w,
+                                     &a->emb2_b, &a->out_w, &a->out_b}) {
+        bufs.push_back(const_cast<SharedBuffer*>(sb));
       }
     }
+    _wire.wire_set(bufs, false);
   }
   for (DitTrunk::AdaLN* a : {&_trunk.video, &_trunk.audio, &_trunk.prompt,
                              &_trunk.audio_prompt, &_trunk.av_video_ss,
@@ -596,7 +595,7 @@ Ltx25Dit::~Ltx25Dit()
   if (!_wired_fixed) { return; }
   wire_fixed_(false);
   for (auto& b : _blocks) {
-    if (b) { wire_block_(*b, false); }
+    if (b) { _wire.note_unwired(wire_block_(*b, false)); }
   }
 }
 
@@ -659,14 +658,10 @@ Ltx25Dit::each_scratch_(
 void
 Ltx25Dit::unwire_scratch_()
 {
-  auto* mgr = manager_();
-  if (mgr == nullptr || !_wired_fixed) { return; }
-  std::size_t given = 0;
-  each_scratch_([&](SharedBuffer& b) {
-    if (b.byte_size() == 0 || !b.is_wired()) { return; }
-    given += b.byte_size();
-    mgr->unwire_from_pool(b);
-  });
+  if (!_wired_fixed) { return; }
+  std::vector<SharedBuffer*> bufs;
+  each_scratch_([&](SharedBuffer& b) { bufs.push_back(&b); });
+  const std::size_t given = _wire.wire_set(bufs, false);
   if (given > 0 && _ops != nullptr && _ops->mc() != nullptr &&
       _ops->mc()->session() != nullptr) {
     _ops->mc()->session()->log_debug(vpipe::fmt(
@@ -678,141 +673,101 @@ Ltx25Dit::unwire_scratch_()
 std::size_t
 Ltx25Dit::wire_fixed_(bool on)
 {
-  auto* mgr = manager_();
-  if (mgr == nullptr) { return 0; }
-  std::size_t changed = 0;
-  bool full = false;
-  std::size_t unwirable = 0;
-  auto one = [&](SharedBuffer& b) {
-    if (b.byte_size() == 0 || b.is_wired() == on) { return; }
-    if (!on) { mgr->unwire_from_pool(b); changed += b.byte_size(); return; }
-    // Too small to be a pool question (heap slices, a few scalars): never
-    // wired, not counted, and above all not a reason to stop.
-    if (!vpipe::genai::GenerativeModelManager::pool_wirable(b)) { return; }
-    if (full) { unwirable += b.byte_size(); return; }
-    const std::size_t got = mgr->wire_into_pool(b);
-    if (got == 0) {
-      unwirable += b.byte_size();
-      // A buffer that would not wire for a reason of its OWN leaves the
-      // pool able to take the next one: go on. Only a pool that can no
-      // longer take it -- full, or capped by a real shortage -- ends the
-      // pass, keeping what is wired rather than unwinding it (a partly
-      // protected model beats an unprotected one), and arms the retry.
-      if (!mgr->wired_pool_can_take(b.byte_size())) {
-        full = true;
-        note_wire_refused_();
-      }
-      return;
-    }
-    changed += got;
-  };
   // THE SCRATCH FIRST. A forward cannot proceed without it, where a
   // resident block is an optimisation this model can shed -- so if the
   // pool runs out partway, it runs out on the half that had an
-  // alternative.
-  each_scratch_(one);
-  // Then the TRUNK and the CONNECTORS, read on every block of every
-  // forward and never shed.
+  // alternative. Then the TRUNK and the CONNECTORS, read on every block of
+  // every forward and never shed.
   //
   // const_cast because the enumerations hand out const buffers -- they
   // exist for counting as well as wiring -- and wiring is a property of
   // the PAGES rather than of the bytes. Nothing here writes through the
   // pointer.
+  std::vector<SharedBuffer*> bufs;
+  each_scratch_([&](SharedBuffer& b) { bufs.push_back(&b); });
   for_each_weight(_trunk, [&](const SharedBuffer& b) {
-    one(const_cast<SharedBuffer&>(b));
+    bufs.push_back(const_cast<SharedBuffer*>(&b));
   });
   auto conn = [&](const std::unique_ptr<Ltx25Connector>& c) {
     if (!c) { return; }
     c->for_each_weight([&](const SharedBuffer& b) {
-      one(const_cast<SharedBuffer&>(b));
+      bufs.push_back(const_cast<SharedBuffer*>(&b));
     });
   };
   conn(_v_conn);
   conn(_a_conn);
-  _unwirable = unwirable;
+  // The pool stops at the first refusal, keeping what is wired, and arms
+  // its own retry -- see WiredPool::wire_set.
+  const std::size_t changed = _wire.wire_set(bufs, on);
+  if (on) {
+    const vpipe::FlexData inf = _wire.info();
+    _unwirable = (std::size_t)vpipe::genai::accel::integer(
+        &inf, vpipe::genai::wired_pool::kInfoLastRefused, 0);
+  }
   return changed;
 }
 
 std::size_t
 Ltx25Dit::wire_block_(MetalBlock& b, bool on)
 {
-  auto* mgr = manager_();
-  if (mgr == nullptr) { return 0; }
-  std::size_t changed = 0;
-  bool refused = false;
+  std::vector<SharedBuffer*> bufs;
   for_each_weight(b.weights(), [&](const SharedBuffer& x) {
-    if (x.byte_size() == 0 || x.is_wired() == on) { return; }
-    SharedBuffer& m = const_cast<SharedBuffer&>(x);
-    if (!on) { mgr->unwire_from_pool(m); changed += m.byte_size(); return; }
-    // See wire_fixed_: small buffers are not a pool question.
-    if (!vpipe::genai::GenerativeModelManager::pool_wirable(m)) { return; }
-    const std::size_t got = mgr->wire_into_pool(m);
-    changed += got;
-    if (got == 0 && !mgr->wired_pool_can_take(m.byte_size())) {
-      refused = true;
-    }
+    bufs.push_back(const_cast<SharedBuffer*>(&x));
   });
-  if (refused) { note_wire_refused_(); }
+  const std::size_t changed = _wire.wire_set(bufs, on);
   // A promotion that wired less than it asked for is protection lost, and
   // nothing else in the log says so. The first few are reported.
   if (on && _ops != nullptr && _ops->mc() != nullptr &&
       _ops->mc()->session() != nullptr) {
-    std::size_t asked = 0;
-    for_each_weight(b.weights(), [&](const SharedBuffer& x) {
-      if (vpipe::genai::GenerativeModelManager::pool_wirable(x) &&
-          !x.is_wired()) {
-        asked += x.byte_size();
-      }
-    });
+    const vpipe::FlexData inf = _wire.info();
+    namespace acc = vpipe::genai::accel;
+    namespace wp = vpipe::genai::wired_pool;
+    const std::size_t left =
+        (std::size_t)acc::integer(&inf, wp::kInfoLastRefused, 0);
     static std::atomic<int> said{0};
-    if ((asked > 0 || changed > 0) &&
-        said.fetch_add(1, std::memory_order_relaxed) < 3) {
+    if (left > 0 && said.fetch_add(1, std::memory_order_relaxed) < 3) {
       _ops->mc()->session()->info(vpipe::fmt(
           "ltx-2.5: block wiring left {} MB unwired ({} MB wired this call); "
-          "pool {} of {} MB, can take it: {}", asked >> 20, changed >> 20,
-          mgr->wired_pool_used() >> 20, mgr->wired_pool_limit() >> 20,
-          mgr->wired_pool_can_take(asked) ? "yes" : "no"));
+          "pool {} of {} MB", left >> 20, changed >> 20,
+          acc::integer(&inf, wp::kInfoPoolUsed, 0) >> 20,
+          acc::integer(&inf, wp::kInfoPoolLimit, 0) >> 20));
     }
   }
   return changed;
 }
 
 void
-Ltx25Dit::note_wire_refused_()
-{
-  if (_wire_retry || _ops == nullptr || _ops->mc() == nullptr) { return; }
-  _wire_retry    = true;
-  _wire_retry_at = _ops->mc()->memory_budget().available_physical;
-}
-
-void
 Ltx25Dit::maybe_retry_wiring_()
 {
-  if (!_wire_retry || !_wired_fixed) { return; }
-  auto* mgr = manager_();
-  if (mgr == nullptr || _ops == nullptr || _ops->mc() == nullptr) { return; }
-  // GATED on the box having freed a block's worth SINCE the refusal, as
-  // WiredPool::retry is: reopening a genuinely full box only fails again,
-  // one block per forward, and leaves each of them held but unwired.
-  MetalBlock* any = !_blocks.empty() ? _blocks[0].get() : nullptr;
+  if (!_wired_fixed || _ops == nullptr || _ops->mc() == nullptr) { return; }
+  // After this model's refusal once the box has freed a block's worth,
+  // and a ceiling someone else collapsed once per run -- see
+  // WiredPool::retry.
+  MetalBlock* any = nullptr;
+  for (auto& b : _blocks) { if (b) { any = b.get(); break; } }
+  if (any == nullptr && _slot[0]) { any = _slot[0].get(); }
   const std::size_t block = any != nullptr ? block_bytes_(any) : 0;
-  const std::size_t now = _ops->mc()->memory_budget().available_physical;
-  if (now <= _wire_retry_at + block) { return; }
-  _wire_retry = false;
-  mgr->reopen_wired_pool();
+  if (!_wire.retry(_ops->mc(), block)) { return; }
+  // What is HELD but unwired goes in now: the fixed half first, then the
+  // resident blocks, booked as they wire.
   std::size_t n = wire_fixed_(true);
   for (auto& b : _blocks) {
-    if (b) { n += wire_block_(*b, true); }
+    if (!b) { continue; }
+    const std::size_t got = wire_block_(*b, true);
+    _wire.note_wired(_ops->mc(), got, got);
+    n += got;
   }
-  if (n > 0) {
-    // Growth stopped when the pool did and cannot see that it moved.
-    _resid.note_landscape_changed();
-    if (_ops->mc()->session() != nullptr) {
-      _ops->mc()->session()->log_normal(vpipe::fmt(
-          "ltx-2.5: the wired pool took {} MB more after reopening; it "
-          "holds {} MB of {} MB", n >> 20, mgr->wired_pool_used() >> 20,
-          mgr->wired_pool_limit() >> 20));
-    }
+  // Growth stopped when the pool did and cannot see that it moved.
+  _resid.note_landscape_changed();
+  if (_ops->mc()->session() != nullptr) {
+    const vpipe::FlexData inf = _wire.info();
+    namespace acc = vpipe::genai::accel;
+    namespace wp = vpipe::genai::wired_pool;
+    _ops->mc()->session()->log_normal(vpipe::fmt(
+        "ltx-2.5: the wired pool took {} MB more after reopening; it "
+        "holds {} MB of {} MB", n >> 20,
+        acc::integer(&inf, wp::kInfoPoolUsed, 0) >> 20,
+        acc::integer(&inf, wp::kInfoPoolLimit, 0) >> 20));
   }
 }
 
@@ -822,9 +777,20 @@ Ltx25Dit::wire_into_pool()
   const auto* sess = _ops != nullptr && _ops->mc() != nullptr
                          ? _ops->mc()->session() : nullptr;
   auto* mgr = manager_();
-  if (mgr == nullptr) { return 0; }
+  if (mgr == nullptr || _ops == nullptr || _ops->mc() == nullptr) {
+    return 0;
+  }
+  {
+    vpipe::FlexData wo = vpipe::FlexData::make_object();
+    vpipe::genai::accel::set_text(&wo, vpipe::genai::wired_pool::kTag,
+                                  "ltx-2.5");
+    _wire.open(_ops->mc(), wo);
+  }
+  // A new geometry is a new run: a pool ceiling some earlier model
+  // collapsed may be asked about again. See WiredPool::retry.
+  _wire.new_run();
   const std::size_t limit = mgr->wired_pool_limit();
-  if (limit == 0) {
+  if (limit == 0 || !_wire.on()) {
     // SAID, not skipped silently. Wiring off is a legitimate setting
     // (wired_pool_pct 0, or a box that granted nothing), and a run that
     // then sheds its resident set looks exactly like one whose policy
@@ -843,7 +809,10 @@ Ltx25Dit::wire_into_pool()
   // The blocks AFTER, and only the ones already held. A streamed block
   // is wired as it is admitted (see the residency loop), not here.
   for (auto& b : _blocks) {
-    if (b) { n += wire_block_(*b, true); }
+    if (!b) { continue; }
+    const std::size_t got = wire_block_(*b, true);
+    _wire.note_wired(_ops->mc(), got, got);
+    n += got;
   }
   // Reported at INFO and on every geometry, including a zero. A pool
   // that silently refused reads in the log exactly like one that was
@@ -897,7 +866,7 @@ Ltx25Dit::evict_tail_block_(bool allow_pinned)
     // weights can be subviews of a shard its neighbours share -- meant
     // the kernel could discard those pages mid-forward. It took SIGBUS
     // in this block's own destructor.
-    if (_wired_fixed) { wire_block_(*b, false); }
+    if (_wired_fixed) { _wire.note_unwired(wire_block_(*b, false)); }
     b.reset();
     // Taking one out of the PINNED prefix un-pins it. That prefix was
     // sized at load against what the box was believed to hold, and a
@@ -1950,7 +1919,10 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
     // command buffer still in flight.
     if (_blocks[(std::size_t)i] == nullptr && use >= 0) {
       const std::size_t nb = block_bytes_(_slot[(std::size_t)use].get());
-      if (nb > 0 && _resid.admit(o.mc(), nb)) {
+      // Past the pool there is nothing to gain: the block would be kept
+      // unprotected and the compressor would take it. See
+      // WiredPool::wirable.
+      if (nb > 0 && _wire.wirable(nb) && _resid.admit(o.mc(), nb)) {
         // MOVED out of the slot, which leaves it empty. The next block
         // to be streamed rebuilds it -- the read it was going to do
         // anyway -- so a promotion costs no copy and no extra read, and
@@ -1966,7 +1938,10 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
         // accounting. Wiring is skipped silently when the pool is full,
         // which leaves the block held-but-reclaimable: the old
         // behaviour, and no worse than it.
-        if (_wired_fixed) { wire_block_(*_blocks[(std::size_t)i], true); }
+        if (_wired_fixed) {
+          _wire.note_wired(o.mc(),
+                           wire_block_(*_blocks[(std::size_t)i], true), nb);
+        }
       }
     }
     if (kBlkProf && (i % 12 == 0 || i + 1 == (int)_blocks.size())) {
