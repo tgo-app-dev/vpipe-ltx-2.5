@@ -1,6 +1,8 @@
 #include "ltx25-metal-ops.h"
 #include "ltx25-config.h"
 
+#include "apple-silicon/metal-compute/kernel-contract.h"
+
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -44,17 +46,11 @@ dispatch_1d_(ComputeEncoder& enc, std::size_t n)
   enc.dispatch({g, 1, 1}, {256, 1, 1});
 }
 
-// C++ mirror of mlx::steel::AttnParams, which lives in the vendored
-// steel headers and is not on the plugin's include path. Field order and
-// types are the contract; nothing here may be reordered.
-struct SteelAttnParams {
-  int B, H, D;
-  int qL, kL;
-  int gqa_factor;
-  float scale;
-  int NQ, NK, NQ_aligned, NK_aligned, qL_rem, kL_rem, qL_off;
-  std::int64_t Q_strides[3], K_strides[3], V_strides[3], O_strides[3];
-};
+// The steel kernels' parameter block, from the host's kernel contract
+// (kernel-contract/1): the host checks it field for field against the
+// kernel's own definition, so a private mirror has nothing to add.
+namespace contract = vpipe::metal_compute::contract;
+using SteelAttnParams = contract::SteelAttnParams;
 
 }  // namespace
 
@@ -1197,15 +1193,15 @@ MetalOps::steel_attn_plan(SteelAttn* p, int heads, int tq, int tkv,
     s->O_strides[i] = s->Q_strides[i];
   }
 
-  // 200 says the last query tile is full, 201 the last key tile -- so
-  // 201 comes from the KEY length, which for this model's cross
+  // AlignQ says the last query tile is full, AlignK the last key tile --
+  // so AlignK comes from the KEY length, which for this model's cross
   // attentions is not the query length.
   vpipe::metal_compute::FunctionConstants fc;
-  fc.set_bool(200, (tq % bq) == 0)
-      .set_bool(201, (tkv % bk) == 0)
-      .set_bool(300, false)        // has_mask
-      .set_bool(301, false)        // do_causal
-      .set_bool(302, false);       // has_sinks
+  fc.set_bool(contract::kAttnAlignQ, (tq % bq) == 0)
+      .set_bool(contract::kAttnAlignK, (tkv % bk) == 0)
+      .set_bool(contract::kAttnHasMask, false)
+      .set_bool(contract::kAttnCausal, false)
+      .set_bool(contract::kAttnSinks, false);
   const char* name =
       _attn_nax ? (head_dim == 128 ? "attn_steel_nax_h_bd128_bf16"
                                    : "attn_steel_nax_h_bd64_bf16")

@@ -43,6 +43,17 @@ extern "C" const unsigned long ltx25_kernels_f16_metallib_len;
 extern "C" const unsigned char ltx25_kernels_f32_metallib[];
 extern "C" const unsigned long ltx25_kernels_f32_metallib_len;
 
+// What this plugin cannot run without, beyond the ABI integer: it
+// dispatches host kernels by name (the steel attention, the dense and
+// quantized GEMMs, the DiT's elementwise ops) and reads its acceleration
+// tiers out of the request's FlexData bag. A host without either refuses
+// the plugin at load, naming the feature.
+static const char* const kRequires[] = {
+    VPIPE_FEATURE_KERNEL_CONTRACT,
+    VPIPE_FEATURE_ACCEL_BAG,
+    nullptr,
+};
+
 static const VpipePluginInfo kInfo = {
     VPIPE_PLUGIN_INFO_SCHEMA,
     "ltx-2.5",
@@ -51,6 +62,7 @@ static const VpipePluginInfo kInfo = {
     "Apache-2.0 (plugin); the LTX-2.5 WEIGHTS are under the LTX-2.x "
     "Community License -- see https://github.com/Lightricks/LTX-2",
     "LTX-2.5: 22B joint audio-video generation for generate-video",
+    kRequires,
 };
 
 static void

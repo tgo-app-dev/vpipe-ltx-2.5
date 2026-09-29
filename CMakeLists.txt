@@ -7,12 +7,17 @@ project(vpipe_ltx_2_5 LANGUAGES CXX)
 # then load it:
 #   vpipe --plugin build/vpipe-ltx-2.5.so ...
 #
-# A plugin must be rebuilt against the vpipe it deploys with: the ABI
-# handshake is strict equality, so a mismatch is refused at load rather
-# than crashing. This plugin needs ABI 4 -- exactly, not "or newer", and
-# the number moves whenever the host's plugin surface does. 4 is what
-# VideoModelFamily::denoise_scratch_bytes needs, and it also carries the
-# MetalCompute::MemoryBudget layout the residency code reads by value.
+# Built for plugin ABI 8. A host at ABI N loads plugins built for N and
+# N-1, and reads the version from the FILE before loading it, so a
+# plugin outside that window is refused by name rather than crashed.
+# What it needs beyond the integer -- the kernel contract and the
+# acceleration bag -- is named in src/ltx25-plugin.cc (kRequires).
+#
+# vpipe's generative-models/shared helpers this model calls (i8_gemm,
+# Sage, Sol, FP8, the comfy reader) are the SDK's TOOLKIT: compiled INTO
+# this binary from vpipe::toolkit, not called in libvpipe, which does not
+# export them. vpipe_add_plugin links it; every test executable that
+# links vpipe links it too.
 find_package(vpipe REQUIRED)
 
 # The 48-block stack. No test target yet -- it is exercised through the
@@ -105,7 +110,7 @@ add_executable(ltx25-config-test
     src/ltx25-lora.cc
     src/ltx25-quant-family.cc)
 target_include_directories(ltx25-config-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(ltx25-config-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-config-test PRIVATE vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-config-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-config-test PRIVATE -Wall -Werror)
@@ -120,7 +125,7 @@ add_executable(ltx25-lora-test
     src/ltx25-lora.cc
     src/ltx25-quant-family.cc)
 target_include_directories(ltx25-lora-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(ltx25-lora-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-lora-test PRIVATE vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-lora-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-lora-test PRIVATE -Wall -Werror)
@@ -147,7 +152,8 @@ add_executable(ltx25-dit-weights-test
     src/ltx25-config.cc)
 target_include_directories(ltx25-dit-weights-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(ltx25-dit-weights-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-dit-weights-test PRIVATE
+    vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-dit-weights-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-dit-weights-test PRIVATE -Wall -Werror)
@@ -165,7 +171,8 @@ add_executable(ltx25-conditioning-test
     src/ltx25-rope.cc)
 target_include_directories(ltx25-conditioning-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(ltx25-conditioning-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-conditioning-test PRIVATE
+    vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-conditioning-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-conditioning-test PRIVATE -Wall -Werror)
@@ -192,7 +199,7 @@ add_executable(ltx25-kernels-test
     $<TARGET_OBJECTS:ltx25_kernels_bf16_obj>)
 target_include_directories(ltx25-kernels-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(ltx25-kernels-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-kernels-test PRIVATE vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-kernels-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-kernels-test PRIVATE -Wall -Werror)
@@ -205,7 +212,7 @@ add_executable(ltx25-attn-test
     $<TARGET_OBJECTS:ltx25_kernels_bf16_obj>)
 target_include_directories(ltx25-attn-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(ltx25-attn-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-attn-test PRIVATE vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-attn-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-attn-test PRIVATE -Wall -Werror)
@@ -221,7 +228,8 @@ add_executable(ltx25-block-metal-test
     $<TARGET_OBJECTS:ltx25_kernels_bf16_obj>)
 target_include_directories(ltx25-block-metal-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(ltx25-block-metal-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-block-metal-test PRIVATE
+    vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-block-metal-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-block-metal-test PRIVATE -Wall -Werror)
@@ -244,7 +252,7 @@ add_executable(ltx25-lora-apply-test
     $<TARGET_OBJECTS:ltx25_kernels_bf16_obj>)
 target_include_directories(ltx25-lora-apply-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(ltx25-lora-apply-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-lora-apply-test PRIVATE vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-lora-apply-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-lora-apply-test PRIVATE -Wall -Werror)
@@ -262,7 +270,7 @@ add_executable(ltx25-i8-gemm-test
     $<TARGET_OBJECTS:ltx25_kernels_bf16_obj>)
 target_include_directories(ltx25-i8-gemm-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(ltx25-i8-gemm-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-i8-gemm-test PRIVATE vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-i8-gemm-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-i8-gemm-test PRIVATE -Wall -Werror)
@@ -284,7 +292,7 @@ add_executable(ltx25-sol-attn-test
     $<TARGET_OBJECTS:ltx25_kernels_bf16_obj>)
 target_include_directories(ltx25-sol-attn-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(ltx25-sol-attn-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-sol-attn-test PRIVATE vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-sol-attn-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-sol-attn-test PRIVATE -Wall -Werror)
@@ -306,7 +314,7 @@ add_executable(ltx25-sage-attn-test
     $<TARGET_OBJECTS:ltx25_kernels_bf16_obj>)
 target_include_directories(ltx25-sage-attn-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(ltx25-sage-attn-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-sage-attn-test PRIVATE vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-sage-attn-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-sage-attn-test PRIVATE -Wall -Werror)
@@ -325,7 +333,7 @@ add_executable(ltx25-dit-block0-test
     $<TARGET_OBJECTS:ltx25_kernels_bf16_obj>)
 target_include_directories(ltx25-dit-block0-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(ltx25-dit-block0-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-dit-block0-test PRIVATE vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-dit-block0-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-dit-block0-test PRIVATE -Wall -Werror)
@@ -340,7 +348,7 @@ add_executable(ltx25-trunk-test
     $<TARGET_OBJECTS:ltx25_kernels_bf16_obj>)
 target_include_directories(ltx25-trunk-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(ltx25-trunk-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-trunk-test PRIVATE vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-trunk-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-trunk-test PRIVATE -Wall -Werror)
@@ -357,7 +365,7 @@ add_executable(ltx25-lora-trunk-test
     $<TARGET_OBJECTS:ltx25_kernels_bf16_obj>)
 target_include_directories(ltx25-lora-trunk-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(ltx25-lora-trunk-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-lora-trunk-test PRIVATE vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-lora-trunk-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-lora-trunk-test PRIVATE -Wall -Werror)
@@ -370,7 +378,8 @@ add_executable(ltx25-upscaler-ref-test
     src/ltx25-upscaler-ref.cc)
 target_include_directories(ltx25-upscaler-ref-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(ltx25-upscaler-ref-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-upscaler-ref-test PRIVATE
+    vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-upscaler-ref-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-upscaler-ref-test PRIVATE -Wall -Werror)
@@ -384,7 +393,7 @@ add_executable(ltx25-upscaler-test
     $<TARGET_OBJECTS:ltx25_kernels_bf16_obj>)
 target_include_directories(ltx25-upscaler-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(ltx25-upscaler-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-upscaler-test PRIVATE vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-upscaler-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-upscaler-test PRIVATE -Wall -Werror)
@@ -397,7 +406,7 @@ add_executable(ltx25-dit-stack-test
     $<TARGET_OBJECTS:ltx25_kernels_bf16_obj>)
 target_include_directories(ltx25-dit-stack-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(ltx25-dit-stack-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-dit-stack-test PRIVATE vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-dit-stack-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-dit-stack-test PRIVATE -Wall -Werror)
@@ -410,7 +419,7 @@ add_executable(ltx25-connector-test
     $<TARGET_OBJECTS:ltx25_kernels_bf16_obj>)
 target_include_directories(ltx25-connector-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(ltx25-connector-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-connector-test PRIVATE vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-connector-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-connector-test PRIVATE -Wall -Werror)
@@ -436,7 +445,7 @@ add_executable(ltx25-generate-test
     $<TARGET_OBJECTS:ltx25_kernels_f32_obj>)
 target_include_directories(ltx25-generate-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(ltx25-generate-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-generate-test PRIVATE vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-generate-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-generate-test PRIVATE -Wall -Werror)
@@ -449,7 +458,8 @@ add_executable(ltx25-text-features-test
     $<TARGET_OBJECTS:ltx25_kernels_bf16_obj>)
 target_include_directories(ltx25-text-features-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(ltx25-text-features-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-text-features-test PRIVATE
+    vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-text-features-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-text-features-test PRIVATE -Wall -Werror)
@@ -462,7 +472,8 @@ add_executable(ltx25-text-encoder-test
     $<TARGET_OBJECTS:ltx25_kernels_bf16_obj>)
 target_include_directories(ltx25-text-encoder-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(ltx25-text-encoder-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-text-encoder-test PRIVATE
+    vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-text-encoder-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-text-encoder-test PRIVATE -Wall -Werror)
@@ -475,7 +486,7 @@ add_executable(ltx25-vae-ref-test
     $<TARGET_OBJECTS:ltx25_kernels_bf16_obj>)
 target_include_directories(ltx25-vae-ref-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(ltx25-vae-ref-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-vae-ref-test PRIVATE vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-vae-ref-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-vae-ref-test PRIVATE -Wall -Werror)
@@ -490,7 +501,7 @@ add_executable(ltx25-audio-vae-test
     $<TARGET_OBJECTS:ltx25_kernels_bf16_obj>)
 target_include_directories(ltx25-audio-vae-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(ltx25-audio-vae-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-audio-vae-test PRIVATE vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-audio-vae-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-audio-vae-test PRIVATE -Wall -Werror)
@@ -504,7 +515,8 @@ add_executable(ltx25-audio-encode-test
     $<TARGET_OBJECTS:ltx25_kernels_f32_obj>)
 target_include_directories(ltx25-audio-encode-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(ltx25-audio-encode-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-audio-encode-test PRIVATE
+    vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-audio-encode-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-audio-encode-test PRIVATE -Wall -Werror)
@@ -518,7 +530,7 @@ add_executable(ltx25-vocoder-test
     $<TARGET_OBJECTS:ltx25_kernels_f32_obj>)
 target_include_directories(ltx25-vocoder-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(ltx25-vocoder-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-vocoder-test PRIVATE vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-vocoder-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-vocoder-test PRIVATE -Wall -Werror)
@@ -531,7 +543,7 @@ add_executable(ltx25-qlinear-test
     $<TARGET_OBJECTS:ltx25_kernels_bf16_obj>)
 target_include_directories(ltx25-qlinear-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(ltx25-qlinear-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-qlinear-test PRIVATE vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-qlinear-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-qlinear-test PRIVATE -Wall -Werror)
@@ -545,7 +557,7 @@ add_executable(ltx25-bwe-test
     $<TARGET_OBJECTS:ltx25_kernels_f32_obj>)
 target_include_directories(ltx25-bwe-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(ltx25-bwe-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-bwe-test PRIVATE vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-bwe-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-bwe-test PRIVATE -Wall -Werror)
@@ -558,7 +570,7 @@ add_executable(ltx25-vae-family-test
     $<TARGET_OBJECTS:ltx25_kernels_bf16_obj>)
 target_include_directories(ltx25-vae-family-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(ltx25-vae-family-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-vae-family-test PRIVATE vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-vae-family-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-vae-family-test PRIVATE -Wall -Werror)
@@ -571,7 +583,8 @@ add_executable(ltx25-dit-stack-golden-test
     $<TARGET_OBJECTS:ltx25_kernels_bf16_obj>)
 target_include_directories(ltx25-dit-stack-golden-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
-target_link_libraries(ltx25-dit-stack-golden-test PRIVATE vpipe::vpipe)
+target_link_libraries(ltx25-dit-stack-golden-test PRIVATE
+    vpipe::vpipe vpipe::toolkit)
 target_compile_features(ltx25-dit-stack-golden-test PRIVATE cxx_std_20)
 if(NOT MSVC)
     target_compile_options(ltx25-dit-stack-golden-test PRIVATE -Wall -Werror)

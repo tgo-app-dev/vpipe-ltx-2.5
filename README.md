@@ -136,17 +136,22 @@ is finished. It is not:
 
 ## Building
 
-Needs an installed vpipe with **plugin ABI 5** — the host loads a plugin on
-STRICT equality, so this is an exact requirement, not a minimum. Rebuild
-against the vpipe you deploy with; a mismatch is refused with a clear
-message rather than crashed.
+Needs an installed vpipe with **plugin ABI 8**. A host at ABI N loads
+plugins built for N and N−1, and reads the version from the file before
+loading it, so a binary outside that window is refused with a message that
+names both versions rather than crashed. Beyond the integer the plugin
+requires two host features, and a host without either refuses it by name:
+`kernel-contract/1` (the host kernels it dispatches by name — steel
+attention, the dense and quantized GEMMs, the DiT's elementwise ops) and
+`accel-bag/1` (the acceleration tiers below arrive as one open `FlexData`
+on the request rather than as typed fields, which is what stops the next
+tier invalidating this binary).
 
-ABI 4 is what `VideoModelFamily::denoise_scratch_bytes` needs, and it also
-carries the `MetalCompute::MemoryBudget` layout read by value. ABI 3 was
-the acceleration bag. The tiers below arrive as one
-open `FlexData` rather than as typed fields on the request, which is the
-change that stops the NEXT tier invalidating this binary — but the bag
-itself was a version bump, and a host older than that cannot describe it.
+vpipe's `generative-models/shared` helpers the model calls — `i8_gemm`,
+SageAttention, Sol-Attn, the FP8 expansion, the ComfyUI checkpoint reader —
+are the SDK's **toolkit**: compiled into this binary from `vpipe::toolkit`,
+not called in libvpipe. `vpipe_add_plugin` links it; so does every test
+target here.
 
 ```sh
 # in the vpipe tree
