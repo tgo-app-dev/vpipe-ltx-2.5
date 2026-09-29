@@ -626,18 +626,26 @@ void
 MetalBlock::ff_core_(ComputeEncoder& enc, const GpuStream& w, int rows,
                      const LoraPair* l_in, const LoraPair* l_out)
 {
+  ff_core_(enc, w, _s->a, _s->b, rows, l_in, l_out);
+}
+
+void
+MetalBlock::ff_core_(ComputeEncoder& enc, const GpuStream& w,
+                     const SharedBuffer& x, const SharedBuffer& y, int rows,
+                     const LoraPair* l_in, const LoraPair* l_out)
+{
   const int d = w.dim, n = rows, h = w.ff_hidden;
   if (n <= 0) { return; }
-  _ops->linear(enc, _s->a, w.ff_in, w.ff_has_bias ? &w.ff_in_b : nullptr,
+  _ops->linear(enc, x, w.ff_in, w.ff_has_bias ? &w.ff_in_b : nullptr,
                _s->ff, n, d, h);
   // BEFORE the GELU. `ff.net.0.proj` is the widest adapted linear in
   // the model and the only reason the arena's `lora_d` is 4x a stream
   // plane.
-  lora_(enc, l_in, _s->a, _s->ff, n);
+  lora_(enc, l_in, x, _s->ff, n);
   _ops->gelu(enc, _s->ff, _s->ff, n * h);
   _ops->linear(enc, _s->ff, w.ff_out, w.ff_has_bias ? &w.ff_out_b : nullptr,
-               _s->b, n, h, d);
-  lora_(enc, l_out, _s->ff, _s->b, n);
+               y, n, h, d);
+  lora_(enc, l_out, _s->ff, y, n);
 }
 
 // The gated residual, over every row of `_s->b`.
@@ -800,6 +808,26 @@ MetalBlock::video_ff_rows(ComputeEncoder& enc, GpuStreamInput& video,
 {
   if (!video.present || video.tokens <= 0) { return; }
   ff_core_(enc, _w.video, std::min(rows, video.tokens),
+           lora != nullptr ? &lora->video_ff_in : nullptr,
+           lora != nullptr ? &lora->video_ff_out : nullptr);
+}
+
+void
+MetalBlock::video_ff_band(ComputeEncoder& enc, GpuStreamInput& video,
+                          int r0, int rows, const LoraBlock* lora)
+{
+  if (!video.present || r0 < 0 || r0 >= video.tokens) { return; }
+  const int n = std::min(rows, video.tokens - r0);
+  if (n <= 0) { return; }
+  // The linears and the LoRA read and write from row 0, so the band is
+  // handed over as subviews that START at r0. The GELU scratch is used
+  // from its first row, like any other call.
+  const std::size_t row = (std::size_t)_w.video.dim * 2;
+  const SharedBuffer x = _s->a.subview((std::size_t)r0 * row,
+                                       (std::size_t)n * row);
+  const SharedBuffer y = _s->b.subview((std::size_t)r0 * row,
+                                       (std::size_t)n * row);
+  ff_core_(enc, _w.video, x, y, n,
            lora != nullptr ? &lora->video_ff_in : nullptr,
            lora != nullptr ? &lora->video_ff_out : nullptr);
 }

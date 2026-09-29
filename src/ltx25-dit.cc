@@ -1872,12 +1872,31 @@ Ltx25Dit::forward(const Input& in, Output* out, std::string* err)
       vpipe::FlexData timing = vpipe::FlexData::make_object();
       acc_ns::set_real(&timing, ane_ns::kGpuMs, gpu_ms);
       acc_ns::set_real(&timing, ane_ns::kDrainMs, drain_ms);
-      if (a_rows > 0) {
-        if (!_ane->finish(i, timing)) {
+      if (a_rows > 0 && !_ane->finish(i, timing)) {
+        // THE GPU FALLBACK. The host names the first row the ANE did not
+        // write (the rows before it are the ANE's, and exact) and keeps
+        // the tier on the GPU from here on; the lost rows are recomputed
+        // from ff_input(), which the tier only read. A host older than the
+        // key names none, and then the rows cannot be trusted at all.
+        const vpipe::FlexData info = _ane->info();
+        const long long lost =
+            acc_ns::integer(&info, ane_ns::kInfoLostRow0, -1);
+        if (lost < 0 || lost >= gv.tokens) {
           return fail("block " + std::to_string(i) +
                       ": the ANE feed-forward produced non-finite rows");
         }
-      } else if (!ane_split) {
+        auto s3 = o.mc()->make_command_stream();
+        {
+          auto enc = s3.begin_compute();
+          blk->video_ff_band(enc, gv, (int)lost, gv.tokens - (int)lost,
+                             blora);
+        }
+        std::string e3;
+        if (!s3.commit().wait_ok(&e3)) {
+          return fail("block " + std::to_string(i) + ": " +
+                      (e3.empty() ? std::string("GPU error") : e3));
+        }
+      } else if (a_rows == 0 && !ane_split) {
         _ane->note_probe(timing);
       }
       if (!ok2) {

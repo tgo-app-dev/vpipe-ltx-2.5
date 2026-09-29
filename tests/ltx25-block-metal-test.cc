@@ -472,6 +472,51 @@ main()
     }
   }
 
+  // ---- THE ANE FALLBACK'S BAND ----------------------------------------
+  //
+  // An ANE split that loses rows hands [r0, tokens) of the video feed-
+  // forward back to the GPU as video_ff_band(). So head + ff_rows(k) +
+  // ff_band(k, T - k) + tail has to BE the one-pass block, to the bit: the
+  // band is the same linears over rows handed in as subviews, and an
+  // offset one row out is exactly the error a looser bar lets through.
+  {
+    const int k = kTV / 3;                 // strictly inside, both sides
+    auto vx3 = ops.upload_bf16(g("small_vx_in").data);
+    auto ax3 = ops.upload_bf16(g("small_ax_in").data);
+    ltx25::GpuStreamInput v3 = gv, a3 = ga;
+    v3.x = &vx3;
+    a3.x = &ax3;
+    bool ok = true;
+    auto s3 = mc.make_command_stream();
+    {
+      auto e3 = s3.begin_compute();
+      ok = blk->forward_head(e3, v3, a3, &err);
+      if (ok) {
+        blk->video_ff_rows(e3, v3, k);
+        blk->video_ff_band(e3, v3, k, kTV - k);
+        ok = blk->forward_tail(e3, v3, a3, &err);
+      }
+    }
+    s3.commit().wait();
+    check(ok, ok ? "head + ff rows + ff band + tail ran"
+                 : "head + ff rows + ff band + tail: " + err);
+    const std::vector<float> v_got =
+        ltx25::MetalOps::download_bf16(vx3, (std::size_t)kTV * kVD);
+    const std::vector<float> a_got =
+        ltx25::MetalOps::download_bf16(ax3, (std::size_t)kTA * kAD);
+    std::size_t vbad = 0, abad = 0;
+    for (std::size_t i = 0; i < v_got.size(); ++i) {
+      if (v_got[i] != gvx[i]) { ++vbad; }
+    }
+    for (std::size_t i = 0; i < a_got.size(); ++i) {
+      if (a_got[i] != gax[i]) { ++abad; }
+    }
+    check(vbad == 0 && abad == 0,
+          "a feed-forward split into rows + band is bit-identical to one "
+          "pass (" + std::to_string(vbad) + " video / " +
+          std::to_string(abad) + " audio values differ)");
+  }
+
   std::printf("%s\n", g_fail == 0 ? "ALL PASSED" : "FAILURES");
   return g_fail == 0 ? 0 : 1;
 }

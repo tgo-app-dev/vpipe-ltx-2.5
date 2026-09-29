@@ -345,6 +345,13 @@ public:
   void video_ff_rows(vpipe::metal_compute::ComputeEncoder& enc,
                      GpuStreamInput& video, int rows,
                      const LoraBlock* lora = nullptr);
+  // The same over rows [r0, r0 + rows) only: the rows an ANE split LOST
+  // (ane::kInfoLostRow0), recomputed from ff_input() into the same rows of
+  // ff_output() before forward_tail() reads them. Rows before r0 are left
+  // as the ANE wrote them.
+  void video_ff_band(vpipe::metal_compute::ComputeEncoder& enc,
+                     GpuStreamInput& video, int r0, int rows,
+                     const LoraBlock* lora = nullptr);
   bool forward_tail(vpipe::metal_compute::ComputeEncoder& enc,
                     GpuStreamInput& video, GpuStreamInput& audio,
                     std::string* err, const LoraBlock* lora = nullptr);
@@ -409,6 +416,13 @@ private:
   void ff_core_(vpipe::metal_compute::ComputeEncoder& enc,
                 const GpuStream& w, int rows, const LoraPair* l_in,
                 const LoraPair* l_out);
+  // ...from `x` into `y`, each read from its first row: `_s->a` and
+  // `_s->b`, or subviews of them from a later row.
+  void ff_core_(vpipe::metal_compute::ComputeEncoder& enc,
+                const GpuStream& w,
+                const vpipe::metal_compute::SharedBuffer& x,
+                const vpipe::metal_compute::SharedBuffer& y, int rows,
+                const LoraPair* l_in, const LoraPair* l_out);
   void ff_post_(vpipe::metal_compute::ComputeEncoder& enc,
                 const GpuStream& w, GpuStreamInput& s);
   // One direction of the audio<->video cross-attention. `lo` is 0 for
